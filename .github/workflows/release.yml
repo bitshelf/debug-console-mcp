@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl,x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
+
+      - name: Install cross-compiler and protoc
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu protobuf-compiler
+
+      # ── x86_64: STATIC musl build — runs on any glibc, the artifact
+      #    cargo-binstall resolves by default. ─────────────────────────
+      - name: Build (x86_64 musl, static)
+        working-directory: sermcp
+        run: cargo musl
+
+      - name: Build (aarch64 gnu)
+        working-directory: sermcp
+        run: cargo build --release --target aarch64-unknown-linux-gnu
+
+      # ── cargo-binstall packages: name_version_target.tar.gz ────────
+      # (binstall's default pkg-url template resolves exactly this name,
+      # so `cargo binstall --git <repo>` works with zero configuration).
+      - name: Package tarballs
+        working-directory: sermcp
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          # x86_64 musl (static)
+          T1=sermcp_${VERSION}_x86_64-unknown-linux-musl.tar.gz
+          tar -czf "$T1" \
+            -C target/x86_64-unknown-linux-musl/release \
+            sermcp dutabo
+          # aarch64 gnu
+          T2=sermcp_${VERSION}_aarch64-unknown-linux-gnu.tar.gz
+          tar -czf "$T2" \
+            -C target/aarch64-unknown-linux-gnu/release \
+            sermcp dutabo
+          sha256sum "$T1" "$T2" > SHA256SUMS
+          ls -la "$T1" "$T2"; cat SHA256SUMS
+
+      # ── Bare binaries kept for direct-download users ───────────────
+      - name: Bare binaries
+        working-directory: sermcp
+        run: |
+          cp target/x86_64-unknown-linux-musl/release/sermcp sermcp-x86_64-unknown-linux-musl
+          cp target/x86_64-unknown-linux-musl/release/dutabo dutabo-x86_64-unknown-linux-musl
+          cp target/aarch64-unknown-linux-gnu/release/sermcp sermcp-aarch64-unknown-linux-gnu
+          cp target/aarch64-unknown-linux-gnu/release/dutabo dutabo-aarch64-unknown-linux-gnu
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            sermcp/sermcp_*_x86_64-unknown-linux-musl.tar.gz
+            sermcp/sermcp_*_aarch64-unknown-linux-gnu.tar.gz
+            sermcp/SHA256SUMS
+            sermcp/sermcp-x86_64-unknown-linux-musl
+            sermcp/sermcp-aarch64-unknown-linux-gnu
+            sermcp/dutabo-x86_64-unknown-linux-musl
+            sermcp/dutabo-aarch64-unknown-linux-gnu

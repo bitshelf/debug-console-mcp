@@ -1,0 +1,4 @@
+interface:
+  display_name: "Device Serial Operations"
+  short_description: "Check and control an embedded device over serial"
+  default_prompt: "Use $serial-debug to check the configured device over its serial console."

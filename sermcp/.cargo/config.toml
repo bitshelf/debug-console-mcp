@@ -1,0 +1,8 @@
+# Cargo 1.94 `include`: environment-specific config files load from here,
+# keeping the default (glibc) workflow untouched while the static musl
+# build gets its own file below.
+include = ["musl.toml"]
+
+[alias]
+# Static, zero-libc build of both binaries.
+musl = "build --release --locked --target x86_64-unknown-linux-musl"
