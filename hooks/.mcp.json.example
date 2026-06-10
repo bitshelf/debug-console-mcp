@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "semcode": {
+      "command": "semcode-mcp",
+      "env": {
+        "SEMCODE_GIT_REPO": "kernel-6.1"
+      }
+    },
+    "embedded-debug": {
+      "type": "http",
+      "url": "http://localhost:3000/mcp"
+    }
+  }
+}

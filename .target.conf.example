@@ -1,0 +1,23 @@
+# Serial target configuration
+DEV_HOST_IP=192.168.1.xxx
+DEV_HOST_USER=
+DEV_HOST_PASS=
+SERIAL_PORT=2000
+
+LOGIN_USER=root
+LOGIN_PASS=
+
+RELAY_PORT=2001
+RESET_CHANNEL=1
+MASKROM_CHANNEL=2
+
+# 监控参数
+HANG_TIMEOUT=60
+HANG_HYSTERESIS=3
+MAX_ARCHIVED_LOGS=10
+
+# U-Boot 中断策略 (lava=保守, aggressive=激进)
+UBOOT_INTERRUPT_STRATEGY=lava
+
+# StageLearner: 参考启动日志
+REFERENCE_LOG=.dut-serial/reference-boot.log

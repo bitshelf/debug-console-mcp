@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+uv.lock
+.semcode.db/
+/mcp-rs/.dut-serial/
+/.dut-serial/
+/.target.conf
+/.mcp.json
+.target.conf
