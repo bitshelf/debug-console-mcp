@@ -56,13 +56,13 @@ Configuration:
   See README.md for the full configuration reference.
 
   Example .target.conf:
-    RK_DEV_HOST_IP=192.168.1.189
-    RK_SERIAL_PORT=2000
-    RK_LOGIN_USER=root
-    RK_LOGIN_PASS=mypassword
-    RK_RELAY_PORT=2001
-    RK_RESET_CHANNEL=2
-    RK_MASKROM_CHANNEL=1
+    DEV_HOST_IP=192.168.1.189
+    SERIAL_PORT=2000
+    LOGIN_USER=root
+    LOGIN_PASS=mypassword
+    RELAY_PORT=2001
+    RESET_CHANNEL=2
+    MASKROM_CHANNEL=1
 
 MCP Tools:
   serial_send_command  - Execute shell command on target
@@ -71,10 +71,15 @@ MCP Tools:
   serial_list_logs     - List archived boot logs
   serial_reset         - Hardware reset via relay + log rotation
   serial_enter_uboot   - Force target into U-Boot prompt
+  serial_enter_maskrom - Force target into Rockchip MASKROM mode
   serial_wait_pattern  - Wait for regex pattern in serial output
+  serial_uboot_command - Send command at U-Boot prompt
   serial_new_log       - Manually rotate log without reset
   serial_poll_logs     - Get new serial output since last poll
   serial_get_config    - Show current target configuration
+  serial_claim         - Claim serial ownership
+  serial_load_reference - Load reference log for adaptive stage detection
+  serial_get_stages    - Show learned stage fingerprints
 
 Files:
   {project}/.target.conf          Target configuration

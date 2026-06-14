@@ -52,8 +52,6 @@ impl Config {
     }
 
     pub fn dev_host_ip(&self) -> String { self.get_str_or("DEV_HOST_IP", "") }
-    pub fn dev_host_user(&self) -> String { self.get("DEV_HOST_USER").to_string() }
-    pub fn dev_host_pass(&self) -> String { self.get("DEV_HOST_PASS").to_string() }
     /// Returns serial target: "2000" for TCP port, "/dev/ttyUSB0" for local device.
     /// 默认 2000 (ser2net TCP); 如果 SERIAL_PORT 是 /dev/ 路径则直接返回路径。
     pub fn serial_target(&self) -> String {
@@ -73,7 +71,6 @@ impl Config {
     pub fn max_log_file_size_mb(&self) -> u64 { self.get("MAX_LOG_FILE_SIZE").parse().unwrap_or(100) }
     pub fn dut_dir(&self) -> String { self.get_str_or("DUT_DIR", ".dut-serial") }
     pub fn lock_dir(&self) -> String { self.get_str_or("LOCK_DIR", "/tmp/embedded-debug/locks") }
-    pub fn interrupt_strategy(&self) -> String { self.get_str_or("UBOOT_INTERRUPT_STRATEGY", "lava") }
     pub fn login_user(&self) -> String { self.get_str_or("LOGIN_USER", "root") }
     pub fn login_pass(&self) -> String { self.get("LOGIN_PASS").to_string() }
     pub fn reference_log(&self) -> String { self.get("REFERENCE_LOG").to_string() }
@@ -96,7 +93,13 @@ fn parse_shell_config(path: &Path) -> HashMap<String, String> {
         }
         let line = line.strip_prefix("export ").unwrap_or(line);
         if let Some(caps) = re.captures(line) {
-            let key = caps.get(1).unwrap().as_str().to_string();
+            let raw_key = caps.get(1).unwrap().as_str().to_string();
+            // 去掉 RK_ / LR_ 前缀，统一到 accessor 查找键
+            let key = raw_key
+                .strip_prefix("RK_")
+                .or_else(|| raw_key.strip_prefix("LR_"))
+                .unwrap_or(&raw_key)
+                .to_string();
             let value = caps
                 .get(2)
                 .or_else(|| caps.get(3))
@@ -109,18 +112,47 @@ fn parse_shell_config(path: &Path) -> HashMap<String, String> {
     cfg
 }
 
-/// 递归向上查找 .target.conf
+/// Directories that should NEVER be treated as project roots, even if they
+/// contain a .target.conf file (e.g. leftover from a previous session).
+const FORBIDDEN_ROOTS: &[&str] = &["/tmp", "/var/tmp", "/dev/shm", "/run", "/proc", "/sys", "/dev"];
+
+/// Companion files/dirs that must exist alongside .target.conf to validate
+/// it's a real project directory, not a stale file in a temp dir.
+const PROJECT_MARKERS: &[&str] = &[".dut-serial", ".claude", "build/envsetup.sh", "device/rockchip"];
+
+fn is_valid_project_dir(d: &Path) -> bool {
+    // Reject ONLY the forbidden roots themselves (e.g. /tmp/.target.conf),
+    // not subdirectories (e.g. /tmp/xyz/.target.conf with markers is fine).
+    let resolved = d.canonicalize().unwrap_or_else(|_| d.to_path_buf());
+    for forbidden in FORBIDDEN_ROOTS {
+        if resolved == Path::new(forbidden) {
+            return false;
+        }
+    }
+    // Require at least one project marker alongside .target.conf
+    for marker in PROJECT_MARKERS {
+        if d.join(marker).exists() {
+            return true;
+        }
+    }
+    false
+}
+
+/// 递归向上查找 .target.conf，仅返回通过项目验证的目录。
 fn find_config_path() -> Option<PathBuf> {
     if let Ok(env) = std::env::var("TARGET_CONF") {
         let p = PathBuf::from(&env);
         if p.exists() {
-            return Some(p);
+            let parent = p.parent().unwrap_or(Path::new("."));
+            if is_valid_project_dir(parent) {
+                return Some(p);
+            }
         }
     }
     let mut d = std::env::current_dir().ok()?;
     loop {
         let candidate = d.join(".target.conf");
-        if candidate.exists() {
+        if candidate.exists() && is_valid_project_dir(&d) {
             return Some(candidate);
         }
         if !d.pop() {
@@ -272,6 +304,8 @@ mod tests {
     #[test]
     fn test_config_override_defaults() {
         let tmp = TempDir::new().unwrap();
+        // Create a project marker so is_valid_project_dir() passes
+        std::fs::create_dir_all(tmp.path().join(".dut-serial")).unwrap();
         let conf = tmp.path().join(".target.conf");
         let mut f = std::fs::File::create(&conf).unwrap();
         writeln!(f, "DEV_HOST_IP=172.16.0.1").unwrap();

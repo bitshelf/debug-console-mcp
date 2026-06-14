@@ -1,100 +1,158 @@
 #!/usr/bin/env python3
-"""SessionStart hook — auto-start MCP HTTP server + statusline when .target.conf exists.
+"""SessionStart hook — discover projects, start MCP + statusline-watch daemon.
 
-Only checks Claude Code CWD (no parent directory walk).
+Projects only need .mcp.json + .target.conf. No per-project scripts.
 """
 
+import json
 import os
+import subprocess
 import sys
+import time
 from pathlib import Path
 from subprocess import Popen, DEVNULL
 
-from lib import has_target_conf
+
+def find_projects():
+    """Only discover the project Claude Code is currently working in.
+
+    Checks CWD directly for .target.conf — no directory scanning at all.
+    """
+    cwd = os.getcwd()
+    if os.path.isfile(os.path.join(cwd, ".target.conf")):
+        return [cwd]
+    return []
 
 
-def _start_statusline_daemon() -> None:
-    """Start the event-driven statusline daemon (inotify watcher)."""
-    try:
-        Popen(
-            [sys.executable,
-             os.path.expanduser("~/.claude/hooks/embedded-debug/statusline.py"),
-             "--daemon"],
-            stdout=DEVNULL, stderr=DEVNULL,
-            start_new_session=True,
-        )
-    except OSError:
-        pass
+def project_hash(project_dir):
+    import hashlib
+    return hashlib.md5(str(Path(project_dir).resolve()).encode()).hexdigest()[:8]
 
 
-def _ensure_mcp_json(project_dir: str) -> None:
-    """Auto-generate .mcp.json with embedded-debug server if .target.conf exists."""
-    import json
+def read_mcp_port(project_dir):
+    """Read HTTP port from project's .mcp.json serial config. Returns int or None."""
     mcp_json = Path(project_dir) / ".mcp.json"
-    if mcp_json.exists():
-        return
-
-    # Check if we have embedded-debug binary installed
-    import shutil
-    binary = shutil.which("embedded-debug-mcp")
-    if not binary:
-        binary = os.path.expanduser("~/.local/bin/embedded-debug-mcp")
-        if not Path(binary).exists():
-            return
-
+    if not mcp_json.exists():
+        return None
     try:
-        cfg = {
-            "mcpServers": {
-                "embedded-debug": {
-                    "type": "stdio",
-                    "command": binary,
-                    "timeout": 60000
-                }
-            }
-        }
-        mcp_json.write_text(json.dumps(cfg, indent=2) + "\n")
-    except OSError:
+        cfg = json.loads(mcp_json.read_text())
+        url = cfg.get("mcpServers", {}).get("embedded-debug", {}).get("url", "")
+        # "http://localhost:3000/mcp" → 3000
+        if ":" in url:
+            return int(url.rsplit(":", 1)[-1].split("/")[0])
+    except (json.JSONDecodeError, ValueError, KeyError):
         pass
-
-
-def _find_mcp_binary() -> str | None:
-    """Find the embedded-debug-mcp binary."""
-    import shutil
-    binary = shutil.which("embedded-debug-mcp")
-    if binary:
-        return binary
-    path = os.path.expanduser("~/.local/bin/embedded-debug-mcp")
-    if Path(path).exists():
-        return path
     return None
 
 
-def _mcp_already_running() -> bool:
-    """Check if MCP HTTP server is already running on port 3000."""
+def is_port_in_use(port):
     import socket
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        s.connect(("127.0.0.1", 3000))
+        s.connect(("127.0.0.1", port))
         s.close()
         return True
     except (ConnectionRefusedError, OSError):
         return False
 
 
+def mcp_running(project_dir):
+    """Check if an embedded-debug-mcp process is already serving this project."""
+    try:
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                pid = int(entry.name)
+                if pid == os.getpid():
+                    continue
+                comm = (entry / "comm").read_text().strip()
+                if "embedded" not in comm:
+                    continue
+                cwd = os.readlink(f"{entry}/cwd")
+                if Path(cwd).resolve() == Path(project_dir).resolve():
+                    return True
+            except (OSError, FileNotFoundError, ValueError):
+                continue
+    except OSError:
+        pass
+    return False
+
+
+def _kill_stale_mcp_on_port(port):
+    """Kill any embedded-debug-mcp process listening on the given port."""
+    result = subprocess.run(
+        ["ss", "-tlnpH", f"sport = :{port}"],
+        capture_output=True, text=True
+    )
+    for line in result.stdout.splitlines():
+        if "pid=" in line:
+            old_pid = line.split("pid=")[-1].split(",")[0]
+            try:
+                os.kill(int(old_pid), 15)
+            except OSError:
+                pass
+    time.sleep(0.5)
+
+
+def start_mcp(project_dir, port):
+    """Start embedded-debug-mcp in HTTP mode for a project."""
+    if mcp_running(project_dir):
+        return
+    if is_port_in_use(port):
+        _kill_stale_mcp_on_port(port)
+        if is_port_in_use(port):
+            return
+
+    binary = os.path.expanduser("~/.local/bin/embedded-debug-mcp")
+    if not os.path.isfile(binary):
+        return
+
+    Popen(
+        [binary, "--http", f"0.0.0.0:{port}"],
+        cwd=project_dir,
+        stdout=DEVNULL, stderr=DEVNULL,
+        start_new_session=True,
+    )
+
+
+def start_daemon(registry):
+    """Start statusline-watch daemon if not running."""
+    result = subprocess.run(["pgrep", "-cf", "statusline-watch"], capture_output=True, text=True)
+    if int(result.stdout.strip() or 0) > 0:
+        return
+    binary = os.path.expanduser("~/.local/bin/statusline-watch")
+    if not os.path.isfile(binary):
+        return
+    Popen(
+        [binary, "--registry", registry],
+        stdout=DEVNULL, stderr=DEVNULL,
+        start_new_session=True,
+    )
+
+
 def main():
-    # 只检测 Claude Code 当前目录的 .target.conf
-    if not has_target_conf():
-        sys.exit(0)
+    registry = "/dev/shm/.statusline-watch.projects"
+    seen = set()
 
-    project_dir = str(Path.cwd())
+    for proj in find_projects():
+        dut_dir = os.path.join(proj, ".dut-serial")
+        os.makedirs(dut_dir, exist_ok=True)
 
-    # 1. 启动 statusline daemon
-    _start_statusline_daemon()
+        port = read_mcp_port(proj)
+        if port is None:
+            continue
 
-    # 2. 生成 .mcp.json
-    _ensure_mcp_json(project_dir)
+        start_mcp(proj, port)
+        if proj not in seen:
+            seen.add(proj)
 
-    # 3. MCP 由 Claude Code 通过 .mcp.json (stdio transport) 自动启动
+    # Write registry for daemon
+    with open(registry, "w") as f:
+        for proj in sorted(seen):
+            f.write(proj + "\n")
 
+    start_daemon(registry)
     sys.exit(0)
 
 

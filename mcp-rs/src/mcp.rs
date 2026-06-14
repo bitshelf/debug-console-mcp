@@ -69,7 +69,12 @@ fn tool_definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "serial_enter_uboot",
-            description: "Force target into U-Boot interactive prompt.",
+            description: "Force target into U-Boot interactive prompt via relay reset + Ctrl-C flood.",
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+        },
+        ToolDef {
+            name: "serial_enter_maskrom",
+            description: "Force target into Rockchip MASKROM (loader) mode via relay sequence. Pulls MASKROM pin low, pulses RESET, then releases MASKROM. Target will appear as a Rockchip USB device on the Dev Host.",
             input_schema: serde_json::json!({"type": "object", "properties": {}}),
         },
         ToolDef {
@@ -204,8 +209,6 @@ pub struct McpServer {
     tools: Vec<ToolDef>,
     initialized: bool,
     engine: SharedEngine,
-    /// watchdog 调用计数 (每 4 次 read_once ≈ 2s 调用一次 watchdog)
-    watchdog_counter: u32,
 }
 
 impl McpServer {
@@ -214,7 +217,6 @@ impl McpServer {
             tools: tool_definitions(),
             initialized: false,
             engine,
-            watchdog_counter: 0,
         }
     }
 
@@ -229,7 +231,7 @@ impl McpServer {
 
         // 事件驱动读循环 (epoll, 无轮询), 加防抖
         let engine_read = self.engine.clone();
-        tokio::spawn(async move {
+        let read_handle = tokio::spawn(async move {
             loop {
                 let mut eng = engine_read.lock().await;
                 eng.read_loop_iter().await;
@@ -239,7 +241,7 @@ impl McpServer {
         });
         // 独立 watchdog task
         let engine_wd = self.engine.clone();
-        tokio::spawn(async move {
+        let watchdog_handle = tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(2));
             loop {
                 tick.tick().await;
@@ -247,6 +249,12 @@ impl McpServer {
                 eng.watchdog_once();
             }
         });
+
+        // 注册后台任务 handle 到 engine (确保 stop() 能正确清理)
+        {
+            let mut eng = self.engine.lock().await;
+            eng.set_background_tasks(read_handle, watchdog_handle);
+        }
 
         tracing::info!("[embedded-debug-mcp] stdio transport ready");
 
@@ -281,19 +289,6 @@ impl McpServer {
         }
 
         Ok(())
-    }
-
-    /// 驱动一次串口 read loop 迭代
-    async fn drive_read_loop(&mut self) {
-        let mut engine = self.engine.lock().await;
-        engine.read_once().await;
-
-        // 每 4 次 (~400ms) 调用一次 watchdog
-        self.watchdog_counter += 1;
-        if self.watchdog_counter >= 4 {
-            self.watchdog_counter = 0;
-            engine.watchdog_once();
-        }
     }
 
     /// Public handler for HTTP transport (takes raw request, produces raw response)
@@ -480,13 +475,17 @@ impl McpServer {
                 rx
             };
             let matched = tokio::time::timeout(std::time::Duration::from_secs(20), rx.recv()).await;
-            let result = if let Ok(Some(_line)) = matched {
+            let result = {
                 let mut engine = self.engine.lock().await;
-                engine.state.transition(crate::state_manager::TargetState::UBoot);
-                serde_json::json!({"success": true, "state_after": "uboot"})
-            } else {
-                let engine = self.engine.lock().await;
-                serde_json::json!({"success": false, "state_after": engine.state.current().as_str(), "error": "Timed out waiting for U-Boot prompt"})
+                // BUGFIX: always cleanup watcher to prevent memory leak
+                let pattern = r"=>|U-Boot[>#]";
+                engine.detector.remove_watcher_by_pattern(pattern);
+                if let Ok(Some(_line)) = matched {
+                    engine.state.transition(crate::state_manager::TargetState::UBoot);
+                    serde_json::json!({"success": true, "state_after": "uboot"})
+                } else {
+                    serde_json::json!({"success": false, "state_after": engine.state.current().as_str(), "error": "Timed out waiting for U-Boot prompt"})
+                }
             };
             return serde_json::json!({
                 "content": [{"type": "text", "text": serde_json::to_string(&result).unwrap_or_default()}]
@@ -497,13 +496,14 @@ impl McpServer {
         if name == "serial_send_command" {
             let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
             let timeout = args.get("timeout").and_then(|v| v.as_f64()).unwrap_or(90.0);
-            // fast-path: reboot/shutdown 直接发送不等待
-            if command.trim() == "reboot" || command.trim() == "poweroff" {
+            // fast-path: reboot/shutdown/poweroff 直接发送不等待
+            let cmd_trimmed = command.trim();
+            if cmd_trimmed == "reboot" || cmd_trimmed == "poweroff" || cmd_trimmed == "shutdown" {
                 let mut engine = self.engine.lock().await;
                 engine.console.sendline(command);
                 engine.console.drain_writes().await;
                 return serde_json::json!({
-                    "content": [{"type": "text", "text": serde_json::to_string(&serde_json::json!({"output": "reboot sent", "exit_code": 0, "timed_out": false})).unwrap_or_default()}]
+                    "content": [{"type": "text", "text": serde_json::to_string(&serde_json::json!({"output": format!("{cmd_trimmed} sent"), "exit_code": 0, "timed_out": false})).unwrap_or_default()}]
                 });
             }
             let rx = {
@@ -536,18 +536,9 @@ impl McpServer {
         name: &str,
         args: &Value,
     ) -> Value {
+        // Note: serial_send_command and serial_enter_uboot are intercepted in
+        // handle_call_tool to release the engine lock during network I/O.
         match name {
-            "serial_send_command" => {
-                let command = args
-                    .get("command")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let timeout = args
-                    .get("timeout")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(90.0);
-                engine.send_command(command, timeout).await
-            }
             "serial_get_state" => engine.get_state_dict(),
             "serial_get_logs" => {
                 let lines = args.get("lines").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
@@ -563,7 +554,7 @@ impl McpServer {
                     .unwrap_or(true);
                 engine.reset_target(wait_boot).await
             }
-            "serial_enter_uboot" => engine.enter_uboot().await,
+            "serial_enter_maskrom" => engine.enter_maskrom().await,
             "serial_wait_pattern" => {
                 let pattern = args
                     .get("pattern")
@@ -798,20 +789,20 @@ mod tests {
     fn create_test_engine() -> SharedEngine {
         let tmp = TempDir::new().unwrap();
         let mut values = HashMap::new();
-        values.insert("RK_DEV_HOST_IP".into(), "127.0.0.1".into());
-        values.insert("RK_SERIAL_PORT".into(), "59999".into());
-        values.insert("RK_RELAY_PORT".into(), "0".into());
-        values.insert("RK_RESET_CHANNEL".into(), "0".into());
-        values.insert("RK_MASKROM_CHANNEL".into(), "0".into());
-        values.insert("RK_HANG_TIMEOUT".into(), "60".into());
-        values.insert("RK_HANG_HYSTERESIS".into(), "3".into());
-        values.insert("RK_MAX_ARCHIVED_LOGS".into(), "10".into());
-        values.insert("RK_MAX_LOG_FILE_SIZE".into(), "100".into());
-        values.insert("RK_DUT_DIR".into(), ".dut-serial".into());
-        values.insert("RK_LOCK_DIR".into(), "/tmp/embedded-debug-test-locks".into());
-        values.insert("RK_LOGIN_USER".into(), "root".into());
-        values.insert("RK_LOGIN_PASS".into(), "".into());
-        values.insert("RK_UBOOT_INTERRUPT_STRATEGY".into(), "lava".into());
+        values.insert("DEV_HOST_IP".into(), "127.0.0.1".into());
+        values.insert("SERIAL_PORT".into(), "59999".into());
+        values.insert("RELAY_PORT".into(), "0".into());
+        values.insert("RESET_CHANNEL".into(), "0".into());
+        values.insert("MASKROM_CHANNEL".into(), "0".into());
+        values.insert("HANG_TIMEOUT".into(), "60".into());
+        values.insert("HANG_HYSTERESIS".into(), "3".into());
+        values.insert("MAX_ARCHIVED_LOGS".into(), "10".into());
+        values.insert("MAX_LOG_FILE_SIZE".into(), "100".into());
+        values.insert("DUT_DIR".into(), ".dut-serial".into());
+        values.insert("LOCK_DIR".into(), "/tmp/embedded-debug-test-locks".into());
+        values.insert("LOGIN_USER".into(), "root".into());
+        values.insert("LOGIN_PASS".into(), "".into());
+        values.insert("UBOOT_INTERRUPT_STRATEGY".into(), "lava".into());
 
         let config = Config {
             values,
@@ -873,7 +864,7 @@ mod tests {
 
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert!(tools.len() >= 10); // We have 10 tools
+        assert_eq!(tools.len(), 15, "Expected 15 MCP tools");
 
         // Check some tool names
         let tool_names: Vec<&str> = tools
@@ -1041,7 +1032,7 @@ mod tests {
         assert!(resp.result.is_some());
         let result = resp.result.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("RK_DEV_HOST_IP"));
+        assert!(text.contains("DEV_HOST_IP"));
     }
 
     #[tokio::test]

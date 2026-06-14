@@ -16,6 +16,5 @@ Serial console monitoring hooks — auto-start MCP server + real-time statusline
 ## Deploy
 
 ```bash
-cp hooks/*.py ~/.claude/hooks/embedded-debug/
-python3 ~/.claude/hooks/embedded-debug/statusline.py --daemon &
+cp hooks/claude/*.py ~/.claude/hooks/embedded-debug/
 ```

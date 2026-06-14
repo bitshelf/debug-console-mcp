@@ -10,6 +10,30 @@ description: >-
 
 Rust 实现 (mcp-rs/), 零框架 MCP (纯 JSON-RPC 2.0)。支持 stdio + HTTP 双传输模式。
 
+## CRITICAL: Dev Host vs Target Device
+
+- **Dev Host** (`DEV_HOST_IP`): 运行 ser2net 的中转机器，串口线和继电器接在这台机器上
+- **Target Device** (DUT): 被调试的嵌入式板子，通过串口连接到 Dev Host
+- **Local Machine**: 运行 Claude Code 的开发机，通过 MCP 与 Dev Host 上的 ser2net 通信
+- `serial_send_command` 发送的命令在 **Target Device** 上执行，不是 Dev Host
+- `serial_reset` 控制的是 Dev Host 上的继电器，从而复位 Target Device
+
+## Setup
+
+```bash
+# 1. 在项目根目录创建 .target.conf
+cp ~/.local/share/serial-debug-mcp/references/.target.conf.example .target.conf
+# 编辑 DEV_HOST_IP, SERIAL_PORT 等配置
+
+# 2. 确保 MCP binary 已安装
+ls ~/.local/bin/embedded-debug-mcp
+
+# 3. 启动 session 后，MCP 和 statusline daemon 自动启动
+# 无需手动操作 — SessionStart hook 处理一切
+```
+
+`.target.conf` 位置遵循向上查找规则：从 CWD 向上遍历，找到第一个 `.target.conf` 即为项目根目录。
+
 ## Quick Reference
 
 ```
@@ -29,9 +53,10 @@ serial_reset wait_boot=true  # 继电器复位
 serial_send_command "reboot" # 软重启 (<500ms, timeout=5)
 serial_enter_uboot           # 进入 U-Boot 命令行
 serial_uboot_command "boot"  # 从 U-Boot 继续启动
+serial_enter_maskrom         # 进入 Rockchip MASKROM 模式
 serial_new_log               # 手动切日志 (不复位)
 
-# 🆕 跨 SOC 自适应 (StageLearner)
+# 跨 SOC 自适应 (StageLearner)
 serial_load_reference "/path/to/new-soc-boot.log"
 serial_get_stages
 ```
@@ -64,24 +89,24 @@ State flow: `active → booting → uboot → booting → active`
 ## Configuration (.target.conf)
 
 ```bash
-RK_DEV_HOST_IP=192.168.1.xxx
-RK_SERIAL_PORT=2000
+DEV_HOST_IP=192.168.1.xxx
+SERIAL_PORT=2000
 
 # Optional auto-login
-RK_LOGIN_USER=root
-RK_LOGIN_PASS=password
+LOGIN_USER=root
+LOGIN_PASS=password
 
 # Optional relay control (via ser2net, no SSH)
-RK_RELAY_PORT=2001
-RK_RESET_CHANNEL=2
-RK_MASKROM_CHANNEL=1
+RELAY_PORT=2001
+RESET_CHANNEL=2
+MASKROM_CHANNEL=1
 
 # Monitoring
-RK_HANG_TIMEOUT=60
-RK_MAX_ARCHIVED_LOGS=10
+HANG_TIMEOUT=60
+MAX_ARCHIVED_LOGS=10
 
 # StageLearner: 参考启动日志 (启动时自动加载)
-RK_REFERENCE_LOG=/path/to/reference-boot.log
+REFERENCE_LOG=/path/to/reference-boot.log
 ```
 
 ## Common Workflows
@@ -123,7 +148,7 @@ serial_get_logs(archive=0, pattern="error|fail")  # current boot
 在 `.target.conf` 中设置参考日志路径, MCP 启动时自动加载:
 
 ```bash
-RK_REFERENCE_LOG=/path/to/reference-boot.log
+REFERENCE_LOG=/path/to/reference-boot.log
 ```
 
 **方式二: 手动加载**

@@ -9,7 +9,6 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-#[allow(dead_code)]
 pub struct RelayManager {
     host: String,
     port: u16,
@@ -38,6 +37,10 @@ impl RelayManager {
 
     pub fn configured(&self) -> bool {
         self.port > 0 && self.reset_ch > 0 && self.reset_ch <= 4
+    }
+
+    pub fn maskrom_ch(&self) -> u8 {
+        self.maskrom_ch
     }
 
     /// 确保 TCP 连接已打开 (5s 超时)
@@ -150,7 +153,6 @@ impl RelayManager {
 
     /// MASKROM 序列: MASKROM=低 → RESET=低 → RESET=高 → MASKROM=高
     /// 任何步骤失败 → 回滚释放所有引脚
-    #[allow(dead_code)]
     pub async fn enter_maskrom(&mut self) -> bool {
         if !self.configured() || self.maskrom_ch == 0 {
             return false;
@@ -167,7 +169,6 @@ impl RelayManager {
         }
     }
 
-    #[allow(dead_code)]
     async fn do_maskrom(&mut self) -> Result<(), std::io::Error> {
         self.channel_on(self.maskrom_ch).await?;
         tokio::time::sleep(Duration::from_secs(1)).await;

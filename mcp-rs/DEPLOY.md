@@ -183,7 +183,7 @@ printf '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n' | \
 └──────────────────────────────────────────────────────┘
 ```
 
-## 13 个 MCP Tools
+## 15 个 MCP Tools
 
 | Tool | 说明 |
 |------|------|
@@ -193,7 +193,9 @@ printf '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n' | \
 | `serial_list_logs` | 列出所有归档启动日志 |
 | `serial_reset` | 继电器硬件复位 + 日志切割 |
 | `serial_enter_uboot` | 强制进入 U-Boot 交互提示符 |
+| `serial_enter_maskrom` | 强制进入 Rockchip MASKROM 模式 |
 | `serial_wait_pattern` | 阻塞等待指定正则模式出现 |
+| `serial_uboot_command` | 在 U-Boot 提示符下发送命令 |
 | `serial_new_log` | 手动切割日志 (不复位) |
 | `serial_poll_logs` | 增量获取新输出 |
 | `serial_get_config` | 获取当前目标配置 |

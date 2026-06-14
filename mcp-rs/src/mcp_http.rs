@@ -28,7 +28,7 @@ pub async fn run_http(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Spawn read loop: 事件驱动 (epoll, 无轮询), 加防抖防止 CPU 占用
     let engine_read = engine.clone();
-    let _read_handle = tokio::spawn(async move {
+    let read_handle = tokio::spawn(async move {
         loop {
             let mut eng = engine_read.lock().await;
             eng.read_loop_iter().await;
@@ -38,9 +38,9 @@ pub async fn run_http(
         }
     });
 
-    // Spawn watchdog: 每 5s 检查挂死/心跳
+    // Spawn watchdog: 每 2s 检查挂死/心跳
     let engine_wd = engine.clone();
-    let _wd_handle = tokio::spawn(async move {
+    let watchdog_handle = tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
         loop {
             tick.tick().await;
@@ -48,6 +48,12 @@ pub async fn run_http(
             eng.watchdog_once();
         }
     });
+
+    // 注册后台任务 handle 到 engine (确保 stop() 能正确清理)
+    {
+        let mut eng = engine.lock().await;
+        eng.set_background_tasks(read_handle, watchdog_handle);
+    }
 
     let server = Arc::new(Mutex::new(McpServer::new(engine)));
 

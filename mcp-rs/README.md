@@ -34,17 +34,17 @@ cargo build --release
 
 ```bash
 # 必填: 串口连接
-RK_DEV_HOST_IP=192.168.1.xxx
-RK_SERIAL_PORT=2000
+DEV_HOST_IP=192.168.1.xxx
+SERIAL_PORT=2000
 
 # 可选: 自动登录
-RK_LOGIN_USER=root
-RK_LOGIN_PASS=mypassword
+LOGIN_USER=root
+LOGIN_PASS=mypassword
 
 # 可选: 继电器复位
-RK_RELAY_PORT=2001
-RK_RESET_CHANNEL=2
-RK_MASKROM_CHANNEL=1
+RELAY_PORT=2001
+RESET_CHANNEL=2
+MASKROM_CHANNEL=1
 ```
 
 ## MCP Tools
@@ -57,13 +57,15 @@ RK_MASKROM_CHANNEL=1
 | `serial_list_logs` | 列出所有归档启动日志 |
 | `serial_reset` | 硬件复位 + 日志切割 |
 | `serial_enter_uboot` | 强制进入 U-Boot 交互提示符 |
+| `serial_enter_maskrom` | 强制进入 Rockchip MASKROM 模式 |
 | `serial_wait_pattern` | 阻塞等待串口输出中出现指定模式 |
+| `serial_uboot_command` | 在 U-Boot 提示符下发送命令 |
 | `serial_new_log` | 手动切割日志 (不复位) |
 | `serial_poll_logs` | 增量获取新输出 (文件位置跟踪) |
 | `serial_get_config` | 获取当前目标配置 |
 | `serial_claim` | 夺取串口所有权 |
-| `serial_load_reference` | 🆕 加载参考启动日志启用自适应阶段检测 |
-| `serial_get_stages` | 🆕 查看已学习的启动阶段指纹 |
+| `serial_load_reference` | 加载参考启动日志启用自适应阶段检测 |
+| `serial_get_stages` | 查看已学习的启动阶段指纹 |
 
 ## 模块结构
 

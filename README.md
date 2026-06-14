@@ -46,7 +46,7 @@ Claude Code 启动时，SessionStart hook 自动检测 `.target.conf`，生成 `
 | U-Boot 中断 | 检测 autoboot → Ctrl-C pre-flood → `=>` 提示符 |
 | 自动登录 | 识别 login/password 提示 → 自动发送凭据 |
 | 崩溃检测 | Kernel panic/BUG/Oops → `crashed` 状态 |
-| 继电器控制 | 4 字节协议 over TCP → `serial_reset`, `serial_enter_uboot` |
+| 继电器控制 | 4 字节协议 over TCP → `serial_reset`, `serial_enter_uboot`, `serial_enter_maskrom` |
 | 跨 SOC 自适应 | StageLearner: 参考日志 → 文本相似度 → 匹配新 SOC 启动阶段 |
 | 状态栏 | inotify 事件驱动，即时更新 (非轮询) |
 
@@ -60,40 +60,42 @@ Claude Code 启动时，SessionStart hook 自动检测 `.target.conf`，生成 `
 | `serial_list_logs` | 列出所有启动日志 |
 | `serial_reset` | 硬件复位 + 日志切割 |
 | `serial_enter_uboot` | 强制进入 U-Boot 交互提示符 |
+| `serial_enter_maskrom` | 强制进入 Rockchip MASKROM 模式 |
 | `serial_wait_pattern` | 阻塞等待指定模式出现 |
+| `serial_uboot_command` | 在 U-Boot 提示符下发送命令 |
 | `serial_new_log` | 手动切割日志 |
 | `serial_poll_logs` | 增量获取新输出 |
 | `serial_get_config` | 查看当前配置 |
 | `serial_claim` | 夺取串口所有权 |
-| `serial_load_reference` | 🆕 加载参考日志 (自适应阶段检测) |
-| `serial_get_stages` | 🆕 查看已学习阶段指纹 |
+| `serial_load_reference` | 加载参考日志 (自适应阶段检测) |
+| `serial_get_stages` | 查看已学习阶段指纹 |
 
 ## 配置 (`.target.conf`)
 
 ```bash
 # 串口连接 (必填)
-RK_DEV_HOST_IP=192.168.1.xxx
-RK_SERIAL_PORT=2000
+DEV_HOST_IP=192.168.1.xxx
+SERIAL_PORT=2000
 
 # 继电器控制
-RK_RELAY_PORT=2001
-RK_RESET_CHANNEL=1
-RK_MASKROM_CHANNEL=2
+RELAY_PORT=2001
+RESET_CHANNEL=1
+MASKROM_CHANNEL=2
 
 # 登录凭据
-RK_LOGIN_USER=root
-RK_LOGIN_PASS=
+LOGIN_USER=root
+LOGIN_PASS=
 
 # U-Boot 中断策略 (lava/aggressive)
-RK_UBOOT_INTERRUPT_STRATEGY=lava
+UBOOT_INTERRUPT_STRATEGY=lava
 
 # 监控
-RK_HANG_TIMEOUT=60
-RK_HANG_HYSTERESIS=3
-RK_MAX_ARCHIVED_LOGS=10
+HANG_TIMEOUT=60
+HANG_HYSTERESIS=3
+MAX_ARCHIVED_LOGS=10
 
 # StageLearner: 参考启动日志 (新 SOC 自适应)
-RK_REFERENCE_LOG=/path/to/reference-boot.log
+REFERENCE_LOG=/path/to/reference-boot.log
 ```
 
 ## Transport 模式
@@ -152,14 +154,14 @@ serial_get_stages  # → ddr:35, spl:14, bl31:42, uboot:8, kernel:15, ...
 │   │   ├── config.rs           # shell 风格配置解析
 │   │   └── marker.rs           # 标记符生成
 │   └── .target.conf
-└── mcp/                        # Python MCP (legacy)
+└── mcp-python/                 # Python MCP (legacy)
     └── ...
 
 ~/.claude/hooks/embedded-debug/
 ├── lib.py                      # 共享工具
 ├── session-start.py            # 自动启动
 ├── session-stop.py
-├── pre-tool-use.py             # 🆕 拦截原始串口访问
+├── pre-tool-use.py             # 拦截原始串口访问
 ├── user-prompt-submit.py       # 状态告警
 └── statusline.py               # inotify 事件驱动
 ```

@@ -122,7 +122,9 @@ struct Watcher {
 pub struct StageFingerprint {
     pub stage: String,
     pub anchor: String,
+    #[allow(dead_code)]
     pub prefix: String,
+    #[allow(dead_code)]
     pub suffix: String,
     /// 预计算的 anchor 3-gram 哈希值 (u64)
     anchor_grams: Vec<u64>,
@@ -340,28 +342,6 @@ fn jaccard_similarity(a_grams: &[u64], b_grams: &[u64]) -> f64 {
     intersection as f64 / union as f64
 }
 
-/// 字符串相似度: 基于最长公共子序列 (LCS) 的归一化比率
-fn str_similarity(a: &str, b: &str) -> f64 {
-    if a.is_empty() || b.is_empty() { return 0.0; }
-    if a == b { return 1.0; }
-
-    // 快速路径: 包含关系
-    if a.len() <= b.len() && b.contains(a) { return 0.85; }
-    if b.len() <= a.len() && a.contains(b) { return 0.85; }
-
-    // 字符级 Jaccard 相似度 (3-grams)
-    let a_grams: std::collections::HashSet<&[u8]> = a.as_bytes().windows(3).collect();
-    let b_grams: std::collections::HashSet<&[u8]> = b.as_bytes().windows(3).collect();
-
-    if a_grams.is_empty() || b_grams.is_empty() { return 0.0; }
-
-    let intersection = a_grams.intersection(&b_grams).count();
-    let union = a_grams.union(&b_grams).count();
-
-    if union == 0 { return 0.0; }
-    intersection as f64 / union as f64
-}
-
 pub struct BootStageDetector {
     line_buf: Vec<u8>,
     boot_detected: bool,
@@ -407,12 +387,6 @@ impl BootStageDetector {
             let re_str = re.as_str().to_string();
             self.watchers.retain(|w| w.pattern.as_str() != re_str);
         }
-    }
-
-    /// 编译 pattern 为 Regex
-    #[allow(dead_code)]
-    pub fn compile_pattern(pattern: &str) -> Result<Regex, regex::Error> {
-        Regex::new(pattern)
     }
 
     /// 输入数据，返回检测到的事件列表
@@ -479,12 +453,9 @@ impl BootStageDetector {
         self.boot_detected = false;
         self.login_sent = false;
         self.password_sent = false;
-    }
-
-    /// 仅重置登录状态 — boot_start 回调使用
-    pub fn reset_login_state(&mut self) {
-        self.login_sent = false;
-        self.password_sent = false;
+        if let Some(ref mut learner) = self.learner {
+            learner.reset();
+        }
     }
 
     // ── internal ──
@@ -803,21 +774,6 @@ mod tests {
     }
 
     #[test]
-    fn test_reset_login_state() {
-        let mut detector = BootStageDetector::new();
-
-        // Trigger login
-        detector.feed(b"login:\n");
-
-        // Reset login state
-        detector.reset_login_state();
-
-        // Login prompt should trigger again
-        let events = detector.feed(b"login:\n");
-        assert!(has_event(&events, "LoginPrompt"));
-    }
-
-    #[test]
     fn test_multiline_feed() {
         let mut detector = BootStageDetector::new();
 
@@ -864,7 +820,7 @@ mod tests {
         detector.remove_watcher_by_pattern("test.*pattern");
 
         // Watcher should be removed
-        let events = detector.feed(b"test_pattern_line\n");
+        let _events = detector.feed(b"test_pattern_line\n");
         assert!(rx.try_recv().is_err());
     }
 
@@ -883,7 +839,7 @@ mod tests {
     #[test]
     fn test_line_split_cr() {
         let mut detector = BootStageDetector::new();
-        let events = detector.feed(b"line1\r\nline2\r\n");
+        let _events = detector.feed(b"line1\r\nline2\r\n");
 
         // Should process both lines
         // (exact events depend on content)

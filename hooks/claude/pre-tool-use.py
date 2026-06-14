@@ -8,6 +8,7 @@ agent to use MCP tools instead.
 """
 
 import json
+import re
 import sys
 import os
 from pathlib import Path
@@ -18,28 +19,52 @@ if str(_HOOK_DIR) not in sys.path:
 
 from lib import find_project_dir
 
-# Patterns that indicate raw serial access — should use MCP instead
-SERIAL_RAW_PATTERNS = [
-    r"nc\s+.*192\.168\.",        # netcat to dev host
-    r"ncat\s+.*192\.168\.",
-    r"tio\s+/dev/tty",           # tio serial terminal
-    r"screen\s+/dev/tty",        # screen serial
-    r"cu\s+-l\s+/dev/tty",       # cu serial
-    r"stty\s+-F\s+/dev/tty",     # stty config
-    r"picocom\s+/dev/tty",
-    r"minicom\s+/dev/tty",
-    r">\s*/dev/tty",             # direct write to serial
-    r"echo.*>\s*/dev/tty",
-    r"socat\s+.*tty",            # socat to serial
-    r"printf\s+.*\\\\x[0-9a-fA-F].*2000",  # relay raw packet
-    r"\\\\xa0\\\\x01",           # relay protocol raw bytes
-]
 
-# Patterns that are valid but should prefer MCP
-RELAY_DIRECT_PATTERNS = [
-    r"nc\s+.*192\.168\.\d+\.\d+\s+2001",  # relay port
-    r">\s*/dev/tcp/.*2001",
-]
+def _read_dev_host() -> str:
+    """Read DEV_HOST_IP from .target.conf. Returns empty string if not found."""
+    conf = Path.cwd() / ".target.conf"
+    if not conf.exists():
+        return ""
+    try:
+        for line in conf.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("DEV_HOST_IP="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return ""
+
+
+# Patterns that indicate raw serial access — should use MCP instead
+def _build_serial_patterns() -> list[str]:
+    """Build serial raw-access patterns, using the actual dev host IP if available."""
+    dev_host = _read_dev_host()
+    host_pattern = re.escape(dev_host) if dev_host else r"192\.168\.\d+\.\d+"
+    return [
+        rf"nc\s+.*{host_pattern}",       # netcat to dev host
+        rf"ncat\s+.*{host_pattern}",
+        r"tio\s+/dev/tty",               # tio serial terminal
+        r"screen\s+/dev/tty",            # screen serial
+        r"cu\s+-l\s+/dev/tty",           # cu serial
+        r"stty\s+-F\s+/dev/tty",         # stty config
+        r"picocom\s+/dev/tty",
+        r"minicom\s+/dev/tty",
+        r">\s*/dev/tty",                 # direct write to serial
+        r"echo.*>\s*/dev/tty",
+        r"socat\s+.*tty",                # socat to serial
+        r"printf\s+.*\\\\x[0-9a-fA-F].*2000",  # relay raw packet
+        r"\\\\xa0\\\\x01",               # relay protocol raw bytes
+    ]
+
+# Patterns that are valid but should prefer MCP (built dynamically with dev host IP)
+def _build_relay_patterns() -> list[str]:
+    """Build relay raw-access patterns, using the actual dev host IP if available."""
+    dev_host = _read_dev_host()
+    host_pattern = re.escape(dev_host) if dev_host else r"192\.168\.\d+\.\d+"
+    return [
+        rf"nc\s+.*{host_pattern}\s+2001",  # relay port
+        r">\s*/dev/tcp/.*2001",
+    ]
 
 
 def main():
@@ -68,10 +93,11 @@ def main():
         print(json.dumps({"continue": True}))
         sys.exit(0)
 
-    import re
+    serial_patterns = _build_serial_patterns()
+    relay_patterns = _build_relay_patterns()
 
     # Check for raw serial access
-    for pattern in SERIAL_RAW_PATTERNS:
+    for pattern in serial_patterns:
         if re.search(pattern, command):
             print(json.dumps({
                 "continue": True,
@@ -85,7 +111,7 @@ def main():
             sys.exit(0)
 
     # Check for relay direct access
-    for pattern in RELAY_DIRECT_PATTERNS:
+    for pattern in relay_patterns:
         if re.search(pattern, command):
             print(json.dumps({
                 "continue": True,

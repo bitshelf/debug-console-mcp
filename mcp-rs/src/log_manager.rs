@@ -54,6 +54,7 @@ impl LogManager {
 
     fn next_boot_number(&mut self) -> u32 {
         let count_file = self.dut_dir.join(".boot_count");
+        fs::create_dir_all(&self.dut_dir).ok();
         let n = fs::read_to_string(&count_file)
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok())
@@ -64,6 +65,7 @@ impl LogManager {
     }
 
     /// 打开当前周期日志文件
+    #[allow(dead_code)]
     pub fn open_current(&mut self) {
         let n = self.next_boot_number();
         fs::create_dir_all(&self.log_dir).ok();
@@ -120,15 +122,29 @@ impl LogManager {
             self.ring_buffer.drain(..drain);
             self.boot_start_pos = self.boot_start_pos.saturating_sub(drain);
         }
+        // 文件大小限制检查 → 超出则 rotate
+        if self.max_file_size > 0 {
+            if let Some(ref file) = self.current_file {
+                if let Ok(meta) = file.metadata() {
+                    if meta.len() > self.max_file_size {
+                        self.rotate();
+                        // 将当前数据写入新文件（rotate 已创建新文件）
+                        if let Some(ref mut f) = self.current_file {
+                            f.write_all(&clean).ok();
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// 确保 serial.current.log + serial.full.log 已打开
     pub fn ensure_current_file(&mut self) {
         fs::create_dir_all(&self.log_dir).ok();
-        // serial.current.log (当前启动周期, 可截断)
+        // serial.current.log (当前启动周期, flush_boot_log/open_current 管理 symlink)
         if self.current_file.is_none() {
             let path = self.log_dir.join("serial.current.log");
-            if path.is_symlink() { std::fs::remove_file(&path).ok(); }
+            // 不删除 symlink: 由 flush_boot_log / open_current 统一管理
             match fs::OpenOptions::new().create(true).append(true).open(&path) {
                 Ok(file) => { self.current_file = Some(file); self.current_path = Some(path); }
                 Err(e) => tracing::error!("Failed to open serial.current.log: {e}"),
@@ -147,10 +163,21 @@ impl LogManager {
     /// 标记新启动周期: 保存快照 → 截断 serial.current.log → 重置缓冲
     pub fn mark_boot_start(&mut self) {
         self.flush_boot_log();
+        self.start_new_cycle();
+    }
+
+    /// 结束当前周期，关闭旧文件，截断 serial.current.log，创建新 symlink
+    fn start_new_cycle(&mut self) {
         self.current_file.take();
-        let current = self.log_dir.join("serial.current.log");
-        if current.exists() { std::fs::write(&current, b"").ok(); }
-        self.ensure_current_file();
+        // Truncate serial.current.log so the new cycle starts fresh
+        let path = self.log_dir.join("serial.current.log");
+        self.current_file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .ok();
+        self.current_path = Some(path);
         self.cleanup_old_logs();
         self.boot_start_pos = self.ring_buffer.len();
     }
@@ -174,6 +201,11 @@ impl LogManager {
         if let Ok(mut file) = fs::OpenOptions::new().append(true).create(true).open(&path) {
             file.write_all(&boot_data).ok();
             self.current_path = Some(path);
+            // 更新 symlink serial.current.log → 最新 boot 文件
+            let link = self.log_dir.join("serial.current.log");
+            std::fs::remove_file(&link).ok();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&fname, &link).ok();
             tracing::info!("Boot log saved: {} ({} bytes)", fname, boot_data.len());
         }
         // 清理旧日志
@@ -183,12 +215,30 @@ impl LogManager {
     }
 
     /// 切割: flush buffer → 打开新日志 → 清理旧日志
+    /// 显式 rotate 始终创建新 boot 文件 + 更新 symlink（即使 ring buffer 为空）
     pub fn rotate(&mut self) {
+        let had_data = self.boot_start_pos < self.ring_buffer.len();
         self.flush_boot_log();
+        if !had_data {
+            // flush_boot_log 因无 ring buffer 数据而跳过 → 手动创建空 boot 文件 + symlink
+            fs::create_dir_all(&self.log_dir).ok();
+            let n = self.next_boot_number();
+            let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+            let fname = format!("boot-{:03}_{ts}.log", n);
+            let path = self.log_dir.join(&fname);
+            fs::OpenOptions::new().create(true).append(true).open(&path).ok();
+            // 更新 symlink
+            let link = self.log_dir.join("serial.current.log");
+            std::fs::remove_file(&link).ok();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&fname, &link).ok();
+        }
+        self.start_new_cycle();
     }
 
     pub fn close(&mut self) {
         self.current_file.take();
+        self.full_file.take();
     }
 
     /// 列出所有归档启动日志 (最新在前)
@@ -274,7 +324,7 @@ impl LogManager {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) == Some("log")
-                    && !path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n == "serial.current.log")
+                    && !path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n == "serial.current.log" || n == "serial.full.log")
                 {
                     let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                     result.push(LogFileInfo {
@@ -576,16 +626,120 @@ mod tests {
 
     #[test]
     fn test_max_file_size_rotation() {
-        let (mut lm, _tmp) = create_test_log_manager(10, 0); // 0 MB = 0 bytes = rotate immediately
+        let (mut lm, _tmp) = create_test_log_manager(10, 0); // 0 MB → never rotate by size (no limit)
 
         lm.open_current();
         let path1 = lm.current_path().unwrap().to_path_buf();
 
-        // Write some data (should trigger rotation due to 0 size limit)
+        // Write data within header (< 0 bytes limit = no rotation, 0 = disabled)
         lm.write(b"some data\n");
 
-        // Should have rotated
+        // No rotation — 0 MB means "no size limit"
         let path2 = lm.current_path().unwrap().to_path_buf();
-        assert_ne!(path1, path2);
+        assert_eq!(path1, path2, "0 MB = no limit, should NOT rotate");
+    }
+
+    // ── Smoke tests: boot log splitting ─────────────────────────────────
+
+    /// ensure_current_file() opens serial.current.log WITHOUT creating a
+    /// numbered boot-NNN.log.  Boot log files are only created on BootStart.
+    #[test]
+    fn test_ensure_current_file_no_numbered_log() {
+        let (mut lm, tmp) = create_test_log_manager(10, 100);
+        let log_dir = tmp.path().join(".dut-serial/logs");
+
+        lm.ensure_current_file();
+
+        // serial.current.log should exist as a regular file
+        assert!(log_dir.join("serial.current.log").exists());
+        // But no numbered boot-NNN.log should have been created
+        let numbered: Vec<_> = std::fs::read_dir(&log_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("boot-") && n.ends_with(".log"))
+            })
+            .collect();
+        assert!(
+            numbered.is_empty(),
+            "ensure_current_file() should NOT create numbered boot logs, got {}",
+            numbered.len()
+        );
+    }
+
+    /// Only mark_boot_start() creates numbered boot logs.
+    #[test]
+    fn test_mark_boot_start_creates_numbered_log() {
+        let (mut lm, tmp) = create_test_log_manager(10, 100);
+        let log_dir = tmp.path().join(".dut-serial/logs");
+
+        // Write some data first
+        lm.ensure_current_file();
+        lm.write(b"SPL: U-Boot 2024\n");
+        lm.write(b"kernel booting...\n");
+
+        // Simulate BootStart detection
+        lm.mark_boot_start();
+
+        // Should have created a numbered boot-NNN.log
+        let numbered: Vec<_> = std::fs::read_dir(&log_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("boot-") && n.ends_with(".log"))
+            })
+            .collect();
+        assert_eq!(numbered.len(), 1, "mark_boot_start should create exactly 1 boot log");
+        assert!(log_dir.join("serial.current.log").is_symlink());
+    }
+
+    /// After mark_boot_start, new data goes to a fresh cycle (new current).
+    #[test]
+    fn test_mark_boot_start_resets_cycle() {
+        let (mut lm, tmp) = create_test_log_manager(10, 100);
+        let log_dir = tmp.path().join(".dut-serial/logs");
+
+        lm.ensure_current_file();
+        lm.write(b"boot 1 data\n");
+        let boot1 = lm.boot_number();
+
+        lm.mark_boot_start();
+        assert_eq!(lm.boot_number(), boot1 + 1); // incremented
+
+        lm.write(b"boot 2 data\n");
+
+        // boot 1 data should be in the archived file, not current
+        let current = std::fs::read_to_string(log_dir.join("serial.current.log")).unwrap();
+        assert!(current.contains("boot 2 data"));
+        assert!(!current.contains("boot 1 data")); // flushed to numbered log
+    }
+
+    /// Double mark_boot_start with no data in between should not create empty logs.
+    #[test]
+    fn test_double_mark_boot_start_no_empty_logs() {
+        let (mut lm, tmp) = create_test_log_manager(10, 100);
+        let log_dir = tmp.path().join(".dut-serial/logs");
+
+        lm.ensure_current_file();
+        lm.write(b"real boot data\n");
+        lm.mark_boot_start();
+
+        // Second mark_boot_start with NO new data → flush_boot_log returns early
+        lm.mark_boot_start();
+
+        let numbered: Vec<_> = std::fs::read_dir(&log_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("boot-") && n.ends_with(".log"))
+            })
+            .collect();
+        assert_eq!(numbered.len(), 1, "double mark with no data should NOT create empty logs");
     }
 }

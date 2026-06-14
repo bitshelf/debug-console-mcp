@@ -7,6 +7,7 @@ Reads .dut-serial/target-state, outputs {"continue": true} or {"systemMessage": 
 
 import json
 import os
+import signal
 import sys
 from pathlib import Path
 
@@ -49,13 +50,30 @@ def _check_ser2net(host: str, port: str) -> bool:
 
 
 def _restart_mcp(project_dir: str) -> None:
-    """释放端口并重启 MCP HTTP server."""
+    """Release port 3000 and restart MCP HTTP server — only kills embedded-debug processes."""
     import subprocess
     import shutil
     binary = shutil.which("embedded-debug-mcp") or os.path.expanduser("~/.local/bin/embedded-debug-mcp")
     if not Path(binary).exists():
         return
-    subprocess.run(["fuser", "-k", "3000/tcp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # Targeted kill: only kill embedded-debug processes on port 3000, not arbitrary services
+    try:
+        result = subprocess.run(
+            ["fuser", "3000/tcp"], capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            for pid_str in result.stdout.strip().split():
+                try:
+                    pid = int(pid_str)
+                    # Verify the process is an embedded-debug server before killing
+                    comm = (Path("/proc") / str(pid) / "comm").read_text().strip()
+                    cmdline = (Path("/proc") / str(pid) / "cmdline").read_text()
+                    if "python" in comm or "embedded" in comm or "server.py" in cmdline:
+                        os.kill(pid, signal.SIGTERM)
+                except (ValueError, OSError, ProcessLookupError):
+                    pass
+    except (subprocess.TimeoutExpired, OSError):
+        pass
     subprocess.Popen(
         [binary, "--http"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

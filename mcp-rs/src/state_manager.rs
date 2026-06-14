@@ -70,6 +70,10 @@ impl TargetState {
 pub struct StateManager {
     current: TargetState,
     state_file: PathBuf,
+    /// Project-local cache (fallback, read by Python hook)
+    cache_file: PathBuf,
+    /// /dev/shm cache — zero-syscall read by Python hook via `cat`
+    shm_cache_file: PathBuf,
     hang_timeout_secs: u64,
     hysteresis: u32,
     hang_count: u32,
@@ -86,11 +90,26 @@ impl StateManager {
     pub fn new(project_dir: &Path, hang_timeout: u64, hysteresis: u32, dut_dir: &str) -> Self {
         let dut_dir_path = project_dir.join(dut_dir);
         let state_file = dut_dir_path.join("target-state");
+        let cache_file = dut_dir_path.join("statusline-cache");
+
+        // /dev/shm cache: keyed by project path hash so multiple projects don't collide
+        let shm_dir = if std::path::Path::new("/dev/shm").is_dir() {
+            "/dev/shm"
+        } else {
+            "/tmp"
+        };
+        let project_hash = Self::project_hash(project_dir);
+        let shm_cache_file = std::path::PathBuf::from(format!(
+            "{}/claude-status-{}", shm_dir, project_hash
+        ));
+
         std::fs::create_dir_all(&dut_dir_path).ok();
 
         Self {
             current: TargetState::Stopped,
             state_file,
+            cache_file,
+            shm_cache_file,
             hang_timeout_secs: hang_timeout,
             hysteresis,
             hang_count: 0,
@@ -99,6 +118,19 @@ impl StateManager {
             last_probe_time: Instant::now(),
             heartbeat_missed: 0,
         }
+    }
+
+    /// Stable 8-char hex hash matching Python's get_session_id() (md5).
+    /// Both MCP and statusline hook use the same project_dir → same hash.
+    fn project_hash(project_dir: &Path) -> String {
+        use md5::{Digest, Md5};
+        let canonical = project_dir
+            .canonicalize()
+            .unwrap_or_else(|_| project_dir.to_path_buf());
+        let mut hasher = Md5::new();
+        hasher.update(canonical.to_string_lossy().as_bytes());
+        let digest = hasher.finalize();
+        format!("{:08x}", digest).chars().take(8).collect()
     }
 
     /// 写入 PID 文件 — 仅 lock 成功后调用
@@ -129,17 +161,41 @@ impl StateManager {
 
         match new {
             TargetState::Stopped => {
-                // MCP Server 关闭 → 删除状态文件，statusline 不显示任何状态
                 self.delete_state_file();
-                tracing::info!("StateManager: deleted state file (server stopped)");
+                self.delete_cache_file();
+                self.delete_shm_cache();
             }
             TargetState::Connecting => {
                 // 不写文件，避免 statusline 闪烁
             }
-            _ => {
-                self.atomic_write(new.as_str());
+            TargetState::Active
+            | TargetState::Booting
+            | TargetState::Booted
+            | TargetState::UBoot
+            | TargetState::Crashed
+            | TargetState::Disconnected
+            | TargetState::DutOff => {
+                self.atomic_write(&self.state_file, new.as_str());
+                let text = Self::format_statusline(new);
+                self.atomic_write(&self.cache_file, &text);
+                self.atomic_write(&self.shm_cache_file, &text);
             }
         }
+    }
+
+    /// ANSI-formatted statusline text for a given state.
+    fn format_statusline(state: TargetState) -> String {
+        let text: &str = match state {
+            TargetState::Active => "\x1b[32m● serial:active\x1b[0m",
+            TargetState::Booting => "\x1b[33m◐ serial:booting\x1b[0m",
+            TargetState::Booted => "\x1b[32m● serial:booted\x1b[0m",
+            TargetState::UBoot => "\x1b[36m● serial:uboot\x1b[0m",
+            TargetState::Crashed => "\x1b[31m✗ serial:crashed\x1b[0m",
+            TargetState::Disconnected => "\x1b[31m✗ serial:disconnected\x1b[0m",
+            TargetState::DutOff => "\x1b[31m✗ serial:DUT-off\x1b[0m",
+            TargetState::Stopped | TargetState::Connecting => "",
+        };
+        text.to_string()
     }
 
     /// 每次收到串口数据时调用 — 重置挂死和心跳计数器
@@ -204,23 +260,27 @@ impl StateManager {
         self.last_data_time.elapsed()
     }
 
-    fn atomic_write(&self, state: &str) {
-        let tmp = self.state_file.with_extension("tmp");
-        if let Err(e) = std::fs::write(&tmp, state) {
+    fn atomic_write(&self, path: &Path, content: &str) {
+        let tmp = path.with_extension("tmp");
+        if let Err(e) = std::fs::write(&tmp, content) {
             tracing::error!("StateManager: write failed: {e}");
             return;
         }
-        if let Err(e) = std::fs::rename(&tmp, &self.state_file) {
+        if let Err(e) = std::fs::rename(&tmp, path) {
             tracing::error!("StateManager: rename failed: {e}");
         }
     }
 
     fn delete_state_file(&self) {
-        if self.state_file.exists() {
-            if let Err(e) = std::fs::remove_file(&self.state_file) {
-                tracing::error!("StateManager: delete failed: {e}");
-            }
-        }
+        let _ = std::fs::remove_file(&self.state_file);
+    }
+
+    fn delete_cache_file(&self) {
+        let _ = std::fs::remove_file(&self.cache_file);
+    }
+
+    fn delete_shm_cache(&self) {
+        let _ = std::fs::remove_file(&self.shm_cache_file);
     }
 }
 
@@ -397,11 +457,55 @@ mod tests {
         let (sm, tmp) = create_test_state_manager(60, 3);
         let state_file = tmp.path().join(".dut-serial/target-state");
 
-        sm.atomic_write("test-state");
+        sm.atomic_write(&state_file, "test-state");
         assert_eq!(std::fs::read_to_string(&state_file).unwrap(), "test-state");
 
-        sm.atomic_write("another-state");
+        sm.atomic_write(&state_file, "another-state");
         assert_eq!(std::fs::read_to_string(&state_file).unwrap(), "another-state");
+    }
+
+    #[test]
+    fn test_statusline_cache_write() {
+        let (mut sm, tmp) = create_test_state_manager(60, 3);
+        let cache_file = tmp.path().join(".dut-serial/statusline-cache");
+        let shm_file = std::path::PathBuf::from(format!(
+            "/dev/shm/claude-status-{}",
+            StateManager::project_hash(tmp.path())
+        ));
+
+        sm.transition(TargetState::Active);
+        assert!(cache_file.exists());
+        let content = std::fs::read_to_string(&cache_file).unwrap();
+        assert!(content.contains("serial:active"));
+        // /dev/shm cache is only written if /dev/shm exists
+        if std::path::Path::new("/dev/shm").is_dir() {
+            assert!(shm_file.exists());
+            let shm_content = std::fs::read_to_string(&shm_file).unwrap();
+            assert!(shm_content.contains("serial:active"));
+        }
+
+        sm.transition(TargetState::DutOff);
+        let content = std::fs::read_to_string(&cache_file).unwrap();
+        assert!(content.contains("serial:DUT-off"));
+    }
+
+    #[test]
+    fn test_format_statusline_all_states_have_text() {
+        for state in &[
+            TargetState::Active,
+            TargetState::Booting,
+            TargetState::Booted,
+            TargetState::UBoot,
+            TargetState::Crashed,
+            TargetState::Disconnected,
+            TargetState::DutOff,
+        ] {
+            let text = StateManager::format_statusline(*state);
+            assert!(!text.is_empty(), "{:?} should have statusline text", state);
+        }
+        // Stopped/Connecting produce empty string (no display)
+        assert_eq!(StateManager::format_statusline(TargetState::Stopped), "");
+        assert_eq!(StateManager::format_statusline(TargetState::Connecting), "");
     }
 
     #[test]
