@@ -1,0 +1,128 @@
+# Embedded Debug Target Configuration (TOML)
+# Copy to project root as .target.toml
+#
+# Supports two formats:
+#   1. Legacy: single [dev_host] + single DUT (no [[dut]] needed)
+#   2. Modern: [[dev_hosts]] array + [[dut]] array (multi-DUT, multi-host)
+#
+# Config semantics:
+#   commented (#) = not set (use default)
+#   ""            = explicitly empty → fall back to dev_host.ip
+#   Agent must NOT modify this file — read only.
+
+# ── Legacy format (single dev_host + single DUT) ─────────────────────────
+# Use this for simple setups with one board on one host PC.
+
+[dev_host]
+ip = "192.168.1.xxx"
+user = "linaro"
+# pass = ""
+
+[serial]
+# ip = ""            # empty → defaults to dev_host.ip
+port = 2000
+
+[target]
+login_user = "root"
+# login_pass = ""
+
+[uboot]
+# interrupt_char: "ctrl_c" for Rockchip, "2" for Allwinner, 0x03 for hex
+interrupt_char = "ctrl_c"
+interrupt_strategy = "aggressive"
+
+[relay]
+type = "usb-relay"   # usb-relay, ch340, external, none
+# ip = ""            # empty → defaults to dev_host.ip
+# port = 2001        # relay TCP port
+# reset_ch = 1       # RESET button channel (0 = relay not available)
+# maskrom_ch = 2
+# recovery_ch = 3
+
+[monitor]
+hang_timeout = 60
+max_archived_logs = 10
+
+[flash]
+# tool = "upgrade_tool"              # flash tool on dev host
+# upload_dir = "/tmp"                # image upload destination
+# full_image_cmd = "uf {image}"      # full firmware flash command template
+# kernel_image_cmd = "di -k {image}" # kernel-only flash command template
+# loader_bin = "/opt/rockchip/loader.bin"  # MASKROM loader binary path
+# loader_cmd = "db {loader}"         # loader flash command template
+# list_devices_cmd = "ld"            # list USB devices command
+
+# StageLearner: reference boot log for text-similarity stage detection + log split.
+reference_log = ".dut-serial/reference-boot.log"
+
+# ── Modern format (multi-dev_host + multi-DUT) ───────────────────────────
+# Uncomment below for multi-board setups. Each DUT references a dev_host by alias.
+#
+# [[dev_hosts]]
+# alias = "rk-board-pc"
+# ip = "192.168.1.xxx"
+# user = "linaro"
+#
+# [[dev_hosts]]
+# alias = "lab-pc-2"
+# ip = "192.168.1.yyy"
+# user = "linaro"
+#
+# [[dut]]
+# alias = "rk3576"
+# dev_host = "rk-board-pc"            # reference [[dev_hosts]] by alias
+#
+# [dut.serial]
+# port = 2000
+#
+# [dut.target]
+# login_user = "root"
+#
+# [dut.uboot]
+# interrupt_char = "ctrl_c"
+# interrupt_strategy = "aggressive"
+#
+# [dut.relay]
+# port = 2001
+# reset_ch = 1
+# maskrom_ch = 2
+# recovery_ch = 3
+#
+# [dut.monitor]
+# hang_timeout = 60
+# max_archived_logs = 10
+# reference_log = ".dut-serial/rk3576/reference-boot.log"
+#
+# [dut.flash]
+# tool = "upgrade_tool"
+# upload_dir = "/tmp"
+# full_image_cmd = "uf {image}"
+# kernel_image_cmd = "di -k {image}"
+# loader_bin = "/opt/rockchip/rk3576_loader.bin"
+# loader_cmd = "db {loader}"
+#
+# [[dut]]
+# alias = "rk3588"
+# dev_host = "lab-pc-2"
+#
+# [dut.serial]
+# port = 2010
+#
+# [dut.target]
+# login_user = "root"
+#
+# [dut.relay]
+# type = "usb-relay"
+# port = 2011
+# reset_ch = 1
+# maskrom_ch = 2
+#
+# [dut.monitor]
+# reference_log = ".dut-serial/rk3588/reference-boot.log"
+#
+# [dut.flash]
+# tool = "upgrade_tool"
+# upload_dir = "/tmp"
+# full_image_cmd = "uf {image}"
+# kernel_image_cmd = "di -k {image}"
+# loader_bin = "/opt/rockchip/rk3588_loader.bin"

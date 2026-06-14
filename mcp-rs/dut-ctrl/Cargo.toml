@@ -1,0 +1,15 @@
+[package]
+name = "dut-ctrl"
+version = "0.1.0"
+edition = "2021"
+description = "DUT hardware button control — reset, recovery, maskrom via CH340, USB relay, PDU, MQTT, GPIO, software reboot, external program"
+
+[dependencies]
+tokio = { version = "1", features = ["net", "time", "io-util", "process"] }
+tracing = "0.1"
+
+[build-dependencies]
+toml = "0.8"
+
+[package.metadata.learn]
+min_reset_ms = 3000

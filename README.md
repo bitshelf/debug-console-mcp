@@ -1,178 +1,339 @@
-# Embedded Debug Skill — Rust MCP v0.2
+# Debug Console MCP Server
 
-Rust MCP Server (mcp-rs/) + Python hooks. TCP 直连 Dev Host ser2net，零 socat，零 SSH。
+Rust MCP server for embedded Linux DUT debugging. TCP direct to ser2net,
+strsim-based boot stage detection, self-learning reference log, relay/PDU
+power control, multi-DUT support, exponential backoff reconnect.
 
-## 架构
+> Design spec: [docs/DESIGN-v0.3.md](docs/DESIGN-v0.3.md)
+> Observability: `#[instrument]` tracing spans on all key async functions
 
-```
-Claude Code                         Dev Host (192.168.1.xxx)
-┌─────────────────────┐            ┌──────────────────────────┐
-│  statusline hook     │            │  ser2net                  │
-│  (inotify 事件驱动)   │            │  TCP:2000 → /dev/ttyACM0 │
-│         │            │            │  TCP:2001 → 继电器       │
-│  ┌──────▼──────────┐ │   TCP:2000 │                          │
-│  │  Rust MCP Server │─┼──────────→│  目标板 (RK3576/LR3576)  │
-│  │  (stdio/HTTP)    │ │   TCP:2001 │                          │
-│  │                  │─┼──────────→│  ┌─RESET─┐ ┌─MASKROM─┐   │
-│  │  • SerialEngine  │ │            │  │  ch1   │ │   ch2    │   │
-│  │  • BootDetector  │ │            │  └───┬────┘ └────┬─────┘   │
-│  │  • StageLearner  │ │            │      │          │         │
-│  │  • RelayManager  │ │            │  目标板 RK3576  Android   │
-│  │  • LogManager    │ │            └──────────────────────────┘
-│  │  • StateManager  │─┼──▶ target-state ──inotify──▶ statusline
-│  └──────────────────┘ │
-└─────────────────────┘
-```
-
-## 快速开始
+## Quick Start — New Project
 
 ```bash
-# 构建
-cd mcp-rs && cargo build --release
+# 1. Build & deploy
+cd mcp-rs && cargo build --release && ./deploy.sh
 
-# 配置
-cp .target.conf.example .target.conf
-vi .target.conf   # 设置 RK_DEV_HOST_IP, RK_SERIAL_PORT
+# 2. Create config + per-DUT directory
+cp references/.target.toml.example .target.toml
+vi .target.toml                            # set [[dev_hosts]].ip, [dut.serial].port, [dut].alias
+mkdir -p .dut-serial/$(grep alias .target.toml | head -1 | cut -d'"' -f2)/logs
+
+# 3. Restart Claude Code → SessionStart hook auto-starts MCP
 ```
 
-Claude Code 启动时，SessionStart hook 自动检测 `.target.conf`，生成 `.mcp.json` 并启动 Rust MCP Server (stdio transport)。
+## Hardware Setup — Dev Host
 
-## 功能
+### udev Persistent Naming
 
-| 功能 | 实现 |
-|------|------|
-| 串口交互 | MCP tools: `serial_send_command`, `serial_get_state`, `serial_wait_pattern` |
-| 启动日志 | 按上电周期自动切割 (`boot-NNN_*.log`) |
-| U-Boot 中断 | 检测 autoboot → Ctrl-C pre-flood → `=>` 提示符 |
-| 自动登录 | 识别 login/password 提示 → 自动发送凭据 |
-| 崩溃检测 | Kernel panic/BUG/Oops → `crashed` 状态 |
-| 继电器控制 | 4 字节协议 over TCP → `serial_reset`, `serial_enter_uboot` |
-| 跨 SOC 自适应 | StageLearner: 参考日志 → 文本相似度 → 匹配新 SOC 启动阶段 |
-| 状态栏 | inotify 事件驱动，即时更新 (非轮询) |
-
-## MCP Tools
-
-| Tool | 功能 |
-|------|------|
-| `serial_send_command` | 在目标上执行 shell 命令 |
-| `serial_get_state` | 获取目标状态 (active/booting/uboot/crashed/DUT-off) |
-| `serial_get_logs` | 检索串口日志 (支持正则过滤) |
-| `serial_list_logs` | 列出所有启动日志 |
-| `serial_reset` | 硬件复位 + 日志切割 |
-| `serial_enter_uboot` | 强制进入 U-Boot 交互提示符 |
-| `serial_wait_pattern` | 阻塞等待指定模式出现 |
-| `serial_new_log` | 手动切割日志 |
-| `serial_poll_logs` | 增量获取新输出 |
-| `serial_get_config` | 查看当前配置 |
-| `serial_claim` | 夺取串口所有权 |
-| `serial_load_reference` | 🆕 加载参考日志 (自适应阶段检测) |
-| `serial_get_stages` | 🆕 查看已学习阶段指纹 |
-
-## 配置 (`.target.conf`)
+Prevent `/dev/ttyACM*` renumbering across replug/reboot cycles by mapping each board's
+USB serial number to a stable alias.
 
 ```bash
-# 串口连接 (必填)
-RK_DEV_HOST_IP=192.168.1.xxx
-RK_SERIAL_PORT=2000
+# On dev host, create /etc/udev/rules.d/99-rk3576-duts.rules:
+# Use ATTRS{bInterfaceNumber} instead of KERNEL — kernel device numbers
+# change across reboots. Interface 00 is the main console on dual-serial chips.
+SUBSYSTEM=="tty", ATTRS{serial}=="<USB_SERIAL>", ATTRS{bInterfaceNumber}=="00", \
+  SYMLINK+="serial/by-alias/<dut_alias>"
 
-# 继电器控制
-RK_RELAY_PORT=2001
-RK_RESET_CHANNEL=1
-RK_MASKROM_CHANNEL=2
+# Apply:
+sudo udevadm control --reload-rules && sudo udevadm trigger
 
-# 登录凭据
-RK_LOGIN_USER=root
-RK_LOGIN_PASS=
-
-# U-Boot 中断策略 (lava/aggressive)
-RK_UBOOT_INTERRUPT_STRATEGY=lava
-
-# 监控
-RK_HANG_TIMEOUT=60
-RK_HANG_HYSTERESIS=3
-RK_MAX_ARCHIVED_LOGS=10
-
-# StageLearner: 参考启动日志 (新 SOC 自适应)
-RK_REFERENCE_LOG=/path/to/reference-boot.log
+# Verify:
+ls -la /dev/serial/by-alias/
 ```
 
-## Transport 模式
+**Finding a board's USB serial number:**
+```bash
+ssh <dev_host> "udevadm info --query=property --name=/dev/ttyACM0 | grep ID_SERIAL_SHORT"
+```
 
-| Mode | Config | 说明 |
-|------|--------|------|
-| **stdio** (默认) | `"type":"stdio"` | Claude Code spawn 子进程，低延迟 |
-| **HTTP** (备用) | `--http [HOST:PORT]` | 独立进程，端口 3000 |
+### ser2net Configuration
 
-## Hook 集成
+```yaml
+# /etc/ser2net.yaml — port → serial device mapping
+connection: &con2000
+    accepter: tcp,0.0.0.0,2000
+    enable: on
+    options:
+      kickolduser: true          # prevent zombie connections
+      telnet-brk-on-sync: true
+    connector: serialdev,
+              /dev/serial/by-alias/<dut_alias>,   # use udev symlink
+              115200n81,local                      # RK3576 default baud
+```
 
-`~/.claude/hooks/embedded-debug/` 中所有 hook 为 Python 脚本。
+### Board Mapping Reference
 
-| Hook | 脚本 | 触发时机 | 作用 |
-|------|------|---------|------|
-| SessionStart | `session-start.py` | 进入项目 | 启动 statusline daemon + MCP 配置 |
-| Stop | `session-stop.py` | 退出会话 | 清理 |
-| PreToolUse | `pre-tool-use.py` | Bash 执行前 | 拦截原始串口/继电器访问 → 提醒用 MCP |
-| UserPromptSubmit | `user-prompt-submit.py` | 每次提示前 | 目标 DUT-off/crashed 告警 |
-| statusLine | `statusline.py` | 1s 刷新 | inotify 事件驱动，即时更新 |
+| Alias | USB Serial | ser2net Port | OS |
+|-------|-----------|-------------|-----|
+| `rk3576-pdstars` | `5C2C244700` | 2000 | Yocto |
+| `rk3576-yt9215` | `56E6019371` | 2008 | Ubuntu |
 
-## StageLearner — 跨 SOC 自适应
+## Configuration Reference (`.target.toml`)
 
-无需为每个新 SOC 写正则表达式。提供参考启动日志 → 自动学习阶段指纹。
+### Single Board
+
+```toml
+[[dev_hosts]]
+alias = "rk-board-pc"
+ip = "192.168.1.105"
+user = "linaro"
+
+[[dut]]
+alias = "rk3576-pdstars"
+dev_host = "rk-board-pc"
+
+[dut.serial]
+port = 2000
+
+[dut.target]
+login_user = "root"
+login_prompt = ""         # custom login regex (empty = default: `login:\s*$`)
+
+[dut.uboot]
+interrupt_char = "ctrl_c"
+interrupt_strategy = "aggressive"
+
+[dut.relay]
+type = "usb-relay"
+port = 2001
+reset_ch = 1
+# maskrom_ch = 2
+reset_time_ms = 3000      # minimum USB relay reset pulse (default: 3000)
+
+[dut.monitor]
+hang_timeout = 60
+max_archived_logs = 10
+reference_log = ".dut-serial/rk3576-pdstars/reference-boot.log"
+# StageLearner similarity thresholds (0.0–1.0). Defaults from Cargo.toml.
+learner_stage_threshold = 0.45   # boot stage classification
+learner_crash_threshold = 0.50   # crash pattern detection
+
+[dut.flash]
+tool = "upgrade_tool"
+upload_dir = "/tmp"
+full_image_cmd = "uf {image}"
+kernel_image_cmd = "di -k {image}"
+loader_bin = "/path/to/MiniLoaderAll.bin"
+loader_cmd = "db {loader}"
+```
+
+### Multiple Boards
+
+Add additional `[[dut]]` blocks. Each DUT gets:
+- Independent `.dut-serial/<alias>/` directory
+- Independent `target-state`, `statusline-cache`, logs
+- Independent relay configuration
+
+```toml
+# ... same dev_hosts ...
+
+[[dut]]
+alias = "rk3576-pdstars"
+# ... config ...
+
+[[dut]]
+alias = "rk3576-yt9215"
+dev_host = "rk-board-pc"
+
+[dut.serial]
+port = 2008    # different port!
+
+[dut.target]
+login_user = "root"
+
+[dut.monitor]
+reference_log = ".dut-serial/rk3576-yt9215/reference-boot.log"
+```
+
+## MCP Tools (28 total)
+
+| Tool | Description |
+|------|-------------|
+| `serial_send_command` | Execute shell command on DUT |
+| `serial_get_state` | Get state (active/booting/uboot/crashed/DUT-off/disconnected) |
+| `serial_get_logs` | Retrieve serial logs (regex filter, streaming) |
+| `serial_list_logs` | List archived boot logs |
+| `serial_reset` | Hardware reset + log rotation |
+| `serial_enter_uboot` | Enter U-Boot (Ctrl-C flood, bootdelay=0 compatible) |
+| `serial_reboot_uboot` | Soft reboot + Ctrl-C flood -> U-Boot |
+| `serial_enter_maskrom` | Enter MASKROM mode (if relay configured) |
+| `serial_wait_pattern` | Wait for pattern (probe on timeout) |
+| `serial_uboot_command` | Send command at U-Boot `=>` prompt |
+| `serial_new_log` | Manually rotate log |
+| `serial_poll_logs` | Incremental output (file position tracking) |
+| `serial_get_config` | View current config (read-only) |
+| `serial_get_metrics` | Engine metrics: uptime, command/error count, pending |
+| `serial_claim` | Claim serial ownership for this session |
+| `serial_button` | Press/release/pulse reset/maskrom/recovery buttons |
+| `serial_pause` | Pause serial engine for dutabo takeover |
+| `serial_resume` | Resume after pause |
+| `serial_send_raw` | Send raw bytes (no markers, no wrapping) |
+| `serial_load_reference` | Load reference log for StageLearner |
+| `serial_get_stages` | View learned stage fingerprints |
+| `serial_get_unclassified` | Get unclassified lines (self-learning) |
+| `serial_append_reference` | Append anchor lines + hot-reload StageLearner |
+| `serial_learn_connection` | Auto-learn connection (3x reset, similarity check) |
+| `serial_verify_relay` | Verify CH340 relay control (ON/OFF read-back) |
+| `serial_flash_plan` | Generate flash plan from .target.toml [flash] config |
+| `serial_flash` | Execute firmware flash via dev host SSH |
+
+## Target States
+
+```
+● serial:active        — DUT ready, login configured
+◐ serial:booting       — U-Boot → kernel boot in progress
+● serial:uboot         — U-Boot interactive prompt
+✗ serial:crashed       — kernel panic / BUG / Oops detected
+✗ serial:DUT-off       — no response (hang timeout)
+✗ serial:disconnected  — ser2net unreachable
+```
+
+When `.target.toml` has multiple `[[dut]]` entries, statusline shows all:
+```
+● rk3576-pdstars:active  ● rk3576-yt9215:active
+```
+
+## StageLearner Tuning
+
+The StageLearner uses text similarity (3-gram Jaccard + Jaro-Winkler) to
+detect boot stages without SOC-specific regex. Two thresholds control
+classification accuracy:
+
+### `learner_stage_threshold` (default 0.45)
+
+Minimum similarity score for normal boot stage classification.
+
+| Range | Effect |
+|-------|--------|
+| 0.30–0.40 | Loose — may produce false stage detections |
+| **0.45–0.55** | **Balanced (recommended)** |
+| 0.60–0.80 | Strict — may miss valid stages |
+
+### `learner_crash_threshold` (default 0.50)
+
+Minimum similarity score for crash pattern detection. Set higher than
+the stage threshold because crash lines are high-signal events that
+warrant higher confidence.
+
+### Example
+
+```toml
+[dut.monitor]
+# Stricter matching for a noisy serial line:
+learner_stage_threshold = 0.50
+# Lower crash threshold to catch custom firmware panics:
+learner_crash_threshold = 0.40
+```
+
+Defaults (0.45 / 0.50) are in `Cargo.toml` `[package.metadata.learn]`.
+
+---
+
+## Known Limitations & Fallbacks
+
+### BusyBox ash Pipe Buffering
+
+On Yocto/BusyBox targets, `echo ... | grep ...` often returns empty output
+because ash's pipe buffering delays `grep` output past the exit-code marker.
+
+| Pattern | Fallback |
+|---------|----------|
+| `echo <data> \| grep <pat>` | `printf '<data>\n' \| grep <pat>` |
+| `echo <data> \| head -N` | 加 `; true` 同步: `echo <data> \| head -N; true` |
+| `dmesg \| grep <pat>` | `dmesg \| grep <pat>; true` |
+| Any pipe command | 加 `; true` 确保管道刷新完成 |
+
+**The MCP returns a `hint` field in the JSON response when it detects this pattern.**
+
+### First-Command Warmup
+
+The first `serial_send_command` after MCP startup may return empty.
+Always start with a warmup: `serial_send_command("echo warmup", timeout=3)`.
+
+### USB Relay Minimum Reset Time
+
+USB relays (CH340) require a minimum pulse duration to physically toggle.
+Default: **3000ms** (3 seconds). Override in `.target.toml` via
+`[dut.relay] reset_time_ms = 5000`.
+
+### Reconnect Behavior
+
+When the serial connection drops, the MCP uses exponential backoff:
+**1s → 2s → 4s → 8s → 16s → cap at 30s**, resetting to 1s after 60s of
+stable connection. The Agent is notified on each retry.
+
+## Observability
+
+All key async functions are instrumented with `#[tracing::instrument]`:
+
+```
+serial_send_command{cmd="uname -a", timeout=8}          ← MCP tool entry
+  queue_command{command="uname -a"}                      ← engine dispatch
+    execute{command="uname -a", timeout_secs=8}          ← command queue
+
+start{host="192.168.1.105", target="2000"}               ← engine lifecycle
+  probe_initial_state{result=active}                     ← initial probe
+
+stop                                                    ← engine shutdown
+```
+
+Each span records duration (`time.busy`, `time.idle`) and structured fields
+for querying by command text, exit code, timeout status.
+
+View spans in real-time:
+```bash
+debug-console-mcp --log-to-stderr --verbose
+```
+
+## Hooks
+
+| Hook | Trigger | Purpose |
+|------|---------|---------|
+| `session-start.py` | Enter project | Detect `.target.toml`, start MCP (HTTP mode) |
+| `pre-tool-use.py` | Before Bash | Block raw `nc`/`tio`/`screen` serial access |
+| `user-prompt-submit.py` | Before each prompt | Multi-DUT state alert, auto-restart MCP |
+| `statusline.py` | ~1s refresh | Show DUT state(s) in statusline |
+
+## Adding a New Board
+
+1. **Find USB serial number:**
+   ```bash
+   ssh <dev_host> "udevadm info --query=property --name=/dev/ttyACM0 | grep ID_SERIAL_SHORT"
+   ```
+
+2. **Add udev rule** (on dev host, `/etc/udev/rules.d/99-rk3576-duts.rules`):
+   ```
+   SUBSYSTEM=="tty", ATTRS{serial}=="<serial>", ATTRS{idProduct}=="55d2", \
+     KERNEL=="ttyACM0", SYMLINK+="serial/by-alias/<new_alias>"
+   ```
+
+3. **Add ser2net port** (on dev host, `/etc/ser2net.yaml`):
+   ```yaml
+   connection: &con<port>
+       accepter: tcp,0.0.0.0,<port>
+       enable: on
+       options:
+         kickolduser: true
+       connector: serialdev,
+                 /dev/serial/by-alias/<new_alias>,
+                 115200n81,local
+   sudo systemctl restart ser2net
+   ```
+
+4. **Create project `.target.toml`** with matching `serial.port` and `dut.alias`
+
+5. **Create `.dut-serial/<alias>/logs/`** directory (or let MCP auto-create it)
+
+6. **Start Claude Code** in the project directory → MCP auto-starts
+
+## CLI (`dutabo`)
 
 ```bash
-# .target.conf 中配置 (启动时自动加载)
-RK_REFERENCE_LOG=/path/to/mt6893-boot.log
-
-# 或运行时手动加载
-serial_load_reference("/path/to/new-soc-boot.log")
-serial_get_stages  # → ddr:35, spl:14, bl31:42, uboot:8, kernel:15, ...
-```
-
-算法: 3-gram Jaccard 相似度 + 顺序约束。详见 [mcp-rs/README.md](mcp-rs/README.md).
-
-## 文件结构
-
-```
-~/.config/ai-dev/skills/embedded-debug/
-├── README.md
-├── SKILL.md                    # Claude Code Skill 定义
-├── mcp-rs/                     # Rust MCP Server
-│   ├── src/
-│   │   ├── main.rs             # 入口 (stdio + HTTP dispatch)
-│   │   ├── mcp.rs              # JSON-RPC 2.0
-│   │   ├── mcp_http.rs         # Streamable HTTP (axum)
-│   │   ├── serial_engine.rs    # 核心引擎
-│   │   ├── console.rs          # TCP 串口驱动
-│   │   ├── boot_detector.rs    # Regex + StageLearner 双模式
-│   │   ├── state_manager.rs    # 状态管理 (滞后防抖)
-│   │   ├── log_manager.rs      # 日志切割 + 保留策略
-│   │   ├── command_queue.rs    # 命令队列 (marker echo)
-│   │   ├── relay_manager.rs    # 继电器控制 (4-byte 协议)
-│   │   ├── lock_manager.rs     # 互斥锁 (O_EXCL)
-│   │   ├── config.rs           # shell 风格配置解析
-│   │   └── marker.rs           # 标记符生成
-│   └── .target.conf
-└── mcp/                        # Python MCP (legacy)
-    └── ...
-
-~/.claude/hooks/embedded-debug/
-├── lib.py                      # 共享工具
-├── session-start.py            # 自动启动
-├── session-stop.py
-├── pre-tool-use.py             # 🆕 拦截原始串口访问
-├── user-prompt-submit.py       # 状态告警
-└── statusline.py               # inotify 事件驱动
-```
-
-## 状态栏
-
-**事件驱动**，非轮询。MCP 状态变化 → `target-state` 文件更新 → inotify 检测 → 即时刷新。
-
-```
-● serial:active        — 目标就绪，可执行命令
-◐ serial:booting       — 启动中 (SPL → kernel)
-● serial:uboot         — U-Boot 交互模式
-✗ serial:crashed       — 内核崩溃 (panic/BUG/Oops)
-✗ serial:DUT-off       — 目标无响应
-✗ serial:disconnected  — 连不上 dev host (ser2net 不可达)
+dutabo list                    # list DUTs from .target.toml
+dutabo serial [--dut <alias>]  # interactive serial console
+dutabo reset [--dut <alias>]   # hardware reset
+dutabo uf <image> [--dut]      # flash firmware
+dutabo uboot [--dut <alias>]   # enter U-Boot
+dutabo state [--dut <alias>]   # get DUT state
 ```

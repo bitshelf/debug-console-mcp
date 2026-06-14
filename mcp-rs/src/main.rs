@@ -6,26 +6,16 @@
 //! Protocol: MCP (Model Context Protocol) 2024-11-05
 //! Transport: stdio (newline-delimited JSON-RPC 2.0)
 
-mod boot_detector;
-mod command_queue;
-mod config;
-mod console;
-mod lock_manager;
-mod log_manager;
-mod marker;
-mod mcp;
-mod mcp_http;
-mod relay_manager;
-mod serial_engine;
-mod state_manager;
+// All modules are in lib.rs — use the library crate.
+use debug_console_mcp as lib;
 
 const HELP: &str = "\
-embedded-debug-mcp — MCP serial console debugger for embedded Linux targets
+debug-console-mcp — MCP serial console debugger for embedded Linux targets
 
 Usage:
-  embedded-debug-mcp [OPTIONS]
-  embedded-debug-mcp --help
-  embedded-debug-mcp --version
+  debug-console-mcp [OPTIONS]
+  debug-console-mcp --help
+  debug-console-mcp --version
 
 Description:
   An MCP (Model Context Protocol) server that connects to embedded Linux
@@ -44,25 +34,26 @@ Options:
   -v, --verbose      Increase log verbosity (debug level on stderr).
                      Default: info level to {project}/.dut-serial/mcp.log.
       --log-to-stderr  Log to stderr instead of file (useful for debugging).
-      --http [HOST:PORT]  Run as Streamable HTTP server (default: 0.0.0.0:3000).
+      --http [HOST:PORT]  Run as Streamable HTTP server (default: 127.0.0.1:3000).
+      --dry-run          Validate config and exit without connecting.
 
 Environment:
-  TARGET_CONF        Path to .target.conf file (alternative to CWD search).
+  TARGET_CONF        Path to .target.toml file (alternative to CWD search).
   RUST_LOG           tracing filter (e.g. RUST_LOG=debug).
                      Overridden by --verbose.
 
 Configuration:
-  The server searches recursively upward from CWD for .target.conf.
+  The server searches recursively upward from CWD for .target.toml.
   See README.md for the full configuration reference.
 
-  Example .target.conf:
-    RK_DEV_HOST_IP=192.168.1.189
-    RK_SERIAL_PORT=2000
-    RK_LOGIN_USER=root
-    RK_LOGIN_PASS=mypassword
-    RK_RELAY_PORT=2001
-    RK_RESET_CHANNEL=2
-    RK_MASKROM_CHANNEL=1
+  Example .target.toml:
+    DEV_HOST_IP=192.168.1.189
+    SERIAL_PORT=2000
+    LOGIN_USER=root
+    LOGIN_PASS=mypassword
+    RELAY_PORT=2001
+    RESET_CHANNEL=2
+    MASKROM_CHANNEL=1
 
 MCP Tools:
   serial_send_command  - Execute shell command on target
@@ -71,19 +62,44 @@ MCP Tools:
   serial_list_logs     - List archived boot logs
   serial_reset         - Hardware reset via relay + log rotation
   serial_enter_uboot   - Force target into U-Boot prompt
+  serial_enter_maskrom - Force target into Rockchip MASKROM mode
   serial_wait_pattern  - Wait for regex pattern in serial output
+  serial_uboot_command - Send command at U-Boot prompt
   serial_new_log       - Manually rotate log without reset
   serial_poll_logs     - Get new serial output since last poll
   serial_get_config    - Show current target configuration
+  serial_claim         - Claim serial ownership
+  serial_load_reference - Load reference log for adaptive stage detection
+  serial_get_stages    - Show learned stage fingerprints
 
 Files:
-  {project}/.target.conf          Target configuration
+  {project}/.target.toml          Target configuration
   {project}/.dut-serial/logs/     Boot log archives
   {project}/.dut-serial/target-state   Current state file
   {project}/.dut-serial/mcp.log   Server log
-  /tmp/embedded-debug/locks/      Per host:port mutual exclusion
+  /tmp/debug-console/locks/      Per host:port mutual exclusion
 
-Version: embedded-debug-mcp v{}\n";
+Quick Start:
+  # Start in stdio mode (Claude Code spawns automatically):
+  debug-console-mcp
+
+  # Start in HTTP mode for dutabo CLI access:
+  debug-console-mcp --http
+
+  # Debug with verbose logging:
+  debug-console-mcp --log-to-stderr --verbose
+
+Troubleshooting:
+  # Check hardware connectivity:
+  bash scripts/diagnose.sh
+
+  # Kill all MCP processes and restart:
+  pkill debug-console-mcp; debug-console-mcp --log-to-stderr
+
+  # Build and deploy:
+  bash deploy-all.sh
+
+Version: debug-console-mcp v{}\n";
 
 fn print_help() {
     let msg = HELP.replace("{}", env!("CARGO_PKG_VERSION"));
@@ -91,7 +107,25 @@ fn print_help() {
 }
 
 fn print_version() {
-    eprintln!("embedded-debug-mcp v{}", env!("CARGO_PKG_VERSION"));
+    eprintln!("debug-console-mcp v{}", env!("CARGO_PKG_VERSION"));
+}
+
+/// Rotate mcp.log if it exceeds 10MB. Keeps at most 5 rotated files.
+fn rotate_mcp_log(log_dir: &std::path::Path) {
+    let log_path = log_dir.join("mcp.log");
+    let max_size = 10 * 1024 * 1024; // 10 MB
+    let max_files = 5;
+    if let Ok(meta) = std::fs::metadata(&log_path) {
+        if meta.len() > max_size {
+            // Rotate: mcp.log.4 → mcp.log.5, mcp.log.3 → mcp.log.4, etc.
+            for i in (1..max_files).rev() {
+                let old = log_dir.join(format!("mcp.log.{}", i));
+                let new = log_dir.join(format!("mcp.log.{}", i + 1));
+                let _ = std::fs::rename(&old, &new);
+            }
+            let _ = std::fs::rename(&log_path, log_dir.join("mcp.log.1"));
+        }
+    }
 }
 
 #[tokio::main]
@@ -100,7 +134,9 @@ async fn main() {
     let mut verbose = false;
     let mut log_to_stderr = false;
     let mut http_mode = false;
-    let mut http_bind = "0.0.0.0:3000".to_string();
+    let mut http_bind = "127.0.0.1:3000".to_string();
+    let mut dry_run = false;
+    let mut diagnose = false;
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -116,6 +152,7 @@ async fn main() {
             }
             "-v" | "--verbose" => verbose = true,
             "--log-to-stderr" => log_to_stderr = true,
+            "--diagnose" => diagnose = true,
             "--http" => {
                 http_mode = true;
                 // Check if next arg is a HOST:PORT (doesn't start with -)
@@ -124,6 +161,7 @@ async fn main() {
                     http_bind = args[i].clone();
                 }
             }
+            "--dry-run" => dry_run = true,
             other => {
                 eprintln!("Unknown option: {other}");
                 eprintln!("Use --help for usage information.");
@@ -136,22 +174,24 @@ async fn main() {
     // ── 初始化日志 ──
     let log_level = if verbose { "debug" } else { "info" };
 
+    use tracing_subscriber::fmt::format::FmtSpan;
+
     if log_to_stderr {
-        // 日志写到 stderr (调试用)
+        // 日志写到 stderr (调试用) — 打印 span 生命周期用于链路追踪
         tracing_subscriber::fmt()
             .with_writer(std::io::stderr)
             .with_ansi(true)
+            .with_target(true)
+            .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
             .with_env_filter(
                 tracing_subscriber::EnvFilter::from_default_env()
-                    .add_directive(
-                        format!("embedded_debug_mcp={log_level}").parse().unwrap(),
-                    ),
+                    .add_directive(format!("debug_console_mcp={log_level}").parse().unwrap()),
             )
             .init();
     } else {
-        // 日志写到文件 (stdout 留给 JSON-RPC)
+        // 日志写到文件 (stdout 留给 JSON-RPC) — JSON format for structured analysis
         let log_dir = std::path::PathBuf::from(
-            config::load_config()
+            lib::config::load_config()
                 .project_dir
                 .as_ref()
                 .map(|p| p.to_string_lossy().to_string())
@@ -159,6 +199,7 @@ async fn main() {
         )
         .join(".dut-serial");
         std::fs::create_dir_all(&log_dir).ok();
+        rotate_mcp_log(&log_dir);
         let log_file = log_dir.join("mcp.log");
 
         tracing_subscriber::fmt()
@@ -170,29 +211,123 @@ async fn main() {
                     .unwrap_or_else(|_| panic!("Cannot open log file: {log_file:?}"))
             })
             .with_ansi(false)
+            .with_target(true)
+            .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
             .with_env_filter(
                 tracing_subscriber::EnvFilter::from_default_env()
-                    .add_directive(
-                        format!("embedded_debug_mcp={log_level}").parse().unwrap(),
-                    ),
+                    .add_directive(format!("debug_console_mcp={log_level}").parse().unwrap()),
             )
             .init();
     }
 
-    tracing::info!("embedded-debug-mcp v{} starting", env!("CARGO_PKG_VERSION"));
+    tracing::info!("debug-console-mcp v{} starting", env!("CARGO_PKG_VERSION"));
 
     // ── 加载配置 ──
-    let cfg = config::load_config();
+    let cfg = lib::config::load_config();
     if cfg.config_path.is_none() {
         tracing::error!(
-            "No .target.conf found. cwd={}, TARGET_CONF={:?}",
+            "No .target.toml found. cwd={}, TARGET_CONF={:?}",
             std::env::current_dir().unwrap_or_default().display(),
             std::env::var("TARGET_CONF").ok()
         );
     }
 
+    // ── Dry-run: validate config and exit ──
+    if dry_run {
+        eprintln!("=== Config Validation ===");
+        eprintln!("Dev Host:  {}", cfg.dev_host_ip());
+        eprintln!("Serial:    {}:{}", cfg.serial_ip(), cfg.serial_target());
+        let login_user = cfg.login_user();
+        eprintln!(
+            "Login:     {}",
+            if login_user.is_empty() {
+                "(not set)"
+            } else {
+                &login_user
+            }
+        );
+        let reference_log = cfg.reference_log();
+        eprintln!(
+            "Reference: {}",
+            if reference_log.is_empty() {
+                "(not set)"
+            } else {
+                &reference_log
+            }
+        );
+        eprintln!(
+            "Relay:     port={} ch:reset={}/maskrom={}/recovery={}",
+            cfg.relay_port(),
+            cfg.reset_channel(),
+            cfg.maskrom_channel(),
+            cfg.recovery_channel()
+        );
+        if cfg.dev_host_ip().is_empty() {
+            eprintln!("\nERROR: dev_host.ip not set. Edit .target.toml");
+            std::process::exit(1);
+        }
+        if cfg.serial_target() == "0" {
+            eprintln!("\nERROR: serial.port not set. Edit .target.toml");
+            std::process::exit(1);
+        }
+        eprintln!("\nConfig OK. No errors found.");
+        std::process::exit(0);
+    }
+
+    // ── Diagnose: test connectivity and exit ──
+    if diagnose {
+        eprintln!("=== Diagnostics ===");
+        let host = cfg.serial_ip();
+        let port = cfg.serial_target();
+        eprintln!("Testing ser2net: {host}:{port} ...");
+
+        // Test TCP connectivity
+        let addr = format!("{host}:{port}");
+        match std::net::TcpStream::connect_timeout(
+            &addr.parse().unwrap(),
+            std::time::Duration::from_secs(5),
+        ) {
+            Ok(_) => eprintln!("  ✓ TCP connect OK"),
+            Err(e) => eprintln!("  ✗ TCP connect FAILED: {e}"),
+        }
+
+        // Test reference log
+        let ref_log = cfg.reference_log();
+        if !ref_log.is_empty() {
+            let path = std::path::PathBuf::from(&ref_log);
+            eprintln!("Reference log: {ref_log}");
+            if path.exists() {
+                match lib::boot_detector::StageLearner::from_reference(&path) {
+                    Ok(learner) => {
+                        eprintln!("  ✓ Loaded ({} fingerprints)", learner.fingerprints.len());
+                    }
+                    Err(e) => eprintln!("  ✗ Load failed: {e}"),
+                }
+            } else {
+                eprintln!("  ✗ File not found");
+            }
+        } else {
+            eprintln!("Reference log: (not configured)");
+        }
+
+        // Test relay config
+        let relay_port = cfg.relay_port();
+        if relay_port > 0 {
+            eprintln!(
+                "Relay: port={relay_port} reset_ch={} maskrom_ch={}",
+                cfg.reset_channel(),
+                cfg.maskrom_channel()
+            );
+        } else {
+            eprintln!("Relay: (not configured)");
+        }
+
+        eprintln!("\nDiagnostics complete.");
+        std::process::exit(0);
+    }
+
     // ── 创建并启动 engine（带超时防护）──
-    let engine = serial_engine::new_shared_engine(cfg.clone());
+    let engine = lib::serial_engine::new_shared_engine(cfg.clone());
 
     {
         let mut eng = engine.lock().await;
@@ -202,11 +337,13 @@ async fn main() {
             Err(_) => tracing::error!("Engine start timed out after 5s"),
         }
 
-        // 自动加载参考日志 (RK_REFERENCE_LOG in .target.conf)
+        // 自动加载参考日志 (RK_REFERENCE_LOG in .target.toml)
         let ref_log = cfg.reference_log();
         if !ref_log.is_empty() {
             let path = std::path::PathBuf::from(&ref_log);
-            match eng.detector.load_reference(&path) {
+            let st = eng.config.learner_stage_threshold();
+            let ct = eng.config.learner_crash_threshold();
+            match eng.detector.load_reference(&path, st, ct) {
                 Ok(()) => tracing::info!("Auto-loaded reference log: {ref_log}"),
                 Err(e) => tracing::warn!("Failed to load reference log '{ref_log}': {e}"),
             }
@@ -219,15 +356,15 @@ async fn main() {
         let (host, port) = if let Some((h, p)) = http_bind.rsplit_once(':') {
             (h.to_string(), p.parse::<u16>().unwrap_or(3000))
         } else {
-            ("0.0.0.0".to_string(), 3000u16)
+            ("127.0.0.1".to_string(), 3000u16)
         };
         tracing::info!("Starting Streamable HTTP on {host}:{port}");
-        if let Err(e) = mcp_http::run_http(engine.clone(), &host, port).await {
+        if let Err(e) = lib::mcp_http::run_http(engine.clone(), &host, port).await {
             tracing::error!("HTTP server error: {e}");
         }
     } else {
         // Stdio transport (default)
-        let mut server = mcp::McpServer::new(engine.clone());
+        let mut server = lib::mcp::McpServer::new(engine.clone());
         if let Err(e) = server.run().await {
             tracing::error!("MCP server error: {e}");
         }
@@ -239,5 +376,5 @@ async fn main() {
         eng.stop().await;
     }
 
-    tracing::info!("embedded-debug-mcp stopped");
+    tracing::info!("debug-console-mcp stopped");
 }
