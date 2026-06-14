@@ -1,99 +1,223 @@
 #!/usr/bin/env python3
-"""SessionStart hook — auto-start MCP HTTP server + statusline when .target.conf exists.
+"""SessionStart hook — discover the current project and start the MCP HTTP server.
 
-Only checks Claude Code CWD (no parent directory walk).
+Projects only need `.mcp.json` + `.target.conf`. No per-project scripts.
+
+In **stdio** mode (the default, `.mcp.json` has `command` not `url`), Claude Code
+itself spawns the MCP server from `.mcp.json` — this hook does NOT start it.
+In **HTTP** mode (`.mcp.json` has `url`), this hook starts the HTTP server.
 """
 
+import json
 import os
+import subprocess
 import sys
+import time
 from pathlib import Path
 from subprocess import Popen, DEVNULL
 
-from lib import has_target_conf
+# Reuse the shared project-discovery logic so behavior is consistent with the
+# other hooks (walks up from CWD, validates project markers, respects TARGET_CONF).
+from lib import find_project_dir, _is_embedded_server
 
 
-def _start_statusline_daemon() -> None:
-    """Start the event-driven statusline daemon (inotify watcher)."""
-    try:
-        Popen(
-            [sys.executable,
-             os.path.expanduser("~/.claude/hooks/embedded-debug/statusline.py"),
-             "--daemon"],
-            stdout=DEVNULL, stderr=DEVNULL,
-            start_new_session=True,
-        )
-    except OSError:
-        pass
+def find_projects():
+    """Discover the project Claude Code is currently working in.
+
+    Walks up from CWD to find a validated `.target.conf` (same rule as the Rust
+    config loader and the other hooks), so launching Claude Code from a
+    subdirectory still works.
+    """
+    proj = find_project_dir()
+    return [proj] if proj else []
 
 
-def _ensure_mcp_json(project_dir: str) -> None:
-    """Auto-generate .mcp.json with embedded-debug server if .target.conf exists."""
-    import json
+def read_mcp_port(project_dir):
+    """Read HTTP port from the project's `.mcp.json`. Returns int or None.
+
+    Only HTTP-mode configs have a `url` field. stdio-mode configs return None,
+    which means the MCP is spawned by Claude Code itself and this hook does not
+    start a server.
+    """
     mcp_json = Path(project_dir) / ".mcp.json"
-    if mcp_json.exists():
-        return
-
-    # Check if we have embedded-debug binary installed
-    import shutil
-    binary = shutil.which("embedded-debug-mcp")
-    if not binary:
-        binary = os.path.expanduser("~/.local/bin/embedded-debug-mcp")
-        if not Path(binary).exists():
-            return
-
+    if not mcp_json.exists():
+        return None
     try:
-        cfg = {
-            "mcpServers": {
-                "embedded-debug": {
-                    "type": "stdio",
-                    "command": binary,
-                    "timeout": 60000
-                }
-            }
-        }
-        mcp_json.write_text(json.dumps(cfg, indent=2) + "\n")
-    except OSError:
+        cfg = json.loads(mcp_json.read_text())
+        url = cfg.get("mcpServers", {}).get("debug-console", {}).get("url", "")
+        # "http://localhost:3000/mcp" → 3000
+        if ":" in url:
+            return int(url.rsplit(":", 1)[-1].split("/")[0])
+    except (json.JSONDecodeError, ValueError, KeyError):
         pass
-
-
-def _find_mcp_binary() -> str | None:
-    """Find the embedded-debug-mcp binary."""
-    import shutil
-    binary = shutil.which("embedded-debug-mcp")
-    if binary:
-        return binary
-    path = os.path.expanduser("~/.local/bin/embedded-debug-mcp")
-    if Path(path).exists():
-        return path
     return None
 
 
-def _mcp_already_running() -> bool:
-    """Check if MCP HTTP server is already running on port 3000."""
+def is_port_in_use(port):
     import socket
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        s.connect(("127.0.0.1", 3000))
+        s.connect(("127.0.0.1", port))
         s.close()
         return True
     except (ConnectionRefusedError, OSError):
         return False
 
 
+def mcp_running(project_dir):
+    """Check if a debug-console-mcp process is already serving this project.
+
+    Checks PID files first (fast path), then falls back to /proc scanning.
+    """
+    proj = Path(project_dir)
+    # Fast path: check root and per-DUT PID files
+    for pid_dir in [proj / ".dut-serial"] + [
+        d for d in (proj / ".dut-serial").iterdir()
+        if d.is_dir() and (d / "mcp.pid").exists()
+    ]:
+        pid_file = pid_dir / "mcp.pid"
+        if pid_file.exists():
+            try:
+                pid = int(pid_file.read_text().strip())
+                if pid != os.getpid() and _is_embedded_server(pid):
+                    return True
+            except (ValueError, OSError):
+                pass
+    # Fallback: scan /proc for MCP processes with matching cwd
+    try:
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                pid = int(entry.name)
+                if pid == os.getpid():
+                    continue
+                if not _is_embedded_server(pid):
+                    continue
+                cwd = os.readlink(f"{entry}/cwd")
+                if Path(cwd).resolve() == proj.resolve():
+                    return True
+            except (OSError, FileNotFoundError, ValueError):
+                continue
+    except OSError:
+        pass
+    return False
+
+
+def _kill_stale_mcp_on_port(port):
+    """Kill a debug-console-mcp process listening on the given port.
+
+    Validates the PID is actually a debug-console-mcp process (via /proc/comm)
+    before killing — never kills an unrelated process that happens to hold the
+    port.
+    """
+    result = subprocess.run(
+        ["ss", "-tlnpH", f"sport = :{port}"],
+        capture_output=True, text=True
+    )
+    for line in result.stdout.splitlines():
+        if "pid=" not in line:
+            continue
+        old_pid = line.split("pid=")[-1].split(",")[0]
+        try:
+            pid = int(old_pid)
+        except ValueError:
+            continue
+        # Validate before killing.
+        if not _is_embedded_server(pid):
+            continue
+        try:
+            os.kill(pid, 15)
+        except OSError:
+            pass
+    time.sleep(0.5)
+
+
+def start_mcp(project_dir, port):
+    """Start debug-console-mcp in HTTP mode for a project."""
+    if mcp_running(project_dir):
+        return
+    if is_port_in_use(port):
+        _kill_stale_mcp_on_port(port)
+        if is_port_in_use(port):
+            return
+
+    binary = os.path.expanduser("~/.local/bin/debug-console-mcp")
+    if not os.path.isfile(binary):
+        return
+
+    Popen(
+        [binary, "--http", f"127.0.0.1:{port}"],
+        cwd=project_dir,
+        stdout=DEVNULL, stderr=DEVNULL,
+        start_new_session=True,
+    )
+
+
+def _project_http_port(project_dir: str) -> int:
+    """Deterministic port for a project (3001-3099). Same algorithm as dutabo."""
+    import hashlib
+    h = hashlib.md5(str(Path(project_dir).resolve()).encode()).hexdigest()
+    return 3001 + (int(h[:8], 16) % 99)
+
+
+def _ensure_http_mcp(project_dir: str, port: int) -> None:
+    """Ensure an HTTP MCP server is running for this project.
+
+    Starts one if not already running. Never kills existing processes.
+    The MCP stays alive across Claude Code sessions (nohup'd).
+    """
+    # Already running for this project?
+    if mcp_running(project_dir):
+        return
+
+    # Port in use by something else (stale MCP from another project)?
+    if is_port_in_use(port):
+        _kill_stale_mcp_on_port(port)
+        if is_port_in_use(port):
+            # Kill failed — port held by non-MCP process, leave it alone
+            return
+
+    binary = os.path.expanduser("~/.local/bin/debug-console-mcp")
+    if not os.path.isfile(binary):
+        return
+
+    target_conf = os.path.join(project_dir, ".target.toml")
+    target_conf_env = os.environ.get("TARGET_CONF", target_conf)
+
+    Popen(
+        [binary, "--http", f"127.0.0.1:{port}"],
+        cwd=project_dir,
+        env={**os.environ, "TARGET_CONF": target_conf_env},
+        stdout=DEVNULL, stderr=DEVNULL,
+        start_new_session=True,
+    )
+
+
 def main():
-    # 只检测 Claude Code 当前目录的 .target.conf
-    if not has_target_conf():
-        sys.exit(0)
+    import hashlib
+    from pathlib import Path
 
-    project_dir = str(Path.cwd())
+    for proj in find_projects():
+        dut_dir = os.path.join(proj, ".dut-serial")
+        os.makedirs(dut_dir, exist_ok=True)
 
-    # 1. 启动 statusline daemon
-    _start_statusline_daemon()
+        # Per-project hash lock — prevents cross-project interference
+        # when multiple Claude Code windows target different projects
+        h = hashlib.md5(str(Path(proj).resolve()).encode()).hexdigest()[:8]
+        lock_file = f"/dev/shm/claude-serial-{h}.lock"
+        with open(lock_file, "w") as f:
+            f.write(proj)
 
-    # 2. 生成 .mcp.json
-    _ensure_mcp_json(project_dir)
+        # Session PID + lock path — session-stop reads these for cleanup
+        pid_file = os.path.join(dut_dir, ".session-pid")
+        with open(pid_file, "w") as f:
+            f.write(f"{os.getpid()}\n{lock_file}")
 
-    # 3. MCP 由 Claude Code 通过 .mcp.json (stdio transport) 自动启动
+        # ── HTTP MCP: auto-start on per-project hash port ──
+        # Same algorithm as dutabo's project_mcp_port() (MD5, deterministic).
+        port = _project_http_port(proj)
+        _ensure_http_mcp(proj, port)
 
     sys.exit(0)
 

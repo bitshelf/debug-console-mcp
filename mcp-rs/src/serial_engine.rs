@@ -1,7 +1,55 @@
-//! SerialEngine — 核心引擎, 协调 console, log, detector, state, commands, relay。
+//! SerialEngine — central orchestrator for the MCP serial debug system.
 //!
-//! Lifespan: start → 获取锁 + 打开串口 + 启动读循环/看门狗
-//!           stop  → 关闭一切 + 释放资源
+//! # Architecture
+//!
+//! Owns every subsystem as a field. All MCP tool calls and dutabo commands
+//! flow through a single `Arc<Mutex<SerialEngine>>` (type alias `SharedEngine`).
+//!
+//! ```text
+//! ┌──────────────────────────────────────────────────┐
+//! │ SerialEngine                                     │
+//! │  ├─ console:  SerialConsoleDriver  (TCP ↔ ser2net)
+//! │  ├─ detector: BootStageDetector    (regex + learner)
+//! │  ├─ state:    StateManager         (3-tier state machine)
+//! │  ├─ logs:     LogManager           (ring buffer + writer thread)
+//! │  ├─ commands: CommandQueue         (marker-echo pattern)
+//! │  ├─ relay:    RelayManager         (PowerControl trait)
+//! │  └─ reconnect: ReconnectManager    (deferred backoff)
+//! └──────────────────────────────────────────────────┘
+//! ```
+//!
+//! # Lifecycle
+//!
+//! 1. `start()` — project singleton check → serial lock → console.connect()
+//!    → probe_initial_state() → write PID → launch read loop + watchdog
+//! 2. `read_loop_iter()` — called ~100x/sec by HTTP read task. Drains writes,
+//!    handles reconnects, reads serial data, feeds detector + command queue.
+//!    **Lock is NOT held during backoff sleeps** (see `reconnect_after`).
+//! 3. `stop()` — abort background tasks, close console/relay, release locks.
+//!
+//! # State flow
+//!
+//! ```text
+//! Stopped → Connecting → Active ←→ Booting ↔ UBoot
+//!                 ↓          ↓         ↓
+//!            Disconnected  Crashed   DUT-off
+//!                             ↓
+//!                          (watchdog reboot) → Booting → ...
+//! ```
+//!
+//! # Disconnected handling
+//!
+//! 1. **Fast retry**: immediate reconnect (2s timeout). Success → user never sees it.
+//! 2. **Ping-pong guard**: skip fast retry if last attempt was < 10s ago.
+//! 3. **Deferred backoff**: backoff sleep happens OUTSIDE the engine Mutex
+//!    via `reconnect_after`. HTTP requests are never blocked by reconnect waits.
+//!
+//! # Engine lock policy
+//!
+//! - `Arc<Mutex<SerialEngine>>` serialises all access.
+//! - Read loop acquires lock each iteration (~100 Hz), does work, drops lock.
+//! - Backoff sleeps (1s–30s) are deferred: a timestamp is set, the lock is
+//!   released, and the caller (mcp_http) sleeps outside the critical section.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,11 +59,31 @@ use tokio::sync::Mutex;
 use crate::boot_detector::{BootEvent, BootStageDetector};
 use crate::command_queue::CommandQueue;
 use crate::config::Config;
+use crate::connection_learner::{ConnectionLearner, LearnConfig, LearnMethod, LearnResult};
 use crate::console::SerialConsoleDriver;
 use crate::lock_manager;
 use crate::log_manager::LogManager;
+use crate::power_control::Button;
+use crate::reconnect::ReconnectManager;
 use crate::relay_manager::RelayManager;
 use crate::state_manager::{StateManager, TargetState};
+
+// ── Timing ─────────────────────────────────────────────────────────────────
+//
+// Instead of scattered magic numbers, every timeout is a named `Duration`
+// constant that documents *what* it measures.  The expect-style poll loop
+// (`send_and_expect`) returns as soon as data arrives so these are ceiling
+// values, not fixed sleeps.
+//
+// Community reference: labgrid SerialDriver, pexpect expect().
+
+/// Ceiling for send-and-read-response round-trip (TCP → ser2net → UART → back).
+/// Typical LAN response is 20-80 ms.
+const COMMAND_RESPONSE_CEILING: Duration = Duration::from_millis(2000);
+
+/// Poll tick for the expect loop — how often we check for new serial data.
+const EXPECT_POLL: Duration = Duration::from_millis(50);
+
 
 pub struct SerialEngine {
     pub console: SerialConsoleDriver,
@@ -24,17 +92,34 @@ pub struct SerialEngine {
     pub logs: LogManager,
     pub commands: CommandQueue,
     pub relay: RelayManager,
-    config: Config,
+    pub config: Config,
     running: bool,
     read_handle: Option<tokio::task::JoinHandle<()>>,
     watchdog_handle: Option<tokio::task::JoinHandle<()>>,
     host: String,
+    relay_host: String,
     serial_target: String,
     login_user: String,
     login_pass: String,
-    interrupt_strategy: String,
-    /// poll_logs 的文件位置跟踪
+    pub interrupt_char: u8,
+    /// poll_logs 的 file position tracking
     poll_position: u64,
+    /// When paused, the engine skips sending data (heartbeat, login, etc.)
+    /// Used by dutabo serial to take over the serial port without Agent interference.
+    paused: bool,
+    /// Reconnection manager with exponential backoff.
+    reconnect: ReconnectManager,
+    /// WebSocket broadcast: serial output relayed to dutabo clients.
+    /// Set when a WebSocket session is active, cleared on disconnect.
+    ws_tx: Option<tokio::sync::broadcast::Sender<Vec<u8>>>,
+    /// Timestamp of the last fast-retry attempt. Used to prevent ping-pong:
+    /// if we fast-retried within the last 10s and the connection dropped again,
+    /// skip the fast retry and go straight to backoff.
+    last_fast_retry: Option<std::time::Instant>,
+    /// Earliest time to attempt the next reconnection. Set by the backoff logic
+    /// so the sleep happens OUTSIDE the engine lock (in the HTTP read loop).
+    /// `None` means reconnect is allowed now.
+    reconnect_after: Option<std::time::Instant>,
 }
 
 impl SerialEngine {
@@ -43,22 +128,35 @@ impl SerialEngine {
             .project_dir
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap());
-        let host = config.dev_host_ip();
+        let host = config.serial_ip();
+        let relay_host = config.relay_ip();
         let serial_target = config.serial_target();
         let dut_dir = config.dut_dir();
         // 提取所有需要的配置值（在 config 被 move 之前）
         let login_user = config.login_user();
         let login_pass = config.login_pass();
-        let interrupt_strategy = config.interrupt_strategy();
+        let login_prompt = config.login_prompt();
+        let interrupt_char = config.uboot_interrupt_char();
+
+        let mut detector = BootStageDetector::new();
+        if !login_prompt.is_empty() {
+            detector.set_login_regex(&login_prompt);
+        }
+        // Apply custom crash patterns from .target.toml
+        let crash_patterns = config.crash_patterns();
+        if !crash_patterns.is_empty() {
+            detector.set_crash_patterns(crash_patterns);
+        }
 
         Self {
             console: SerialConsoleDriver::new(host.clone(), serial_target.clone()),
-            detector: BootStageDetector::new(),
+            detector,
             state: StateManager::new(
                 &project_dir,
                 config.hang_timeout(),
                 config.hang_hysteresis(),
                 &dut_dir,
+                config.get("DUT_ALIAS"),
             ),
             logs: LogManager::new(
                 &project_dir,
@@ -68,43 +166,126 @@ impl SerialEngine {
             ),
             commands: CommandQueue::new(),
             relay: RelayManager::new(
-                host.clone(),
+                relay_host.clone(),
                 config.relay_port(),
                 config.reset_channel(),
                 config.maskrom_channel(),
+                config.recovery_channel(),
+                config.power_channel(),
+                config.power_off_time_ms(),
             ),
             config,
             running: false,
             read_handle: None,
             watchdog_handle: None,
             host,
+            relay_host,
             serial_target,
             login_user,
             login_pass,
-            interrupt_strategy,
+            interrupt_char,
             poll_position: 0,
+            paused: false,
+            reconnect: ReconnectManager::new(),
+            ws_tx: None,
+            last_fast_retry: None,
+            reconnect_after: None,
         }
     }
 
     /// 启动引擎: 项目单例检查 → 获取串口锁 → 打开串口 → 启动后台任务
+    #[tracing::instrument(skip(self), fields(host, target))]
     pub async fn start(&mut self) -> Result<(), String> {
-        let project_dir = self.config.project_dir.clone()
+        tracing::Span::current().record("host", &self.host);
+        tracing::Span::current().record("target", &self.serial_target);
+        let project_dir = self
+            .config
+            .project_dir
+            .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap());
         let dut_dir = self.config.dut_dir();
 
-        // 1. 项目级单例: 同一 project_dir 只能有一个 MCP
-        if let Some(conflicting_pid) = lock_manager::check_project_singleton(&project_dir, &dut_dir) {
-            return Err(format!(
-                "MCP already running for this project (PID {}).\n\
-                 Only one MCP instance per project directory.\n\
-                 Kill the existing process or use 'fuser -k 3000/tcp'.",
-                conflicting_pid
-            ));
+        // 0. Validate config — catch common misconfigurations early
+        {
+            let mut issues: Vec<String> = Vec::new();
+            if self.config.dev_host_ip().is_empty() {
+                issues.push("dev_host.ip not set".into());
+            }
+            let port = self.config.serial_target();
+            if port.is_empty() || port == "0" {
+                issues.push("serial.port not set".into());
+            }
+            if self.config.login_user().is_empty() {
+                tracing::warn!("[AGENT-NOTIFY] login_user not set — auto-login disabled");
+            }
+            let ref_log = self.config.reference_log();
+            if !ref_log.is_empty() {
+                let ref_path = std::path::PathBuf::from(&ref_log);
+                let abs_path = if ref_path.is_relative() {
+                    self.config
+                        .project_dir
+                        .as_ref()
+                        .map(|p| p.join(&ref_path))
+                        .unwrap_or(ref_path)
+                } else {
+                    ref_path
+                };
+                if !abs_path.exists() {
+                    tracing::warn!(
+                        "[AGENT-NOTIFY] reference_log '{}' not found. \
+                         Run serial_reset(wait_boot=true) to auto-capture.",
+                        abs_path.display()
+                    );
+                }
+            }
+            if !issues.is_empty() {
+                for issue in &issues {
+                    tracing::error!("[AGENT-NOTIFY] Config error: {issue}");
+                }
+                return Err(format!(
+                    "Config errors: {}. Fix .target.toml.",
+                    issues.join("; ")
+                ));
+            }
+        }
+
+        // 1. 项目级单例: 同一 project_dir 只能有一个 MCP，自动替换旧进程。
+        //    使用轮询等待旧进程退出（最多 5 秒），避免 sleep(800ms) 后端口仍被占用。
+        if let Some(conflicting_pid) = lock_manager::check_project_singleton(&project_dir, &dut_dir)
+        {
+            tracing::warn!("Killing stale MCP process (PID {conflicting_pid})");
+            unsafe { libc::kill(conflicting_pid as i32, libc::SIGTERM) };
+            // Poll until the old process exits or 5 seconds pass.
+            for _ in 0..50 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if !lock_manager::process_alive(conflicting_pid) {
+                    tracing::info!("Old MCP process {conflicting_pid} exited");
+                    break;
+                }
+            }
+            if lock_manager::process_alive(conflicting_pid) {
+                tracing::warn!("Old MCP process {conflicting_pid} did not exit — sending SIGKILL");
+                unsafe { libc::kill(conflicting_pid as i32, libc::SIGKILL) };
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            // Clean stale PID files (project-level + per-DUT + session)
+            let pid_file = project_dir.join(&dut_dir).join("mcp.pid");
+            std::fs::remove_file(&pid_file).ok();
+            let auto_dut_alias = self.config.get_str_or("DUT_ALIAS", "default");
+            let alias_pid = project_dir
+                .join(&dut_dir)
+                .join(&auto_dut_alias)
+                .join("mcp.pid");
+            std::fs::remove_file(&alias_pid).ok();
+            let session_pid = project_dir.join(&dut_dir).join(".session-pid");
+            std::fs::remove_file(&session_pid).ok();
         }
 
         // 2. 获取串口互斥锁
         let lock_dir = self.config.lock_dir();
-        if let Some(conflicting_pid) = lock_manager::acquire_lock(&self.host, &self.serial_target, &lock_dir) {
+        if let Some(conflicting_pid) =
+            lock_manager::acquire_lock(&self.host, &self.serial_target, &lock_dir)
+        {
             return Err(format!(
                 "Target {}:{} is already in use by PID {}.",
                 self.host, self.serial_target, conflicting_pid
@@ -114,20 +295,47 @@ impl SerialEngine {
         // 3. 写入 PID 文件
         self.state.write_pid(&project_dir, &dut_dir);
 
-        // 2. 设置 write_fn for CommandQueue
+        // 4. 设置 write_fn for CommandQueue
         let write_tx = self.console.write_sender();
         self.commands.set_write_fn(Box::new(move |data| {
-            write_tx.send(data.to_vec()).ok();
+            write_tx.try_send(data.to_vec()).ok();
         }));
 
-        // 3. 初始化日志缓冲
-        self.logs.mark_boot_start();
+        // 5. 确保日志文件已打开 (不切割 — 板子可能早已在运行)
+        self.logs.ensure_current_file();
 
-        // 4. 连接串口 + 探测初始状态
+        // Auto-create per-DUT directory structure if missing
+        let auto_dut_alias = self.config.get_str_or("DUT_ALIAS", "default");
+        let alias_dir = project_dir
+            .join(&dut_dir)
+            .join(&auto_dut_alias)
+            .join("logs");
+        if let Err(e) = std::fs::create_dir_all(&alias_dir) {
+            tracing::warn!("Cannot create DUT log dir {}: {e}", alias_dir.display());
+        } else if !alias_dir.exists() {
+            // create_dir_all reports Ok even if dir already exists; check it's there
+            tracing::debug!("DUT log dir ready: {}", alias_dir.display());
+        }
+
+        // 6. 连接串口 + stty -echo + 探测初始状态
         match self.console.connect().await {
             Ok(()) => {
                 tracing::info!("Serial connected to {}:{}", self.host, self.serial_target);
+                // Disable echo before any command — avoids marker-in-echo garbling.
+                // drain_writes flushes the send buffer; the subsequent
+                // probe_initial_state read_available call naturally waits for
+                // the response — no explicit sleep needed.
+                self.console.sendline("stty -echo");
+                self.console.drain_writes().await;
                 self.probe_initial_state().await;
+                // Warmup: prime the serial pipeline so the first real command
+                // doesn't return empty (BusyBox/ser2net buffering issue).
+                self.console.sendline("echo warmup");
+                self.console.drain_writes().await;
+                let _ = self
+                    .console
+                    .read_available(Duration::from_millis(EXPECT_POLL.as_millis() as u64 * 6), 256)
+                    .await;
             }
             Err(e) => {
                 tracing::warn!("Cannot open serial: {e}");
@@ -135,10 +343,89 @@ impl SerialEngine {
             }
         }
 
-        // 5. 启动后台任务
+        // 7. Auto-load reference boot log if configured (StageLearner adaptive mode)
+        let ref_log = self.config.reference_log();
+        if !ref_log.is_empty() {
+            let ref_path = std::path::PathBuf::from(&ref_log);
+            if ref_path.exists() {
+                let st = self.config.learner_stage_threshold();
+                let ct = self.config.learner_crash_threshold();
+                match self.detector.load_reference(&ref_path, st, ct) {
+                    Ok(()) => {
+                        tracing::info!("Auto-loaded reference log: {}", ref_log);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to load reference log {}: {e}", ref_log);
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "[AGENT-NOTIFY] Reference boot log missing: {}. \
+                     The StageLearner needs a reference boot log for accurate stage detection. \
+                     Run: serial_reset(wait_boot=true) to auto-capture one.",
+                    ref_log
+                );
+            }
+        }
+
+        // 8. 标记运行状态 (后台任务由 mcp/mcp_http spawn 并通过 set_background_tasks 注册)
+        //    必须在任何可能阻塞的操作之前设置，确保 MCP 能及时响应请求。
         self.running = true;
 
-        tracing::info!("[{}:{}] SerialEngine started", self.host, self.serial_target);
+        tracing::info!(
+            "[{}:{}] SerialEngine started",
+            self.host,
+            self.serial_target
+        );
+
+        // 9. Optional: verify udev alias on dev host (best-effort, runs in blocking
+        //    thread pool via spawn_blocking to avoid fork() issues). Spawned after
+        //    running=true so the engine is already responsive.
+        {
+            let dut_alias = self.config.get_str_or("DUT_ALIAS", "default");
+            if !dut_alias.is_empty() && dut_alias != "default" {
+                let dev_ip = self.config.dev_host_ip();
+                let dev_user = self.config.get_str_or("DEV_HOST_USER", "linaro");
+                if !dev_ip.is_empty() {
+                    let alias_path = format!("/dev/serial/by-alias/{dut_alias}");
+                    let ssh_dest = format!("{dev_user}@{dev_ip}");
+                    let alias_for_log = alias_path.clone();
+                    let ssh_for_log = ssh_dest.clone();
+                    tokio::spawn(async move {
+                        let result = tokio::time::timeout(
+                            Duration::from_secs(3),
+                            tokio::task::spawn_blocking(move || {
+                                std::process::Command::new("ssh")
+                                    .args([
+                                        "-o",
+                                        "ConnectTimeout=2",
+                                        "-o",
+                                        "BatchMode=yes",
+                                        &ssh_dest,
+                                        "test",
+                                        "-e",
+                                        &alias_path,
+                                    ])
+                                    .status()
+                            }),
+                        )
+                        .await;
+                        match result {
+                            Ok(Ok(Ok(status))) if status.success() => {
+                                tracing::info!("udev alias verified: {alias_for_log}");
+                            }
+                            _ => {
+                                tracing::warn!(
+                                    "[AGENT-NOTIFY] udev alias '{alias_for_log}' not found on dev host. \
+                                     Run: ssh {ssh_for_log} ls /dev/serial/by-alias/"
+                                );
+                            }
+                        }
+                    });
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -156,7 +443,10 @@ impl SerialEngine {
             });
         }
         // 写新的 mcp.pid
-        let project_dir = self.config.project_dir.clone()
+        let project_dir = self
+            .config
+            .project_dir
+            .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap());
         self.state.write_pid(&project_dir, &self.config.dut_dir());
         // 重连串口
@@ -173,6 +463,7 @@ impl SerialEngine {
     }
 
     /// 停止引擎
+    #[tracing::instrument(skip(self))]
     pub async fn stop(&mut self) {
         self.running = false;
         if let Some(h) = self.read_handle.take() {
@@ -181,149 +472,337 @@ impl SerialEngine {
         if let Some(h) = self.watchdog_handle.take() {
             h.abort();
         }
+        if self.console.is_open() {
+            self.console.sendline("stty echo");
+        }
         self.console.close();
         self.relay.close();
         self.logs.close();
         let lock_dir = self.config.lock_dir();
         lock_manager::release_lock(&self.host, &self.serial_target, &lock_dir);
         self.state.transition(TargetState::Stopped);
-        tracing::info!("[{}:{}] SerialEngine stopped", self.host, self.serial_target);
+        tracing::info!(
+            "[{}:{}] SerialEngine stopped",
+            self.host,
+            self.serial_target
+        );
+    }
+
+    /// 保存后台任务 handle (由 mcp/mcp_http spawn 后调用)
+    pub fn set_background_tasks(
+        &mut self,
+        read_handle: tokio::task::JoinHandle<()>,
+        watchdog_handle: tokio::task::JoinHandle<()>,
+    ) {
+        self.read_handle = Some(read_handle);
+        self.watchdog_handle = Some(watchdog_handle);
     }
 
     /// 检查事件列表中是否包含启动完成信号
     fn is_boot_complete(events: &[BootEvent]) -> bool {
-        events.iter().any(|e| matches!(e,
-            BootEvent::Stage(s) if matches!(s.as_str(),
-                "shell" | "android_shell" | "android_adbd"
-                | "android_bootanim" | "android_surfaceflinger"
-                | "android_boot_completed"
+        events.iter().any(|e| {
+            matches!(e,
+                BootEvent::Stage(s) if matches!(s.as_str(),
+                    "shell" | "android_shell" | "android_adbd"
+                    | "android_bootanim" | "android_surfaceflinger"
+                    | "android_boot_completed"
+                )
             )
-        ))
+        })
     }
 
-    /// 启动后探测串口当前状态
+    /// Send a line to the board and read back the response using an
+    /// expect-style poll loop.  Checks for data every `EXPECT_POLL_INTERVAL_MS`,
+    /// returns immediately when data arrives.  `COMMAND_RESPONSE_CEILING_MS`
+    /// is only a failsafe for a dead board.
+    async fn send_and_expect(&mut self, cmd: &str) -> Result<Vec<u8>, std::io::Error> {
+        self.console.sendline(cmd);
+        self.console.drain_writes().await;
+        let deadline = std::time::Instant::now()
+            + COMMAND_RESPONSE_CEILING;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(Vec::new());
+            }
+            let poll = remaining.min(EXPECT_POLL);
+            match self.console.read_available(poll, 4096).await {
+                Ok(data) if !data.is_empty() => return Ok(data),
+                Err(e) => return Err(e),
+                _ => {} // no data yet, keep polling
+            }
+        }
+    }
+
+    /// Probe the serial port to determine the board's current state.
+    ///
+    /// Uses an expect pattern: quick non-blocking drain first, then
+    /// send-and-expect to trigger a prompt if the board appears idle.
+    /// No hardcoded sleeps — poll loop returns as soon as data arrives.
+    #[tracing::instrument(skip(self), fields(result))]
     async fn probe_initial_state(&mut self) {
+        let _start_state = self.state.current();
+        // Step 1: non-blocking drain of kernel buffer
         match self
             .console
-            .read_available(Duration::from_secs(1), 4096)
+            .read_available(EXPECT_POLL, 4096)
             .await
         {
             Ok(data) if !data.is_empty() => {
                 let filtered = strip_ser2net_banner(&data);
                 let probe_data = if !filtered.is_empty() { &filtered } else { &data };
+
                 if !filtered.is_empty() {
                     self.logs.write(probe_data);
-                }
-                let events = self.detector.feed(probe_data);
+                    let events = self.detector.feed(probe_data);
+                    self.state.on_activity();
 
-                // 明确的启动完成信号 → active
-                if Self::is_boot_complete(&events) {
-                    self.logs.flush_boot_log();
-                    self.logs.mark_boot_start();
-                    self.state.transition(TargetState::Active);
-                    tracing::info!("Probe: boot complete → active");
-                    return;
+                    if Self::is_boot_complete(&events) {
+                        self.state.transition(TargetState::Active);
+                        tracing::info!("Probe: boot complete → active");
+                        return;
+                    }
+                    if events.iter().any(|e| matches!(e, BootEvent::BootStart)) {
+                        self.state.transition(TargetState::Booting);
+                        tracing::info!("Probe: SPL → booting");
+                        return;
+                    }
+                    if events
+                        .iter()
+                        .any(|e| matches!(e, BootEvent::Stage(s) if s == "uboot"))
+                    {
+                        self.state.transition(TargetState::UBoot);
+                        tracing::info!("Probe: at U-Boot prompt");
+                        return;
+                    }
                 }
-                if events.iter().any(|e| matches!(e, BootEvent::BootStart)) {
-                    tracing::info!("Probe: SPL → booting");
-                    return;
-                }
-                // 发换行探测 shell
-                self.console.sendline("");
-                self.console.drain_writes().await; // 确保换行通过 TCP 发出
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                if let Ok(d2) = self.console.read_available(Duration::from_millis(800), 4096).await {
-                    if !d2.is_empty() {
+
+                // Buffered data inconclusive — trigger fresh prompt
+                match self.send_and_expect("").await {
+                    Ok(d2) if !d2.is_empty() => {
                         self.logs.write(&d2);
                         let e2 = self.detector.feed(&d2);
+                        self.state.on_activity();
                         if Self::is_boot_complete(&e2) {
-                            self.logs.flush_boot_log();
-                            self.logs.mark_boot_start();
                             self.state.transition(TargetState::Active);
                             tracing::info!("Probe: 2nd pass boot complete → active");
-                        } else if e2.iter().any(|e| matches!(e, BootEvent::Stage(s) if s == "uboot")) {
+                        } else if e2
+                            .iter()
+                            .any(|e| matches!(e, BootEvent::Stage(s) if s == "uboot"))
+                        {
                             self.state.transition(TargetState::UBoot);
-                            tracing::info!("Probe: at U-Boot prompt");
+                            tracing::info!("Probe: 2nd pass → U-Boot");
                         } else {
-                            self.logs.flush_boot_log();
-                            self.logs.mark_boot_start();
                             self.state.transition(TargetState::Active);
                             tracing::info!("Probe: responding → active");
                         }
-                    } else {
+                    }
+                    Err(_) => {
+                        self.state.transition(TargetState::Disconnected);
+                        tracing::warn!("Probe: 2nd read error → disconnected");
+                    }
+                    _ => {
                         self.state.transition(TargetState::DutOff);
                         tracing::warn!("Probe: not responding → DUT-off");
                     }
-                } else {
-                    self.state.transition(TargetState::Active);
-                    tracing::info!("Probe: read timeout → active");
                 }
             }
-            Ok(_) | Err(_) => {
-                self.state.transition(TargetState::Active);
-                tracing::info!("Probe: no data → active");
-            }
-        }
-        // 探测完成后初始化日志缓冲 (match 外部)
-        if self.state.current() == TargetState::Active {
-            self.logs.mark_boot_start();
-        }
-    }
-
-    /// 读取并处理串口数据 (调用前确保 wait_readable 已返回 true)
-    pub async fn process_serial_data(&mut self) {
-        self.console.drain_writes().await;
-        match self.console.read_available(Duration::from_millis(0), 4096).await {
-            Ok(data) if !data.is_empty() => {
-                self.state.on_activity();
-                if self.state.current() == TargetState::DutOff {
-                    self.state.transition(TargetState::Active);
+            Ok(_) => {
+                // Board appears idle — send empty line to verify it's alive
+                match self.send_and_expect("").await {
+                    Ok(d2) if !d2.is_empty() => {
+                        self.logs.write(&d2);
+                        let e2 = self.detector.feed(&d2);
+                        self.state.on_activity();
+                        if Self::is_boot_complete(&e2) {
+                            self.state.transition(TargetState::Active);
+                            tracing::info!("Probe: late response → boot complete → active");
+                        } else {
+                            self.state.transition(TargetState::Active);
+                            tracing::info!("Probe: late response → active");
+                        }
+                    }
+                    Err(_) => {
+                        self.state.transition(TargetState::Disconnected);
+                        tracing::warn!("Probe: 2nd read error after probe → disconnected");
+                    }
+                    _ => {
+                        self.state.transition(TargetState::DutOff);
+                        tracing::warn!("Probe: no data, no probe response → DUT-off");
+                    }
                 }
-                let clean_data = strip_ser2net_banner(&data);
-                if !clean_data.is_empty() { self.logs.write(&clean_data); }
-                let events = self.detector.feed(&data);
-                self.handle_boot_events(events).await;
-                let clean = strip_android_klog(&data);
-                self.commands.feed_serial_data(&clean);
             }
-            Ok(_) => { self.commands.check_timeouts(); }
-            Err(e) => { self.handle_read_error(e).await; }
+            Err(e) => {
+                self.state.transition(TargetState::Disconnected);
+                tracing::warn!("Probe: read error ({e}) → disconnected");
+            }
+        }
+        tracing::Span::current().record(
+            "result",
+            &tracing::field::display(
+                self.state
+                    .external_state()
+                    .map(|s| s.as_str())
+                    .unwrap_or("unknown"),
+            ),
+        );
+    }
+
+    /// Check if serial data contains a shutdown message → transition to DUT-off.
+    fn maybe_detect_shutdown(&mut self, data: &[u8]) {
+        let text = String::from_utf8_lossy(data);
+        if text.contains("Power down")
+            || text.contains("System halted")
+            || text.contains("reboot: Power down")
+        {
+            self.state.transition(TargetState::DutOff);
+            tracing::info!("Shutdown detected → DUT-off");
         }
     }
 
-    /// 检查连接状态, 断连则重连 (同步版本, 由 watchdog 调用)
-    pub fn try_reconnect(&mut self) {
-        if !self.console.is_open() {
-            tracing::info!("Connection lost, will reconnect on next read loop iteration");
-            // 实际重连由 read_loop_iter 的 disconnected 路径处理
-        }
-    }
-
-    /// 事件驱动读循环: 等待数据 (epoll/kqueue, 无轮询), 处理 watchdog
+    /// 事件驱动读循环: 等待数据 (epoll/kqueue, 无轮询), 处理 watchdog。
+    ///
+    /// 事件驱动读循环: 等待数据 (epoll/kqueue, 无轮询), 处理 watchdog。
+    ///
+    /// The engine lock is NOT held during backoff sleeps — see
+    /// `reconnect_after`.
     pub async fn read_loop_iter(&mut self) {
         if !self.running {
             return;
         }
+        // Always drain pending writes
         self.console.drain_writes().await;
-        // disconnected 状态 → 主动尝试重连
-        if self.state.current() == TargetState::Disconnected {
+
+        // If a previous drain_writes marked the connection as broken, surface
+        // the error promptly instead of waiting for wait_readable to time out.
+        // (ser2net may keep the TCP socket open even after the serial device
+        // disappears, so wait_readable never signals EOF.)
+        let cur = self.state.current();
+        if !self.console.is_open() && matches!(cur, TargetState::Active | TargetState::Booting) {
+            // Probe the socket once — if it returns an error, handle it now.
+            match self
+                .console
+                .read_available(std::time::Duration::from_millis(0), 128)
+                .await
+            {
+                Err(e) => {
+                    self.handle_read_error(e).await;
+                    return;
+                }
+                Ok(_) => {} // still open, continue
+            }
+        }
+        // Periodic statusline cache refresh (every 5s) — keeps timestamps fresh
+
+        // Handle resume from dutabo: reconnect with backoff, then go active.
+        // Only reconnect when sentinel is gone — if it still exists, dutabo
+        // is still holding the serial port and we must wait.
+        // Skip this when WS is active (dutabo serial via MCP WebSocket) — the
+        // serial connection is still managed by this engine.
+        if self.ws_tx.is_none() && !self.paused && self.state.current() == TargetState::Dutabo {
+            let sentinel_gone = self
+                .config
+                .project_dir
+                .as_ref()
+                .map(|proj| !proj.join(".dut-serial").join(".dutabo-active").exists())
+                .unwrap_or(true);
+            if !sentinel_gone {
+                return; // dutabo still active — don't reconnect yet
+            }
+            let delay = self.reconnect.next_delay();
+            self.reconnect_after = Some(std::time::Instant::now() + delay);
+            tracing::info!(
+                "[AGENT-NOTIFY] Dutabo resume, reconnecting in {:.1}s (backoff {:.0})",
+                delay.as_secs_f64(),
+                self.reconnect.current_backoff()
+            );
+            return; // defer sleep — caller will wait outside the lock
+        }
+        // reconnect_after has elapsed, try the actual reconnect now.
+        if self.reconnect_after.take().is_some() {
             if let Ok(()) = self.console.connect().await {
+                self.console.sendline("stty -echo");
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 self.probe_initial_state().await;
-                tracing::info!("Auto-reconnected from disconnected");
-            } else {
-                // 重连失败, 短暂等待后让 watchdog 再试
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                self.reconnect.reset();
+                tracing::info!("Reconnected after dutabo session");
+            }
+            return;
+        }
+
+        if self.paused {
+            return;
+        }
+
+        // Check for dutabo takeover sentinel file (direct-serial mode only).
+        // Skip when WS is active — the MCP server manages serial for the WS client.
+        if self.ws_tx.is_none() {
+            if let Some(ref proj) = self.config.project_dir {
+                let sentinel = proj.join(".dut-serial").join(".dutabo-active");
+                if sentinel.exists() {
+                    if self.console.is_open() {
+                        self.console.close(); // release serial so dutabo can connect
+                        self.state
+                            .transition(crate::state_manager::TargetState::Dutabo);
+                    }
+                    return; // don't reconnect while dutabo is active
+                }
+            }
+        }
+        self.console.drain_writes().await;
+        // disconnected 状态 → 主动尝试重连 (exponential backoff).
+        // Backoff sleep is deferred via reconnect_after — engine lock NOT held.
+        if self.state.current() == TargetState::Disconnected {
+            // Check if we're in a backoff waiting period.
+            if let Some(after) = self.reconnect_after {
+                if std::time::Instant::now() < after {
+                    return; // backoff window hasn't elapsed yet
+                }
+                // Window elapsed — try reconnect now.
+                if let Ok(()) = self.console.connect().await {
+                    self.console.sendline("stty -echo");
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    self.probe_initial_state().await;
+                    self.reconnect.reset();
+                    self.reconnect_after = None;
+                    tracing::info!("Auto-reconnected after backoff");
+                } else {
+                    // Failed — schedule the next backoff window.
+                    let delay = self.reconnect.next_delay();
+                    self.reconnect_after = Some(std::time::Instant::now() + delay);
+                    tracing::info!(
+                        "[AGENT-NOTIFY] Serial disconnected, next retry in {:.1}s",
+                        delay.as_secs_f64()
+                    );
+                }
                 return;
             }
+            // First disconnect — start the backoff sequence.
+            let delay = self.reconnect.next_delay();
+            self.reconnect_after = Some(std::time::Instant::now() + delay);
+            tracing::info!(
+                "[AGENT-NOTIFY] Serial disconnected, reconnecting in {:.1}s",
+                delay.as_secs_f64()
+            );
+            return;
         }
         // 事件驱动等待数据 (100ms 超时, 快速释放锁给 HTTP)
         if !self.console.wait_readable(Duration::from_millis(100)).await {
             return;
         }
         // 数据就绪, 读取处理
-        match self.console.read_available(Duration::from_millis(0), 4096).await {
+        match self
+            .console
+            .read_available(Duration::from_millis(0), 4096)
+            .await
+        {
             Ok(data) if !data.is_empty() => {
+                // Broadcast to WebSocket clients (dutabo serial)
+                if let Some(ref tx) = self.ws_tx {
+                    let _ = tx.send(data.clone());
+                }
                 self.state.on_activity();
+                self.maybe_detect_shutdown(&data);
                 if self.state.current() == TargetState::DutOff {
                     self.state.transition(TargetState::Active);
                     tracing::info!("Device resumed from DUT-off → active");
@@ -332,10 +811,54 @@ impl SerialEngine {
                 if !clean_data.is_empty() {
                     self.logs.write(&clean_data);
                 }
-                let events = self.detector.feed(&data);
+                // Catch panics in detector.feed() — a malformed regex or unexpected
+                // input should not crash the MCP server.
+                let events = {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.detector.feed(&clean_data)
+                    }));
+                    match result {
+                        Ok(events) => events,
+                        Err(e) => {
+                            let msg = if let Some(s) = e.downcast_ref::<String>() {
+                                s.clone()
+                            } else if let Some(s) = e.downcast_ref::<&str>() {
+                                s.to_string()
+                            } else {
+                                "unknown panic".to_string()
+                            };
+                            tracing::error!(
+                                "[AGENT-NOTIFY] SerialEngine panicked in detector.feed(): {}. Reconnecting...",
+                                msg
+                            );
+                            self.state.transition(TargetState::Disconnected);
+                            return;
+                        }
+                    }
+                };
                 self.handle_boot_events(events).await;
                 let clean = strip_android_klog(&data);
-                self.commands.feed_serial_data(&clean);
+                // Catch panics in feed_serial_data() — marker parsing or buffer
+                // management bugs should not crash the MCP server.
+                {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.commands.feed_serial_data(&clean);
+                    }));
+                    if let Err(e) = result {
+                        let msg = if let Some(s) = e.downcast_ref::<String>() {
+                            s.clone()
+                        } else if let Some(s) = e.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else {
+                            "unknown panic".to_string()
+                        };
+                        tracing::error!(
+                            "[AGENT-NOTIFY] SerialEngine panicked in commands.feed_serial_data(): {}. Reconnecting...",
+                            msg
+                        );
+                        self.state.transition(TargetState::Disconnected);
+                    }
+                }
             }
             Ok(_) => {
                 self.commands.check_timeouts();
@@ -344,74 +867,89 @@ impl SerialEngine {
                 self.handle_read_error(e).await;
             }
         }
+
+        // Drain command metrics from CommandQueue → StateManager
+        let completed = self.commands.completed_count;
+        let errors = self.commands.error_count;
+        for _ in 0..completed {
+            self.state.inc_command();
+        }
+        for _ in 0..errors {
+            self.state.inc_error();
+        }
+        // Record latencies from recently completed commands.
+        for ms in self.commands.drain_latencies() {
+            self.state.record_latency(ms);
+        }
+        self.commands.completed_count = 0;
+        self.commands.error_count = 0;
     }
 
     async fn handle_read_error(&mut self, e: std::io::Error) {
         tracing::warn!("Serial read error: {e}");
         let cur = self.state.current();
-        // 连接断开 → disconnected (ser2net 挂了, 板子可能正常)
-        // hang 由 watchdog 的 check_hang 检测, 不在此判断
+
+        // Close the dead connection so the next reconnect attempt starts clean.
+        self.console.close();
+
+        // ═══════════════════════════════════════════════════════════════════
+        // Fast-retry guard: prevent ping-pong when ser2net accepts TCP but
+        // there's no real serial device behind it (board unplugged / USB gone).
+        //
+        // If we fast-retried within the last 10 seconds and the connection
+        // dropped again, skip the fast retry — the board is likely physically
+        // disconnected. Go straight to backoff.
+        // ═══════════════════════════════════════════════════════════════════
+        let now = std::time::Instant::now();
+        let skip_fast = self
+            .last_fast_retry
+            .map(|t| now.duration_since(t).as_secs() < 10)
+            .unwrap_or(false);
+
+        if !skip_fast {
+            self.last_fast_retry = Some(now);
+
+            // Fast retry: try to reconnect immediately (2s timeout).
+            // Most "Connection closed by ser2net" events are brief USB
+            // re-enumeration glitches (< 500ms) during board reboots.
+            match self.console.connect_with_timeout(2).await {
+                Ok(()) => {
+                    self.console.sendline("stty -echo");
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    self.probe_initial_state().await;
+                    self.reconnect.reset();
+                    tracing::info!(
+                        "Fast reconnect succeeded (was {:?}), user never saw disconnected",
+                        cur
+                    );
+                    return;
+                }
+                Err(ref e2) => {
+                    tracing::warn!(
+                        "Fast reconnect failed: {e2}. Falling back to backoff reconnect."
+                    );
+                }
+            }
+        } else {
+            tracing::info!(
+                "Skipping fast retry: already retried < 10s ago (was {:?})",
+                cur
+            );
+        }
+
+        // Fast retry skipped or failed — now we really are disconnected.
         self.state.transition(TargetState::Disconnected);
-        // 尝试重连
-        tracing::info!("Attempting reconnect (was {:?})...", cur);
-        match self.console.connect().await {
-            Ok(()) => {
-                self.probe_initial_state().await;
-                tracing::info!("Serial reconnected → resuming from {:?}", cur);
-            }
-            Err(e) => tracing::debug!("Reconnect failed: {e}"),
-        }
+        // Reconnection is deferred to read_loop_iter() — sole reconnection path
+        // avoids duplicate probe race when read loop also tries to reconnect.
+        tracing::info!(
+            "Disconnected (was {:?}), read_loop_iter will reconnect",
+            cur
+        );
     }
 
-    /// 处理一次读循环迭代 (由 MCP server 主循环调用) — 保留兼容
-    pub async fn read_once(&mut self) {
-        if !self.running {
-            return;
-        }
-
-        // 先处理待发写请求
-        self.console.drain_writes().await;
-
-        // 读取串口数据
-        match self
-            .console
-            .read_available(Duration::from_millis(200), 4096)
-            .await
-        {
-            Ok(data) if !data.is_empty() => {
-                self.state.on_activity();
-                // DUT-off → active: 设备唤醒/恢复通信
-                if self.state.current() == TargetState::DutOff {
-                    self.state.transition(TargetState::Active);
-                    tracing::info!("Device resumed from DUT-off → active");
-                }
-                // 写入日志 (过滤 ser2net banner)
-                let clean_data = strip_ser2net_banner(&data);
-                if !clean_data.is_empty() {
-                    self.logs.write(&clean_data);
-                }
-                // 检测启动阶段
-                let events = self.detector.feed(&data);
-                // 处理事件
-                self.handle_boot_events(events).await;
-                // 送入命令队列
-                // 去除 Android kernel log 前缀后送入命令队列
-                let clean = strip_android_klog(&data);
-                self.commands.feed_serial_data(&clean);
-            }
-            Ok(_) => {
-                // 超时，无数据
-                self.commands.check_timeouts();
-            }
-            Err(e) => {
-                self.handle_read_error(e).await;
-            }
-        }
-    }
-
-    /// 看门狗迭代 (由 MCP server 主循环定期调用)
+    /// 看门狗迭代 (由独立 spawn task 定期调用)
     pub fn watchdog_once(&mut self) {
-        if !self.running {
+        if !self.running || self.paused {
             return;
         }
         self.state.check_hang();
@@ -429,8 +967,15 @@ impl SerialEngine {
             let events = self.detector.flush_line_buf();
             for event in events {
                 if let BootEvent::Stage(ref s) = event {
-                    if matches!(s.as_str(), "shell" | "android_shell" | "android_adbd"
-                        | "android_bootanim" | "android_surfaceflinger" | "android_boot_completed") {
+                    if matches!(
+                        s.as_str(),
+                        "shell"
+                            | "android_shell"
+                            | "android_adbd"
+                            | "android_bootanim"
+                            | "android_surfaceflinger"
+                            | "android_boot_completed"
+                    ) {
                         self.state.transition(TargetState::Active);
                     }
                 }
@@ -444,12 +989,17 @@ impl SerialEngine {
         // 文本相似度检测: 数据像参考日志 → 立即切 booting/uboot
         if let Some(ref learner) = self.detector.learner {
             if self.logs.ring_buffer.len() > 512 {
-                let recent = &self.logs.ring_buffer[self.logs.ring_buffer.len().saturating_sub(2048)..];
+                let recent =
+                    &self.logs.ring_buffer[self.logs.ring_buffer.len().saturating_sub(2048)..];
                 let text = String::from_utf8_lossy(recent);
-                if learner.is_boot_like(&text, 0.10) {
+                if learner.is_boot_like(&text, 0.25) {
                     if cur == TargetState::Active {
+                        // 文本相似度检测到重启 → 完整日志分割
+                        self.logs.flush_boot_log();
+                        self.logs.mark_boot_start();
+                        self.detector.reset_cycle();
                         self.state.transition(TargetState::Booting);
-                        tracing::info!("Text similarity: reboot detected → booting");
+                        tracing::info!("Text similarity: reboot detected → log rotated + booting");
                     }
                 }
             }
@@ -461,16 +1011,13 @@ impl SerialEngine {
         for event in events {
             match event {
                 BootEvent::BootStart => {
-                    // 保存上一个启动周期的日志, 开始新的缓冲
+                    // DDR/SPL 出现 = 板子重启 = 新 boot cycle
+                    // 无论当前状态如何，都分割日志（用 boot_detected 去重同 cycle）
                     let cur = self.state.current();
-                    match cur {
-                        TargetState::Booting | TargetState::UBoot => {}
-                        _ => {
-                            self.logs.flush_boot_log();
-                            self.logs.mark_boot_start();
-                            tracing::info!("BootStart: new boot cycle (was {:?})", cur);
-                        }
-                    }
+                    self.logs.flush_boot_log();
+                    self.logs.mark_boot_start();
+                    self.logs.truncate_unclassified();
+                    tracing::info!("BootStart: new boot cycle (was {:?})", cur);
                     self.state.transition(TargetState::Booting);
                     self.detector.reset_cycle();
                 }
@@ -481,13 +1028,18 @@ impl SerialEngine {
                 }
                 BootEvent::LoginPrompt => {
                     if !self.login_user.is_empty() {
-                        tracing::info!("Sending username: {}", self.login_user);
+                        tracing::info!(
+                            "[AGENT-NOTIFY] Login prompt detected — auto-login as '{}'",
+                            self.login_user
+                        );
                         self.console.sendline(&self.login_user);
+                    } else {
+                        tracing::warn!("[AGENT-NOTIFY] Login prompt but no login_user set");
                     }
                 }
                 BootEvent::PasswordPrompt => {
                     if !self.login_pass.is_empty() {
-                        tracing::info!("Sending password");
+                        tracing::info!("[AGENT-NOTIFY] Password prompt — sending password");
                         self.console.sendline(&self.login_pass);
                     }
                 }
@@ -495,11 +1047,22 @@ impl SerialEngine {
                     self.state.transition(TargetState::Crashed);
                     tracing::warn!("CRASH [{crash_type}]: {line}");
                 }
+                BootEvent::Unclassified(lines) => {
+                    // 追加未分类行到 unclassified.log（供 Agent 自学习分析）
+                    if !lines.is_empty() {
+                        if let Err(e) = self.logs.append_unclassified(&lines) {
+                            tracing::warn!("Failed to write unclassified lines: {e}");
+                        }
+                    }
+                }
                 BootEvent::Stage(stage) => {
                     let new_state = match stage.as_str() {
                         "uboot" | "autoboot" => Some(TargetState::UBoot),
-                        "shell" | "android_shell" | "android_adbd"
-                        | "android_bootanim" | "android_surfaceflinger"
+                        "shell"
+                        | "android_shell"
+                        | "android_adbd"
+                        | "android_bootanim"
+                        | "android_surfaceflinger"
                         | "android_boot_completed" => Some(TargetState::Active),
                         _ => Some(TargetState::Booting),
                     };
@@ -522,28 +1085,13 @@ impl SerialEngine {
     // ── MCP Tool 接口 ──
 
     /// 提交命令并返回 receiver — 调用方必须在释放 engine lock 后 await
-    pub fn queue_command(&mut self, command: &str, timeout: f64) -> tokio::sync::oneshot::Receiver<crate::command_queue::CommandResult> {
+    #[tracing::instrument(skip(self), fields(cmd = %command, timeout))]
+    pub fn queue_command(
+        &mut self,
+        command: &str,
+        timeout: f64,
+    ) -> tokio::sync::oneshot::Receiver<crate::command_queue::CommandResult> {
         self.commands.execute(command.to_string(), timeout)
-    }
-
-    pub async fn send_command(&mut self, command: &str, timeout: f64) -> serde_json::Value {
-        // reboot/shutdown: 直接发送, 不等待 marker 响应 (板子会重启)
-        if command.trim() == "reboot" || command.trim() == "poweroff" || command.trim() == "shutdown" {
-            self.console.sendline(command);
-            serde_json::json!({"output": "reboot sent", "exit_code": 0, "timed_out": false})
-        } else {
-            let rx = self.commands.execute(command.to_string(), timeout);
-            match rx.await {
-                Ok(result) => serde_json::json!({
-                    "output": result.output,
-                    "exit_code": result.exit_code,
-                    "timed_out": result.timed_out,
-                }),
-                Err(_) => serde_json::json!({
-                    "error": "Command cancelled",
-                }),
-            }
-        }
     }
 
     /// 在 U-Boot 提示符下发送原始命令 (即发即返回, 不阻塞)
@@ -551,12 +1099,18 @@ impl SerialEngine {
         self.console.sendline(command);
         // 短暂等待命令回显 (最多 1s), 不阻塞 read loop
         let mut output = String::new();
-        if let Ok(data) = self.console.read_available(std::time::Duration::from_millis(500), 1024).await {
+        if let Ok(data) = self
+            .console
+            .read_available(std::time::Duration::from_millis(500), 1024)
+            .await
+        {
             if !data.is_empty() {
                 let clean = strip_ser2net_banner(&data);
-                if !clean.is_empty() { self.logs.write(&clean); }
+                if !clean.is_empty() {
+                    self.logs.write(&clean);
+                }
                 self.state.on_activity();
-                let events = self.detector.feed(&data);
+                let events = self.detector.feed(&clean);
                 self.handle_boot_events(events).await;
                 output = String::from_utf8_lossy(&clean).to_string();
             }
@@ -572,6 +1126,10 @@ impl SerialEngine {
             "log_path": self.logs.current_path().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
             "relay_configured": self.relay.configured(),
             "login_configured": !self.login_user.is_empty(),
+            "uptime_secs": self.state.uptime_secs(),
+            "command_count": self.state.command_count(),
+            "error_count": self.state.error_count(),
+            "pending_commands": self.commands.pending_len(),
         })
     }
 
@@ -607,111 +1165,325 @@ impl SerialEngine {
         })
     }
 
-    pub async fn reset_target(&mut self, wait_boot: bool) -> serde_json::Value {
-        if !self.relay.configured() {
-            return serde_json::json!({"success": false, "error": "No relay configured"});
+    /// Power cycle target via relay: OFF → wait (≥ power_off_ms) → ON.
+    pub async fn power_cycle_target(&mut self, wait_boot: bool) -> serde_json::Value {
+        if !self.relay.power_configured() {
+            return serde_json::json!({
+                "success": false,
+                "error": "Power channel not configured. Set power_ch in [dut.relay].",
+            });
         }
-        // 立即切状态, 不等 relay 完成
         self.state.transition(TargetState::Booting);
-        let ok = self.relay.reset().await;
-        if ok {
-            self.logs.flush_boot_log();
-            self.logs.mark_boot_start();
-            self.detector.reset_cycle();
-            if wait_boot {
-                let result = self.wait_pattern_internal("login:", 120.0).await;
+        self.logs.flush_boot_log();
+        self.logs.mark_boot_start();
+        self.detector.reset_cycle();
+
+        if !self.relay.power_cycle().await {
+            return serde_json::json!({"success": false, "error": "Power cycle failed"});
+        }
+
+        if !wait_boot {
+            return serde_json::json!({
+                "success": true,
+                "new_boot_number": self.logs.boot_number(),
+                "log_path": self.logs.current_path().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
+            });
+        }
+
+        // Wait for login prompt
+        let result = self.wait_pattern_internal_opts("login:", 120.0, true).await;
+        if result["matched"].as_bool().unwrap_or(false) {
+            return serde_json::json!({
+                "success": true,
+                "new_boot_number": self.logs.boot_number(),
+                "log_path": self.logs.current_path().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
+                "boot_complete": true,
+            });
+        }
+        serde_json::json!({
+            "success": false,
+            "error": "Boot did not complete within timeout",
+            "new_boot_number": self.logs.boot_number(),
+        })
+    }
+
+    pub async fn reset_target(
+        &mut self,
+        wait_boot: bool,
+        failure_retry: usize,
+        failure_retry_interval: f64,
+    ) -> serde_json::Value {
+        let mut backend = self.build_power_control();
+        if !backend.has_button(Button::Reset) {
+            return serde_json::json!({"success": false, "error": "No reset control configured"});
+        }
+        // Immediate state transition (don't wait for relay).
+        self.state.transition(TargetState::Booting);
+        if let Err(e) = backend.pulse(Button::Reset, 500).await {
+            return serde_json::json!({
+                "success": false,
+                "error": format!("reset control failed via {}: {e}", backend.name()),
+                "new_boot_number": self.logs.boot_number(),
+            });
+        }
+        self.logs.flush_boot_log();
+        self.logs.mark_boot_start();
+        self.detector.reset_cycle();
+
+        if !wait_boot {
+            return serde_json::json!({
+                "success": true,
+                "new_boot_number": self.logs.boot_number(),
+                "log_path": self.logs.current_path().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
+            });
+        }
+
+        // Wait for login: with force_prompt_wait (lava semantics). Retry the
+        // whole reset+wait up to `failure_retry` times on timeout.
+        let mut attempts = 0usize;
+        loop {
+            attempts += 1;
+            let result = self.wait_pattern_internal_opts("login:", 120.0, true).await;
+            if result["matched"].as_bool().unwrap_or(false) {
                 return serde_json::json!({
                     "success": true,
                     "new_boot_number": self.logs.boot_number(),
                     "log_path": self.logs.current_path().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
-                    "boot_complete": result["matched"],
+                    "boot_complete": true,
+                    "attempts": attempts,
                 });
             }
+            if attempts >= failure_retry {
+                return serde_json::json!({
+                    "success": true,
+                    "new_boot_number": self.logs.boot_number(),
+                    "log_path": self.logs.current_path().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
+                    "boot_complete": false,
+                    "attempts": attempts,
+                    "error": "login prompt not detected within timeout",
+                });
+            }
+            // Retry: re-assert relay reset and re-arm.
+            tracing::info!("reset_target retry {}/{}", attempts, failure_retry);
+            tokio::time::sleep(Duration::from_secs_f64(failure_retry_interval)).await;
+            self.state.transition(TargetState::Booting);
+            let mut backend = self.build_power_control();
+            if backend.pulse(Button::Reset, 500).await.is_ok() {
+                self.logs.flush_boot_log();
+                self.logs.mark_boot_start();
+                self.detector.reset_cycle();
+            }
         }
-        serde_json::json!({
-            "success": ok,
-            "new_boot_number": self.logs.boot_number(),
-            "log_path": self.logs.current_path().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
-        })
     }
 
-    /// 设置 enter_uboot 并返回 receiver (调用方 release lock 后 await)
-    pub fn queue_enter_uboot(&mut self) -> tokio::sync::mpsc::UnboundedReceiver<String> {
+    /// Set up the U-Boot prompt watcher and return a receiver (caller must
+    /// release the engine lock before awaiting).
+    pub fn queue_enter_uboot(
+        &mut self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<crate::boot_detector::WatcherMatch> {
         let pattern = r"=>|U-Boot[>#]".to_string();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         self.detector.add_watcher(&pattern, tx);
         rx
     }
 
-    /// 执行 relay reset + Ctrl-C flood (持有 lock, 快速完成)
-    pub async fn do_relay_reset_and_flood(&mut self) {
+    /// Set up a single-pattern wait and return a receiver (caller must
+    /// release the engine lock before awaiting). Kept for tools that need
+    /// the lock-released await pattern (e.g. `serial_enter_uboot`).
+    #[allow(dead_code)]
+    pub fn queue_wait_pattern(
+        &mut self,
+        pattern: &str,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<crate::boot_detector::WatcherMatch> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.detector.add_watcher(pattern, tx);
+        rx
+    }
+
+    /// Relay reset + initial Ctrl-C burst (holds the lock, ~1 second).
+    ///
+    /// Only does the relay reset + a short pre-burst. The long continuous
+    /// flood is done by `continuous_flood` which releases the lock between
+    /// bursts so the read loop can process U-Boot banners and trigger
+    /// watchers.
+    ///
+    /// The key insight for bootdelay=0: SPL/BL31/OP-TEE don't read the
+    /// serial port, so Ctrl-C chars just sit in the UART FIFO. When
+    /// U-Boot's `abortboot()` finally calls `tstc()`, even ONE pending
+    /// Ctrl-C is enough to interrupt. We send 1 byte per 100ms (not
+    /// 100-byte floods) to avoid overflowing the 16-byte UART FIFO.
+    pub async fn do_relay_reset_and_flood(&mut self) -> Result<(), String> {
         self.state.transition(TargetState::Booting);
-        if self.console.is_open() {
-            let flood: Vec<u8> = vec![0x03; 100];
-            self.console.write_raw(&flood).await;
+        let ch = self.interrupt_char;
+        let mut backend = self.build_power_control();
+        if !backend.has_button(Button::Reset) {
+            return Err("No reset control configured".into());
         }
-        self.relay.reset().await;
+
+        // Pre-reset burst: clear any pending input on the host side.
+        if self.console.is_open() {
+            let pre: Vec<u8> = vec![ch; 4];
+            self.console.write_raw(&pre).await;
+        }
+
+        // Reset via the configured backend — board begins rebooting.
+        backend
+            .pulse(Button::Reset, 500)
+            .await
+            .map_err(|e| format!("reset control failed via {}: {e}", backend.name()))?;
         self.logs.flush_boot_log();
         self.logs.mark_boot_start();
         self.detector.reset_cycle();
-        for _ in 0..8 {
+
+        // Short post-reset burst (the long flood is done separately).
+        for _ in 0..5 {
             if self.console.is_open() {
-                let flood: Vec<u8> = vec![0x03; 100];
-                self.console.write_raw(&flood).await;
+                self.console.write_raw(&[ch]).await;
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Ok(())
+    }
+
+    /// Send one Ctrl-C byte (called in a loop by the enter-uboot tool,
+    /// with the lock released between calls so the read loop can process
+    /// U-Boot banners and trigger watchers).
+    pub async fn flood_one(&mut self) {
+        if self.console.is_open() {
+            self.console.write_raw(&[self.interrupt_char]).await;
         }
     }
 
-    pub async fn enter_uboot(&mut self) -> serde_json::Value {
-        if !self.relay.configured() {
-            return serde_json::json!({"success": false, "error": "No relay configured"});
+    /// Force the target into Rockchip MASKROM mode via the relay sequence.
+    pub async fn enter_maskrom(&mut self) -> serde_json::Value {
+        let mut backend = self.build_power_control();
+        if !backend.has_button(Button::Reset) {
+            return serde_json::json!({"success": false, "error": "No reset control configured"});
         }
-        let mut rx = self.queue_enter_uboot();
-        self.do_relay_reset_and_flood().await;
-        // 释放锁后 await — 实际由 MCP handler 处理
-        let matched = tokio::time::timeout(Duration::from_secs(20), rx.recv()).await;
-        let pattern = r"=>|U-Boot[>#]";
-        self.detector.remove_watcher_by_pattern(pattern);
-        if let Ok(Some(_line)) = matched {
-            self.state.transition(TargetState::UBoot);
-            return serde_json::json!({"success": true, "state_after": "uboot"});
+        if !backend.has_button(Button::Maskrom) {
+            return serde_json::json!({"success": false, "error": "MASKROM control not configured"});
         }
-        serde_json::json!({"success": false, "state_after": self.state.current().as_str(), "error": "Timed out waiting for U-Boot prompt"})
-    }
-
-    pub async fn wait_pattern(&mut self, pattern: &str, timeout: f64) -> serde_json::Value {
-        let result = self.wait_pattern_internal(pattern, timeout).await;
+        let result = async {
+            backend.press(Button::Maskrom).await?;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            backend.pulse(Button::Reset, 500).await?;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            backend.release(Button::Maskrom).await
+        }
+        .await;
+        if let Err(e) = result {
+            let _ = backend.release(Button::Maskrom).await;
+            return serde_json::json!({
+                "success": false,
+                "error": format!("MASKROM control failed via {}: {e}", backend.name()),
+            });
+        }
+        self.state.transition(TargetState::Booting);
+        self.logs.flush_boot_log();
+        self.logs.mark_boot_start();
+        self.detector.reset_cycle();
         serde_json::json!({
-            "matched": result["matched"],
-            "matched_line": result["matched_line"],
-            "elapsed_seconds": 0,
+            "success": true,
+            "state_after": self.state.current().as_str(),
         })
     }
 
-    async fn wait_pattern_internal(&mut self, pattern: &str, timeout: f64) -> serde_json::Value {
+    /// Wait for a pattern (no probe-on-timeout). Convenience wrapper around
+    /// `wait_pattern_internal_opts` for callers that don't need the probe
+    /// behavior.
+    #[allow(dead_code)]
+    pub async fn wait_pattern_internal(
+        &mut self,
+        pattern: &str,
+        timeout: f64,
+    ) -> serde_json::Value {
+        self.wait_pattern_internal_opts(pattern, timeout, false)
+            .await
+    }
+
+    /// Wait for a pattern with optional `force_prompt_wait` semantics
+    /// (labgrid/lava: on timeout, send a newline to provoke a prompt and
+    /// retry up to `max_probes` times at `timeout/10` each).
+    ///
+    /// When `probe_on_timeout` is true and the wait times out, this sends
+    /// `"\n"` to the console and retries — useful for noisy consoles where
+    /// kernel logs overlap the prompt. Mirrors lava's `force_prompt_wait`
+    /// (shell.py:332) 6× `timeout/10` cadence.
+    pub async fn wait_pattern_internal_opts(
+        &mut self,
+        pattern: &str,
+        timeout: f64,
+        probe_on_timeout: bool,
+    ) -> serde_json::Value {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        self.detector.add_watcher(pattern, tx);
+        self.detector.add_watcher(pattern, tx.clone());
 
-        let result = tokio::time::timeout(Duration::from_secs_f64(timeout), rx.recv()).await;
+        let max_probes = if probe_on_timeout { 6usize } else { 0 };
+        let partial = if probe_on_timeout {
+            timeout / 10.0
+        } else {
+            timeout
+        };
+        let mut elapsed = 0.0f64;
+        let mut probes = 0usize;
 
-        self.detector.remove_watcher_by_pattern(pattern);
+        loop {
+            let remaining = (timeout - elapsed).max(0.0);
+            let wait = partial.min(remaining);
+            let result = tokio::time::timeout(Duration::from_secs_f64(wait), rx.recv()).await;
 
-        match result {
-            Ok(Some(line)) => serde_json::json!({
-                "matched": true,
-                "matched_line": line,
-            }),
-            _ => serde_json::json!({
-                "matched": false,
-                "matched_line": null,
-            }),
+            match result {
+                Ok(Some(m)) => {
+                    self.detector.remove_watcher_group(&tx);
+                    return serde_json::json!({
+                        "matched": true,
+                        "matched_line": m.line,
+                        "pattern_index": m.pattern_index,
+                    });
+                }
+                Ok(None) => {
+                    self.detector.remove_watcher_group(&tx);
+                    return serde_json::json!({
+                        "matched": false,
+                        "matched_line": null,
+                    });
+                }
+                Err(_) => {
+                    elapsed += wait;
+                    if elapsed >= timeout || probes >= max_probes {
+                        self.detector.remove_watcher_group(&tx);
+                        tracing::warn!(
+                            "Pattern '{}' not detected within {:.0}s. Target state: {:?}. Check serial_get_state.",
+                            pattern,
+                            timeout,
+                            self.state.current()
+                        );
+                        return serde_json::json!({
+                            "matched": false,
+                            "matched_line": null,
+                            "probes_sent": probes,
+                        });
+                    }
+                    // Provoke a fresh prompt (lava force_prompt_wait).
+                    if self.console.is_open() {
+                        tracing::info!(
+                            "wait_pattern timeout {:.1}s, probing with newline (attempt {}/{})",
+                            elapsed,
+                            probes + 1,
+                            max_probes
+                        );
+                        self.console.sendline("");
+                        self.console.drain_writes().await;
+                    }
+                    probes += 1;
+                }
+            }
         }
     }
 
     pub fn rotate_log(&mut self) -> serde_json::Value {
         self.logs.flush_boot_log();
-            self.logs.mark_boot_start();
+        self.logs.mark_boot_start();
         self.detector.reset_cycle();
         serde_json::json!({
             "success": true,
@@ -757,6 +1529,84 @@ impl SerialEngine {
         }
     }
 
+    /// Get unclassified lines collected by StageLearner (for Agent auto-learning).
+    pub fn get_unclassified(&mut self) -> serde_json::Value {
+        // Drain in-memory buffer first, then also read from file
+        let mut all_lines: Vec<String> = self.detector.unclassified_lines.drain(..).collect();
+        let file_lines = self.logs.read_unclassified();
+        all_lines.extend(file_lines);
+        let count = all_lines.len();
+        let log_path =
+            self.config.dut_dir().trim_end_matches('/').to_string() + "/unclassified.log";
+        if count == 0 {
+            return serde_json::json!({"lines": [], "count": 0, "log_path": log_path, "message": "No unclassified lines. StageLearner is matching all boot output, or no reference log is loaded."});
+        }
+        serde_json::json!({
+            "lines": all_lines,
+            "count": count,
+            "log_path": log_path,
+        })
+    }
+
+    /// Append key anchor lines to reference boot log and hot-reload StageLearner.
+    pub fn append_reference(&mut self, lines: &str) -> serde_json::Value {
+        let ref_path_str = self.config.reference_log();
+        if ref_path_str.is_empty() {
+            return serde_json::json!({"success": false, "error": "No reference_log configured. Add `reference_log` to .target.toml."});
+        }
+        let ref_path = std::path::PathBuf::from(&ref_path_str);
+        // Ensure parent dir exists
+        if let Some(parent) = ref_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        // Append lines to reference log
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&ref_path)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                for line in lines.lines() {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        writeln!(file, "{trimmed}").ok();
+                    }
+                }
+            }
+            Err(e) => {
+                return serde_json::json!({"success": false, "error": format!("Cannot open reference log: {e}")});
+            }
+        }
+        // Hot-reload StageLearner
+        let st = self.config.learner_stage_threshold();
+        let ct = self.config.learner_crash_threshold();
+        match self.detector.load_reference(&ref_path, st, ct) {
+            Ok(()) => {
+                let fp_count = self
+                    .detector
+                    .learner
+                    .as_ref()
+                    .map(|l| l.fingerprints.len())
+                    .unwrap_or(0);
+                serde_json::json!({
+                    "success": true,
+                    "message": format!("Appended lines, reloaded reference log ({fp_count} fingerprints)"),
+                    "fingerprints": fp_count,
+                    "reference_log_path": ref_path_str,
+                })
+            }
+            Err(e) => {
+                // Append succeeded but reload failed — still report partial success
+                serde_json::json!({
+                    "success": true,
+                    "warning": format!("Lines appended but reload failed: {e}"),
+                    "reference_log_path": ref_path_str,
+                })
+            }
+        }
+    }
+
     pub fn get_config(&self) -> serde_json::Value {
         let mut map = serde_json::Map::new();
         for (k, v) in &self.config.values {
@@ -764,12 +1614,666 @@ impl SerialEngine {
         }
         serde_json::Value::Object(map)
     }
+
+    // ── Connection Learning ──────────────────────────────────────────────
+
+    /// Run the hardware reset connection learning process.
+    ///
+    /// Requires relay configured. Executes 3 reset→capture cycles, compares
+    /// first 50 lines similarity. If ≥93%, generates reference_log.
+    /// If <10%, relay is marked broken.
+    pub async fn learn_connection_hardware(&mut self) -> serde_json::Value {
+        let mut power_ctrl = self.build_power_control();
+        if !power_ctrl.has_button(Button::Reset) {
+            return serde_json::json!({
+                "success": false,
+                "error": "No reset control configured. Cannot perform hardware reset learning.",
+                "hint": "Configure reset channel or dev_ctl in .target.toml, or use software reboot learning."
+            });
+        }
+
+        let dut_dir = self.config.dut_dir();
+        let learn_dir = std::path::PathBuf::from(&dut_dir).join("learn");
+        let ref_log = self.config.reference_log();
+        let reference_log_path = if ref_log.is_empty() {
+            std::path::PathBuf::from(&dut_dir).join("reference-boot.log")
+        } else {
+            std::path::PathBuf::from(&ref_log)
+        };
+
+        let mut learn_cfg = LearnConfig::default();
+        learn_cfg.learn_dir = learn_dir;
+        learn_cfg.reference_log = reference_log_path;
+
+        let learner = ConnectionLearner::new(learn_cfg);
+
+        // Verify relay (non-fatal — relay may work even if verify fails)
+        if let Err(e) = power_ctrl.verify().await {
+            tracing::warn!("Relay verify failed: {e} — continuing anyway");
+        }
+
+        let result = self.run_hardware_learning(&learner).await;
+        Self::format_learn_result(&result)
+    }
+
+    /// Run the software reboot connection learning process (fallback).
+    ///
+    /// Two modes:
+    /// 1. No relay, no existing reference_log → 3 reboots, compare against each other
+    /// 2. No relay, HAS existing reference_log → 3 reboots, compare each against existing ref
+    pub async fn learn_connection_software(&mut self) -> serde_json::Value {
+        let dut_dir = self.config.dut_dir();
+        let learn_dir = std::path::PathBuf::from(&dut_dir).join("learn");
+        let ref_log = self.config.reference_log();
+        let reference_log_path = if ref_log.is_empty() {
+            std::path::PathBuf::from(&dut_dir).join("reference-boot.log")
+        } else {
+            std::path::PathBuf::from(&ref_log)
+        };
+
+        // Check if an existing reference log exists for comparison
+        let existing_ref = if reference_log_path.exists() {
+            std::fs::read_to_string(&reference_log_path).ok()
+        } else {
+            None
+        };
+
+        let mut learn_cfg = LearnConfig::default();
+        learn_cfg.learn_dir = learn_dir;
+        learn_cfg.reference_log = reference_log_path;
+
+        let learner = ConnectionLearner::new(learn_cfg);
+
+        let result = if existing_ref.is_some() {
+            // Mode 2: compare each reboot cycle against existing reference log
+            self.run_software_learning_with_ref(&learner, &existing_ref.unwrap())
+                .await
+        } else {
+            // Mode 1: compare reboot cycles against each other
+            self.run_software_learning(&learner).await
+        };
+        Self::format_learn_result(&result)
+    }
+
+    /// Verify the CH340 relay control: send ON, read back, send OFF, read back.
+    pub async fn verify_relay(&mut self) -> serde_json::Value {
+        let mut power_ctrl = self.build_power_control();
+        if !power_ctrl.has_button(Button::Reset)
+            && !power_ctrl.has_button(Button::Maskrom)
+            && !power_ctrl.has_button(Button::Recovery)
+        {
+            return serde_json::json!({
+                "success": false,
+                "error": "No power control configured",
+                "relay_configured": false,
+            });
+        }
+
+        match power_ctrl.verify().await {
+            Ok(true) => serde_json::json!({
+                "success": true,
+                "verified": true,
+                "message": "Relay control verified — commands sent and read-back matched.",
+                "backend": power_ctrl.name(),
+            }),
+            Ok(false) => serde_json::json!({
+                "success": true,
+                "verified": false,
+                "message": "Relay responded but read-back verification is not supported by this backend.",
+                "backend": power_ctrl.name(),
+            }),
+            Err(e) => serde_json::json!({
+                "success": false,
+                "verified": false,
+                "error": format!("{e}"),
+                "backend": power_ctrl.name(),
+            }),
+        }
+    }
+
+    /// Control a button (press/release/pulse) via the power control abstraction.
+    pub async fn control_button(
+        &mut self,
+        button: &str,
+        action: &str,
+        delay_ms: Option<u64>,
+    ) -> serde_json::Value {
+        let btn = match button {
+            "reset" => Button::Reset,
+            "maskrom" => Button::Maskrom,
+            "recovery" => Button::Recovery,
+            _ => {
+                return serde_json::json!({
+                    "success": false,
+                    "error": format!("Unknown button: {button}. Valid: reset, maskrom, recovery")
+                });
+            }
+        };
+
+        let mut backend = self.build_power_control();
+        if !backend.has_button(btn) {
+            return serde_json::json!({
+                "success": false,
+                "error": format!("Button '{button}' not configured. Add relay channel in .target.toml or configure dev_ctl."),
+                "button": button,
+            });
+        }
+
+        match action {
+            "press" => match backend.press(btn).await {
+                Ok(()) => {
+                    serde_json::json!({"success": true, "button": button, "action": "press", "backend": backend.name()})
+                }
+                Err(e) => serde_json::json!({"success": false, "error": format!("{e}")}),
+            },
+            "release" => match backend.release(btn).await {
+                Ok(()) => {
+                    serde_json::json!({"success": true, "button": button, "action": "release", "backend": backend.name()})
+                }
+                Err(e) => serde_json::json!({"success": false, "error": format!("{e}")}),
+            },
+            "pulse" => {
+                let ms = delay_ms.unwrap_or(500);
+                match backend.pulse(btn, ms).await {
+                    Ok(()) => {
+                        serde_json::json!({"success": true, "button": button, "action": "pulse", "delay_ms": ms, "backend": backend.name()})
+                    }
+                    Err(e) => serde_json::json!({"success": false, "error": format!("{e}")}),
+                }
+            }
+            _ => serde_json::json!({
+                "success": false,
+                "error": format!("Unknown action: {action}. Valid: press, release, pulse")
+            }),
+        }
+    }
+
+    // ── Internal learning helpers ───────────────────────────────────────
+
+    /// Build a power control backend from the current config.
+    ///
+    /// If `dev_ctl` is configured in `.target.toml`, uses the external control
+    /// program. Otherwise uses the CH340 relay backend.
+    fn build_power_control(&self) -> crate::power_control::PowerControlBackend {
+        let dev_ctl = self.config.dev_ctl();
+        let channels = crate::power_control::ButtonChannels {
+            reset: self.relay.reset_ch(),
+            maskrom: self.relay.maskrom_ch(),
+            recovery: self.relay.recovery_ch(),
+            power: self.relay.power_ch(),
+        };
+        if !dev_ctl.is_empty() {
+            let dut_alias = self.config.get_str_or("DUT_ALIAS", "default");
+            crate::power_control::PowerControlBackend::External(
+                crate::power_control::ExternalControl::new(dev_ctl, dut_alias, channels),
+            )
+        } else {
+            crate::power_control::PowerControlBackend::Ch340(
+                crate::power_control::Ch340RelayControl::new(
+                    self.relay_host.clone(),
+                    self.relay.port(),
+                    channels,
+                ),
+            )
+        }
+    }
+
+    /// Send raw bytes to the serial port — no markers, no command wrapping.
+    /// Data goes to write channel; drained by read loop on next iteration.
+    pub fn send_raw(&mut self, data: &str) -> serde_json::Value {
+        let bytes = data.as_bytes().to_vec();
+        let len = bytes.len();
+        let _ = self.console.write_sender().try_send(bytes);
+        serde_json::json!({"success": true, "bytes_sent": len})
+    }
+
+    /// Get a cloned write sender for WebSocket relay (no mutex needed).
+    pub fn get_write_sender(&self) -> tokio::sync::mpsc::Sender<Vec<u8>> {
+        self.console.write_sender()
+    }
+
+    /// Set WebSocket broadcast channel for dutabo serial relay.
+    /// Transitions state to Dutabo so the statusline reflects "in use".
+    pub fn set_ws_tx(&mut self, tx: tokio::sync::broadcast::Sender<Vec<u8>>) {
+        self.ws_tx = Some(tx);
+        // WS-based dutabo — show "in use" on statusline without closing serial.
+        // The read_loop_iter skips sentinel/reconnect logic when ws_tx is set.
+        self.state
+            .transition(crate::state_manager::TargetState::Dutabo);
+    }
+
+    /// Clear WebSocket broadcast channel and restore to Active.
+    pub fn clear_ws_tx(&mut self) {
+        self.ws_tx = None;
+        // WS session ended — probe and restore active state.
+        self.state
+            .transition(crate::state_manager::TargetState::Active);
+    }
+
+    /// Pause the serial engine — stops read loop, watchdog, and data sending.
+    pub fn pause(&mut self) -> serde_json::Value {
+        self.paused = true;
+        self.console.close(); // Release TCP so nc can connect
+        self.state
+            .transition(crate::state_manager::TargetState::Dutabo);
+        serde_json::json!({"success": true, "paused": true, "state": "dutabo", "message": "Serial released for dutabo."})
+    }
+
+    /// Resume the serial engine after pause.
+    pub fn resume(&mut self) -> serde_json::Value {
+        self.paused = false;
+        // Keep dutabo state until reconnect succeeds (avoids disconnected flash)
+        // read_loop_iter will handle the actual reconnection
+        serde_json::json!({"success": true, "paused": false, "message": "Serial engine resuming."})
+    }
+
+    /// Run hardware reset learning cycles inline (holds engine lock).
+    async fn run_hardware_learning(&mut self, learner: &ConnectionLearner) -> LearnResult {
+        let cfg = learner.config();
+        let num_cycles = cfg.cycles;
+        let mut cycles = Vec::with_capacity(num_cycles);
+        let learn_dir = &cfg.learn_dir;
+        std::fs::create_dir_all(learn_dir).ok();
+
+        for i in 0..num_cycles {
+            let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+            let log_path = learn_dir.join(format!("learn-{ts}-{}.log", i + 1));
+
+            // Phase 1: reset via the configured power-control backend.
+            self.state.transition(TargetState::Booting);
+            self.logs.flush_boot_log();
+            self.logs.mark_boot_start();
+            self.detector.reset_cycle();
+            let mut backend = self.build_power_control();
+            if !backend.has_button(Button::Reset) {
+                return LearnResult {
+                    connected: false,
+                    cycles,
+                    best_similarity: 0.0,
+                    reference_log: None,
+                    method: LearnMethod::HardwareReset,
+                    relay_verified: false,
+                    error: Some("Reset button/control not configured".into()),
+                };
+            }
+            if let Err(e) = backend.pulse(Button::Reset, cfg.reset_pulse_ms).await {
+                return LearnResult {
+                    connected: false,
+                    cycles,
+                    best_similarity: 0.0,
+                    reference_log: None,
+                    method: LearnMethod::HardwareReset,
+                    relay_verified: false,
+                    error: Some(format!("Reset control failed via {}: {e}", backend.name())),
+                };
+            }
+
+            // Phase 2: wait briefly for boot start, then capture.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let captured = self
+                .capture_boot_output(learner.config().capture_timeout_secs)
+                .await;
+
+            // Write learn log
+            std::fs::write(&log_path, &captured).ok();
+
+            let full_content = String::from_utf8_lossy(&captured).to_string();
+            let first_50 = ConnectionLearner::extract_first_n_lines(
+                &full_content,
+                learner.config().compare_lines,
+            );
+            let normalized = ConnectionLearner::normalize(&first_50);
+
+            cycles.push(crate::connection_learner::LearnCycle {
+                log_path,
+                first_50: normalized,
+                full_content,
+                method: LearnMethod::HardwareReset,
+            });
+
+            tracing::info!(
+                "Hardware learn cycle {}/{}: {} bytes captured",
+                i + 1,
+                3,
+                captured.len()
+            );
+        }
+
+        learner.evaluate(cycles, LearnMethod::HardwareReset)
+    }
+
+    /// Run software reboot learning cycles inline.
+    async fn run_software_learning(&mut self, learner: &ConnectionLearner) -> LearnResult {
+        let cfg = learner.config();
+        let num_cycles = cfg.cycles;
+        let mut cycles = Vec::with_capacity(num_cycles);
+        let learn_dir = &cfg.learn_dir;
+        std::fs::create_dir_all(learn_dir).ok();
+
+        for i in 0..num_cycles {
+            let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+            let log_path = learn_dir.join(format!("learn-{ts}-{}.log", i + 1));
+
+            // Phase 1: send reboot
+            self.state.transition(TargetState::Booting);
+            self.console.sendline("reboot");
+            self.console.drain_writes().await;
+            self.logs.flush_boot_log();
+            self.logs.mark_boot_start();
+            self.detector.reset_cycle();
+
+            // Phase 2: wait for boot to settle then capture
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let captured = self
+                .capture_boot_output(learner.config().capture_timeout_secs)
+                .await;
+
+            // Prepend "reboot" marker
+            let mut full_data = b"reboot\n".to_vec();
+            full_data.extend_from_slice(&captured);
+
+            std::fs::write(&log_path, &full_data).ok();
+
+            let full_content = String::from_utf8_lossy(&full_data).to_string();
+            let first_50 = ConnectionLearner::extract_first_n_lines(
+                &full_content,
+                learner.config().compare_lines,
+            );
+            let normalized = ConnectionLearner::normalize(&first_50);
+
+            cycles.push(crate::connection_learner::LearnCycle {
+                log_path,
+                first_50: normalized,
+                full_content,
+                method: LearnMethod::SoftwareReboot,
+            });
+
+            tracing::info!(
+                "Software learn cycle {}/{}: {} bytes captured",
+                i + 1,
+                3,
+                captured.len()
+            );
+        }
+
+        learner.evaluate(cycles, LearnMethod::SoftwareReboot)
+    }
+
+    /// Run software reboot learning comparing each cycle against an existing reference log.
+    async fn run_software_learning_with_ref(
+        &mut self,
+        learner: &ConnectionLearner,
+        reference_text: &str,
+    ) -> LearnResult {
+        let cfg = learner.config();
+        let num_cycles = cfg.cycles;
+        let mut cycles = Vec::with_capacity(num_cycles);
+        let learn_dir = &cfg.learn_dir;
+        std::fs::create_dir_all(learn_dir).ok();
+
+        let ref_normalized = ConnectionLearner::normalize(
+            &ConnectionLearner::extract_first_n_lines(reference_text, cfg.compare_lines),
+        );
+
+        for i in 0..num_cycles {
+            let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+            let log_path = learn_dir.join(format!("learn-{ts}-{}.log", i + 1));
+
+            // Send reboot
+            self.state.transition(TargetState::Booting);
+            self.console.sendline("reboot");
+            self.console.drain_writes().await;
+            self.logs.flush_boot_log();
+            self.logs.mark_boot_start();
+            self.detector.reset_cycle();
+
+            // Wait for boot then capture
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let captured = self.capture_boot_output(cfg.capture_timeout_secs).await;
+
+            let mut full_data = b"reboot\n".to_vec();
+            full_data.extend_from_slice(&captured);
+            std::fs::write(&log_path, &full_data).ok();
+
+            let full_content = String::from_utf8_lossy(&full_data).to_string();
+            let first_50 =
+                ConnectionLearner::extract_first_n_lines(&full_content, cfg.compare_lines);
+            let normalized = ConnectionLearner::normalize(&first_50);
+
+            cycles.push(crate::connection_learner::LearnCycle {
+                log_path,
+                first_50: normalized,
+                full_content,
+                method: LearnMethod::SoftwareReboot,
+            });
+
+            tracing::info!(
+                "Software+ref learn cycle {}/{}: {} bytes captured",
+                i + 1,
+                num_cycles,
+                captured.len()
+            );
+        }
+
+        // Evaluate: compute similarity of each cycle against the reference
+        let min_similarity = cycles
+            .iter()
+            .map(|c| crate::connection_learner::compute_similarity(&c.first_50, &ref_normalized))
+            .fold(1.0f64, f64::min);
+
+        let connected = min_similarity >= cfg.similarity_threshold;
+        let reference_log = if connected {
+            // Don't overwrite existing reference — it's our ground truth
+            Some(cfg.reference_log.clone())
+        } else {
+            None
+        };
+
+        LearnResult {
+            connected,
+            cycles,
+            best_similarity: min_similarity,
+            reference_log,
+            method: LearnMethod::SoftwareReboot,
+            relay_verified: false,
+            error: if !connected {
+                Some(format!(
+                    "Similarity {:.1}% below threshold {:.1}% against existing reference",
+                    min_similarity * 100.0,
+                    cfg.similarity_threshold * 100.0
+                ))
+            } else {
+                None
+            },
+        }
+    }
+
+    /// Capture serial output until silence or max timeout.
+    /// Returns all bytes read during the capture window.
+    async fn capture_boot_output(&mut self, timeout_secs: f64) -> Vec<u8> {
+        let mut captured = Vec::new();
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs_f64(timeout_secs);
+        let silence_timeout = std::time::Duration::from_secs(5); // 5s silence = boot done
+
+        let mut last_data = tokio::time::Instant::now();
+
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+
+            let read_timeout = remaining.min(std::time::Duration::from_millis(500));
+            match self.console.read_available(read_timeout, 4096).await {
+                Ok(data) if !data.is_empty() => {
+                    last_data = tokio::time::Instant::now();
+                    let clean = crate::serial_engine::strip_ser2net_banner(&data);
+                    if !clean.is_empty() {
+                        self.logs.write(&clean);
+                    }
+                    self.state.on_activity();
+                    let events = self.detector.feed(&clean);
+                    self.handle_boot_events(events).await;
+                    captured.extend_from_slice(&data);
+                }
+                Ok(_) => {
+                    // No data — check silence timeout
+                    if last_data.elapsed() > silence_timeout {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        captured
+    }
+
+    /// Format LearnResult into JSON.
+    fn format_learn_result(result: &LearnResult) -> serde_json::Value {
+        let cycles_json: Vec<serde_json::Value> = result
+            .cycles
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "log_path": c.log_path.to_string_lossy(),
+                    "method": match c.method {
+                        LearnMethod::HardwareReset => "hardware_reset",
+                        LearnMethod::SoftwareReboot => "software_reboot",
+                    },
+                    "size_bytes": c.full_content.len(),
+                })
+            })
+            .collect();
+
+        let method_str = match result.method {
+            LearnMethod::HardwareReset => "hardware_reset",
+            LearnMethod::SoftwareReboot => "software_reboot",
+        };
+
+        let mut resp = serde_json::json!({
+            "success": result.connected,
+            "connected": result.connected,
+            "method": method_str,
+            "best_similarity": format!("{:.1}%", result.best_similarity * 100.0),
+            "similarity_threshold": "93.0%",
+            "cycles": cycles_json,
+            "relay_verified": result.relay_verified,
+        });
+
+        if let Some(ref path) = result.reference_log {
+            resp["reference_log"] = serde_json::Value::String(path.to_string_lossy().to_string());
+        }
+        if let Some(ref err) = result.error {
+            resp["error"] = serde_json::Value::String(err.clone());
+        }
+
+        resp
+    }
+}
+
+/// Wait for a watcher pattern with optional force_prompt_wait (lava semantics).
+///
+/// This is a **free function** — no engine lock is held during the `.await`.
+/// The caller owns the watcher lifecycle (add watcher before calling, remove after).
+/// On timeout with `probe_on_timeout=true`, sends `"\n"` via `console_tx`
+/// to provoke a fresh prompt, retrying up to 6 times at `timeout/10` each.
+/// Mirrors lava's `force_prompt_wait` (shell.py:332).
+pub async fn wait_pattern_with_probe(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::boot_detector::WatcherMatch>,
+    timeout: f64,
+    probe_on_timeout: bool,
+    console_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+) -> serde_json::Value {
+    let max_probes = if probe_on_timeout { 6usize } else { 0 };
+    let partial = if probe_on_timeout {
+        timeout / 10.0
+    } else {
+        timeout
+    };
+    let mut elapsed = 0.0f64;
+    let mut probes = 0usize;
+
+    loop {
+        let remaining = (timeout - elapsed).max(0.0);
+        let wait = partial.min(remaining);
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs_f64(wait), rx.recv()).await;
+
+        match result {
+            Ok(Some(m)) => {
+                return serde_json::json!({
+                    "matched": true,
+                    "matched_line": m.line,
+                    "pattern_index": m.pattern_index,
+                });
+            }
+            Ok(None) => {
+                return serde_json::json!({
+                    "matched": false,
+                    "matched_line": null,
+                });
+            }
+            Err(_) => {
+                elapsed += wait;
+                if elapsed >= timeout || probes >= max_probes {
+                    return serde_json::json!({
+                        "matched": false,
+                        "matched_line": null,
+                        "probes_sent": probes,
+                    });
+                }
+                // Provoke a fresh prompt (lava force_prompt_wait).
+                probes += 1;
+                tracing::info!(
+                    "wait_pattern timeout {:.1}s, probing with newline (attempt {}/{})",
+                    elapsed,
+                    probes,
+                    max_probes
+                );
+                let _ = console_tx.try_send(b"\n".to_vec());
+            }
+        }
+    }
 }
 
 /// 过滤 ser2net 连接 banner
+///
+/// Handles cross-chunk splits: if a ser2net banner line is split across two
+/// read() boundaries, a partial-line buffer stores the trailing incomplete
+/// line and prepends it to the next call, so the full line is filtered.
 fn strip_ser2net_banner(data: &[u8]) -> Vec<u8> {
-    let text = String::from_utf8_lossy(data);
-    text.lines()
+    use std::sync::LazyLock;
+    use std::sync::Mutex;
+    static PARTIAL: LazyLock<Mutex<Vec<u8>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+    let mut partial = PARTIAL.lock().unwrap();
+
+    // Prepend any buffered partial line from the previous chunk.
+    let combined = if partial.is_empty() {
+        data.to_vec()
+    } else {
+        let mut c = std::mem::take(&mut *partial);
+        c.extend_from_slice(data);
+        c
+    };
+
+    let text = String::from_utf8_lossy(&combined);
+    let mut lines: Vec<&str> = text.lines().collect();
+
+    // If the last byte of the input is NOT '\n', the last line is incomplete.
+    // Save it for the next call so it can be joined with the continuation.
+    if !combined.is_empty() && combined.last() != Some(&b'\n') {
+        if let Some(last) = lines.pop() {
+            partial.extend_from_slice(last.as_bytes());
+        }
+    } else {
+        partial.clear();
+    }
+
+    lines
+        .into_iter()
         .filter(|l| !l.contains("ser2net port"))
         .collect::<Vec<_>>()
         .join("\n")
@@ -779,9 +2283,8 @@ fn strip_ser2net_banner(data: &[u8]) -> Vec<u8> {
 /// 去除 Android kernel log 前缀 `[ 1234.567890][  T123]`
 fn strip_android_klog(data: &[u8]) -> Vec<u8> {
     use std::sync::LazyLock;
-    static RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
-        regex::bytes::Regex::new(r"(?m)^\[\s*\d+\.\d+\]\[\s*T\d+\]\s*").unwrap()
-    });
+    static RE: LazyLock<regex::bytes::Regex> =
+        LazyLock::new(|| regex::bytes::Regex::new(r"(?m)^\[\s*\d+\.\d+\]\[\s*T\d+\]\s*").unwrap());
     RE.replace_all(data, b"" as &[u8]).into_owned()
 }
 
@@ -795,30 +2298,32 @@ pub fn new_shared_engine(config: Config) -> SharedEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ConfigFormat;
     use std::collections::HashMap;
     use tempfile::TempDir;
 
     fn create_test_config(project_dir: &std::path::Path) -> Config {
         let mut values = HashMap::new();
-        values.insert("RK_DEV_HOST_IP".into(), "127.0.0.1".into());
-        values.insert("RK_SERIAL_PORT".into(), "59999".into()); // unused port
-        values.insert("RK_RELAY_PORT".into(), "0".into());
-        values.insert("RK_RESET_CHANNEL".into(), "0".into());
-        values.insert("RK_MASKROM_CHANNEL".into(), "0".into());
-        values.insert("RK_HANG_TIMEOUT".into(), "60".into());
-        values.insert("RK_HANG_HYSTERESIS".into(), "3".into());
-        values.insert("RK_MAX_ARCHIVED_LOGS".into(), "10".into());
-        values.insert("RK_MAX_LOG_FILE_SIZE".into(), "100".into());
-        values.insert("RK_DUT_DIR".into(), ".dut-serial".into());
-        values.insert("RK_LOCK_DIR".into(), "/tmp/embedded-debug-test-locks".into());
-        values.insert("RK_LOGIN_USER".into(), "root".into());
-        values.insert("RK_LOGIN_PASS".into(), "".into());
-        values.insert("RK_UBOOT_INTERRUPT_STRATEGY".into(), "lava".into());
+        values.insert("DEV_HOST_IP".into(), "127.0.0.1".into());
+        values.insert("SERIAL_PORT".into(), "59999".into()); // unused port
+        values.insert("RELAY_PORT".into(), "0".into());
+        values.insert("RESET_CHANNEL".into(), "0".into());
+        values.insert("MASKROM_CHANNEL".into(), "0".into());
+        values.insert("HANG_TIMEOUT".into(), "60".into());
+        values.insert("HANG_HYSTERESIS".into(), "3".into());
+        values.insert("MAX_ARCHIVED_LOGS".into(), "10".into());
+        values.insert("MAX_LOG_FILE_SIZE".into(), "100".into());
+        values.insert("DUT_DIR".into(), ".dut-serial".into());
+        values.insert("LOCK_DIR".into(), "/tmp/embedded-debug-test-locks".into());
+        values.insert("LOGIN_USER".into(), "root".into());
+        values.insert("LOGIN_PASS".into(), "".into());
+        values.insert("UBOOT_INTERRUPT_STRATEGY".into(), "lava".into());
 
         Config {
             values,
             config_path: None,
             project_dir: Some(project_dir.to_path_buf()),
+            format: crate::config::ConfigFormat::None,
         }
     }
 
@@ -830,7 +2335,6 @@ mod tests {
 
         assert!(!engine.console.is_open());
         assert_eq!(engine.login_user, "root");
-        assert_eq!(engine.interrupt_strategy, "lava");
     }
 
     #[tokio::test]
@@ -900,8 +2404,8 @@ mod tests {
         let engine = SerialEngine::new(config);
 
         let cfg = engine.get_config();
-        assert_eq!(cfg["RK_DEV_HOST_IP"], "127.0.0.1");
-        assert_eq!(cfg["RK_SERIAL_PORT"], "59999");
+        assert_eq!(cfg["DEV_HOST_IP"], "127.0.0.1");
+        assert_eq!(cfg["SERIAL_PORT"], "59999");
     }
 
     #[tokio::test]
@@ -913,6 +2417,7 @@ mod tests {
         engine.logs.open_current();
         engine.logs.write(b"test line 1\n");
         engine.logs.write(b"test line 2\n");
+        engine.logs.flush_sync();
 
         let result = engine.read_log(0, 10, None);
         // Note: open_current writes a header line, so total_lines = 3 (header + 2 data lines)
@@ -929,6 +2434,7 @@ mod tests {
         engine.logs.open_current();
         engine.logs.write(b"line 1\n");
         engine.logs.write(b"line 2\n");
+        engine.logs.flush_sync();
 
         // First poll should get all lines (including header)
         let result1 = engine.poll_logs();
@@ -939,6 +2445,7 @@ mod tests {
 
         // Write more data
         engine.logs.write(b"line 3\n");
+        engine.logs.flush_sync();
 
         // Second poll should get only new lines
         let result2 = engine.poll_logs();
@@ -953,20 +2460,46 @@ mod tests {
         let config = create_test_config(tmp.path());
         let mut engine = SerialEngine::new(config);
 
-        let result = engine.reset_target(false).await;
+        let result = engine.reset_target(false, 1, 1.0).await;
         assert_eq!(result["success"], false);
-        assert_eq!(result["error"], "No relay configured");
+        assert_eq!(result["error"], "No reset control configured");
     }
 
     #[tokio::test]
-    async fn test_enter_uboot_no_relay() {
+    async fn test_enter_maskrom_no_relay() {
         let tmp = TempDir::new().unwrap();
         let config = create_test_config(tmp.path());
         let mut engine = SerialEngine::new(config);
 
-        let result = engine.enter_uboot().await;
+        let result = engine.enter_maskrom().await;
         assert_eq!(result["success"], false);
-        assert_eq!(result["error"], "No relay configured");
+        assert_eq!(result["error"], "No reset control configured");
+    }
+
+    #[tokio::test]
+    async fn test_enter_maskrom_no_maskrom_channel() {
+        let tmp = TempDir::new().unwrap();
+        // Configure relay but with MASKROM_CHANNEL=0
+        let mut values = HashMap::new();
+        values.insert("DEV_HOST_IP".into(), "127.0.0.1".into());
+        values.insert("SERIAL_PORT".into(), "59999".into());
+        values.insert("RELAY_PORT".into(), "2001".into());
+        values.insert("RESET_CHANNEL".into(), "2".into());
+        values.insert("MASKROM_CHANNEL".into(), "0".into());
+        values.insert("DUT_DIR".into(), ".dut-serial".into());
+        values.insert("LOCK_DIR".into(), "/tmp/embedded-debug-test-locks".into());
+        values.insert("LOGIN_USER".into(), "root".into());
+        let config = Config {
+            values,
+            config_path: None,
+            project_dir: Some(tmp.path().to_path_buf()),
+            format: crate::config::ConfigFormat::None,
+        };
+        let mut engine = SerialEngine::new(config);
+
+        let result = engine.enter_maskrom().await;
+        assert_eq!(result["success"], false);
+        assert_eq!(result["error"], "MASKROM control not configured");
     }
 
     #[tokio::test]
@@ -1000,38 +2533,373 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_once_not_running() {
+    async fn test_read_loop_iter_not_running() {
         let tmp = TempDir::new().unwrap();
         let config = create_test_config(tmp.path());
         let mut engine = SerialEngine::new(config);
 
         // Should return immediately when not running
-        engine.read_once().await;
+        engine.read_loop_iter().await;
     }
 
-    /// Smoke test: reboot and reset must return in <3s
     #[tokio::test]
-    async fn test_reboot_performance_within_3s() {
+    async fn test_read_loop_keeps_dutabo_takeover_while_sentinel_exists() {
+        let tmp = TempDir::new().unwrap();
+        let config = create_test_config(tmp.path());
+        let sentinel_dir = tmp.path().join(".dut-serial");
+        std::fs::create_dir_all(&sentinel_dir).unwrap();
+        std::fs::write(sentinel_dir.join(".dutabo-active"), b"active").unwrap();
+
+        let mut engine = SerialEngine::new(config);
+        engine.running = true;
+        engine.pause();
+        engine.resume();
+
+        assert_eq!(engine.state.current(), TargetState::Dutabo);
+        assert!(!engine.console.is_open());
+
+        engine.read_loop_iter().await;
+
+        assert_eq!(engine.state.current(), TargetState::Dutabo);
+        assert!(!engine.console.is_open());
+        assert!(engine.reconnect_after.is_none());
+        assert!(engine.last_fast_retry.is_none());
+    }
+
+    /// Smoke test: queue_command returns a valid receiver and check_timeouts resolves it
+    #[tokio::test]
+    async fn test_queue_command_returns_receiver() {
         let tmp = TempDir::new().unwrap();
         let config = create_test_config(tmp.path());
         let mut engine = SerialEngine::new(config);
 
-        // Test soft reboot fast-path
-        let start = std::time::Instant::now();
-        let result = engine.send_command("reboot", 5.0).await;
-        let elapsed = start.elapsed().as_millis();
-        assert!(elapsed < 3000, "reboot took {}ms, expected <3000ms", elapsed);
-        assert_eq!(result["output"], "reboot sent");
-        assert_eq!(result["timed_out"], false);
+        // Set up a write_fn so commands can be sent
+        let write_tx = engine.console.write_sender();
+        engine.commands.set_write_fn(Box::new(move |data| {
+            write_tx.try_send(data.to_vec()).ok();
+        }));
 
-        // Test poweroff fast-path
-        let start = std::time::Instant::now();
-        let result = engine.send_command("poweroff", 5.0).await;
-        let elapsed = start.elapsed().as_millis();
-        assert!(elapsed < 3000, "poweroff took {}ms, expected <3000ms", elapsed);
+        // queue_command should return a valid receiver
+        let rx = engine.queue_command("echo test", 0.1); // 100ms timeout for fast test
 
-        // Test normal command still works (will timeout on test server)
-        let result = engine.send_command("echo test", 1.0).await;
-        assert!(result["timed_out"].as_bool().unwrap_or(true));
+        // Simulate read loop calling check_timeouts (normally done by read_loop_iter)
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        engine.commands.check_timeouts();
+
+        let result = rx.await;
+        assert!(result.is_ok());
+        let cmd_result = result.unwrap();
+        assert!(cmd_result.timed_out);
+    }
+
+    // ── state transition tests (no hardware) ─────────────────────────────
+
+    #[tokio::test]
+    async fn test_get_state_dict_fields() {
+        let mut values = std::collections::HashMap::new();
+        values.insert("DEV_HOST_IP".into(), "127.0.0.1".into());
+        values.insert("SERIAL_PORT".into(), "2000".into());
+        values.insert("LOGIN_USER".into(), "test".into());
+        values.insert("DUT_ALIAS".into(), "test-dut".into());
+        values.insert("LOCK_DIR".into(), "/tmp/test-locks".into());
+        let cfg = Config {
+            values,
+            config_path: None,
+            project_dir: Some(std::env::temp_dir()),
+            format: ConfigFormat::None,
+        };
+        let engine = new_shared_engine(cfg);
+        let eng = engine.lock().await;
+        let state = eng.get_state_dict();
+        assert!(state.get("state").is_some());
+        assert!(state.get("login_configured").is_some());
+        assert!(state.get("relay_configured").is_some());
+        assert!(state.get("boot_number").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_engine_new_and_stop() {
+        let mut values = std::collections::HashMap::new();
+        values.insert("DEV_HOST_IP".into(), "127.0.0.1".into());
+        values.insert("SERIAL_PORT".into(), "59999".into());
+        values.insert("LOCK_DIR".into(), "/tmp/debug-console-test-locks".into());
+        values.insert("LOGIN_USER".into(), "root".into());
+        let cfg = Config {
+            values,
+            config_path: None,
+            project_dir: Some(std::env::temp_dir()),
+            format: crate::config::ConfigFormat::None,
+        };
+        // Engine should not panic on new()
+        let engine = new_shared_engine(cfg);
+        let mut eng = engine.lock().await;
+        // start() will fail to connect (no ser2net at 127.0.0.1:59999) but that's OK
+        let _result = eng.start().await;
+        // Should either connect (if something on 59999) or transition to disconnected
+        eng.stop().await;
+    }
+
+    #[test]
+    fn test_target_state_display() {
+        assert_eq!(TargetState::Active.as_str(), "active");
+        assert_eq!(TargetState::Booting.as_str(), "booting");
+        assert_eq!(TargetState::Crashed.as_str(), "crashed");
+        assert_eq!(TargetState::Disconnected.as_str(), "disconnected");
+        assert_eq!(TargetState::Stopped.as_str(), "stopped");
+    }
+
+    #[test]
+    fn test_format_statusline_all_states() {
+        let tmp = TempDir::new().unwrap();
+        let sm = StateManager::new(tmp.path(), 60, 3, ".dut-serial", "");
+        for state in &[
+            TargetState::Active,
+            TargetState::Booting,
+            TargetState::UBoot,
+            TargetState::Crashed,
+            TargetState::Disconnected,
+            TargetState::DutOff,
+        ] {
+            let text = sm.format_statusline(*state);
+            assert!(!text.is_empty());
+            assert!(text.contains('\x1b')); // ANSI color codes
+        }
+    }
+
+    // ── Regression tests ───────────────────────────────────────────────
+
+    /// Engine.start() must set `running = true` before any blocking operations
+    /// (SSH udev check, slow reconnects). Even if serial is unreachable, the
+    /// MCP server must be responsive — `running` must be true after start().
+    #[tokio::test]
+    async fn test_start_sets_running_despite_serial_refused() {
+        let tmp = TempDir::new().unwrap();
+        let mut values = HashMap::new();
+        values.insert("DEV_HOST_IP".into(), "127.0.0.1".into());
+        values.insert("SERIAL_PORT".into(), "1".into()); // port 1 → connection refused fast
+        values.insert("RELAY_PORT".into(), "0".into());
+        values.insert("RESET_CHANNEL".into(), "0".into());
+        values.insert("MASKROM_CHANNEL".into(), "0".into());
+        values.insert("HANG_TIMEOUT".into(), "60".into());
+        values.insert("HANG_HYSTERESIS".into(), "3".into());
+        values.insert("MAX_ARCHIVED_LOGS".into(), "10".into());
+        values.insert("MAX_LOG_FILE_SIZE".into(), "100".into());
+        values.insert("DUT_DIR".into(), ".dut-serial".into());
+        values.insert("LOCK_DIR".into(), format!("/tmp/debug-console-test-{}", std::process::id()));
+        values.insert("LOGIN_USER".into(), "root".into());
+        values.insert("LOGIN_PASS".into(), "".into());
+        values.insert("UBOOT_INTERRUPT_STRATEGY".into(), "lava".into());
+
+        let config = Config {
+            values,
+            config_path: None,
+            project_dir: Some(tmp.path().to_path_buf()),
+            format: ConfigFormat::None,
+        };
+
+        let mut engine = SerialEngine::new(config);
+        let result = engine.start().await;
+
+        // start() should complete (not timeout) and set running=true
+        // even though serial connect was refused.
+        assert!(result.is_ok(), "start() should succeed: {:?}", result.err());
+        assert!(engine.running, "engine.running must be true after start()");
+        assert_eq!(
+            engine.state.current(),
+            TargetState::Disconnected,
+            "should be disconnected when serial is refused"
+        );
+
+        engine.stop().await;
+    }
+
+    /// start() must complete within a reasonable time even when DUT_ALIAS
+    /// is configured (which triggers the SSH udev check). The SSH check
+    /// runs as a background task and must not block the hot path.
+    #[tokio::test]
+    async fn test_start_completes_quickly() {
+        let tmp = TempDir::new().unwrap();
+        // Use unique ports per test to avoid lock conflicts from parallel runs.
+        let test_port = format!("{}", 50000 + (std::process::id() % 10000));
+        let lock_dir = format!("/tmp/debug-console-test-{}-quick", std::process::id());
+
+        let mut values = HashMap::new();
+        values.insert("DEV_HOST_IP".into(), "127.0.0.1".into());
+        values.insert("SERIAL_PORT".into(), test_port);
+        values.insert("RELAY_PORT".into(), "0".into());
+        values.insert("RESET_CHANNEL".into(), "0".into());
+        values.insert("MASKROM_CHANNEL".into(), "0".into());
+        values.insert("HANG_TIMEOUT".into(), "60".into());
+        values.insert("HANG_HYSTERESIS".into(), "3".into());
+        values.insert("MAX_ARCHIVED_LOGS".into(), "10".into());
+        values.insert("MAX_LOG_FILE_SIZE".into(), "100".into());
+        values.insert("DUT_DIR".into(), ".dut-serial".into());
+        values.insert("LOCK_DIR".into(), lock_dir);
+        values.insert("LOGIN_USER".into(), "root".into());
+        values.insert("DUT_ALIAS".into(), "test-dut".into()); // triggers SSH background check
+        values.insert("UBOOT_INTERRUPT_STRATEGY".into(), "lava".into());
+
+        let config = Config {
+            values,
+            config_path: None,
+            project_dir: Some(tmp.path().to_path_buf()),
+            format: ConfigFormat::None,
+        };
+
+        let mut engine = SerialEngine::new(config);
+        let start = std::time::Instant::now();
+        let result = engine.start().await;
+        let elapsed = start.elapsed();
+
+        // start() must succeed even when DUT_ALIAS is configured
+        assert!(
+            result.is_ok(),
+            "start() should succeed: {:?}",
+            result.err()
+        );
+        // start() must complete in under 2s — the SSH udev check is a
+        // background task and must not block the hot path.
+        assert!(
+            elapsed.as_millis() < 2000,
+            "start() took {}ms, should complete quickly (SSH check is background)",
+            elapsed.as_millis()
+        );
+        assert!(engine.running);
+
+        engine.stop().await;
+    }
+
+    // ── WebSocket Dutabo state transitions ───────────────────────────────
+
+    #[tokio::test]
+    async fn test_ws_connect_transitions_to_dutabo() {
+        let tmp = TempDir::new().unwrap();
+        let config = create_test_config(tmp.path());
+        let mut engine = SerialEngine::new(config);
+        engine.running = true;
+        engine.state.transition(TargetState::Active);
+
+        // Simulate WS client connecting
+        let (ws_tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(1);
+        engine.set_ws_tx(ws_tx);
+
+        assert_eq!(
+            engine.state.current(),
+            TargetState::Dutabo,
+            "WS connect should transition to Dutabo"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ws_disconnect_restores_active() {
+        let tmp = TempDir::new().unwrap();
+        let config = create_test_config(tmp.path());
+        let mut engine = SerialEngine::new(config);
+        engine.running = true;
+        engine.state.transition(TargetState::Active);
+
+        // Connect WS
+        let (ws_tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(1);
+        engine.set_ws_tx(ws_tx);
+        assert_eq!(engine.state.current(), TargetState::Dutabo);
+
+        // Disconnect WS
+        engine.clear_ws_tx();
+        assert_eq!(
+            engine.state.current(),
+            TargetState::Active,
+            "WS disconnect should restore Active"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ws_tx_none_after_clear() {
+        let tmp = TempDir::new().unwrap();
+        let config = create_test_config(tmp.path());
+        let mut engine = SerialEngine::new(config);
+        engine.running = true;
+        engine.state.transition(TargetState::Active);
+
+        let (ws_tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(1);
+        engine.set_ws_tx(ws_tx.clone());
+        assert!(engine.ws_tx.is_some());
+
+        engine.clear_ws_tx();
+        assert!(engine.ws_tx.is_none(), "ws_tx should be None after clear");
+    }
+
+    #[tokio::test]
+    async fn test_read_loop_keeps_serial_open_in_ws_dutabo_mode() {
+        // When in Dutabo via WS (not sentinel), the serial connection should
+        // stay open — the MCP server continues to manage serial for the WS client.
+        let tmp = TempDir::new().unwrap();
+        let config = create_test_config(tmp.path());
+        let mut engine = SerialEngine::new(config);
+        engine.running = true;
+        engine.state.transition(TargetState::Active);
+
+        // Simulate WS connection
+        let (ws_tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(1);
+        engine.set_ws_tx(ws_tx);
+        assert_eq!(engine.state.current(), TargetState::Dutabo);
+
+        // read_loop_iter should NOT close the serial when ws_tx is set
+        // (it's a no-op in test, but we verify state is preserved)
+        engine.read_loop_iter().await;
+
+        // State should remain Dutabo (not try to reconnect)
+        assert_eq!(
+            engine.state.current(),
+            TargetState::Dutabo,
+            "WS Dutabo should not trigger reconnect in read_loop_iter"
+        );
+        assert!(
+            engine.ws_tx.is_some(),
+            "ws_tx should still be set after read_loop_iter"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ws_dutabo_skips_sentinel_check() {
+        // If a sentinel file exists but we're in WS mode, read_loop_iter
+        // should NOT close the serial — sentinel is ignored when ws_tx is set.
+        let tmp = TempDir::new().unwrap();
+        let config = create_test_config(tmp.path());
+        let sentinel_dir = tmp.path().join(".dut-serial");
+        std::fs::create_dir_all(&sentinel_dir).unwrap();
+        std::fs::write(sentinel_dir.join(".dutabo-active"), b"active").unwrap();
+
+        let mut engine = SerialEngine::new(config);
+        engine.running = true;
+        engine.state.transition(TargetState::Active);
+
+        // WS is active — sentinel should be ignored
+        let (ws_tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(1);
+        engine.set_ws_tx(ws_tx);
+
+        engine.read_loop_iter().await;
+
+        assert_eq!(
+            engine.state.current(),
+            TargetState::Dutabo,
+            "WS mode should skip sentinel check"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ws_connect_from_stopped_no_warning() {
+        // Active → Dutabo should be clean (no suspicious transition)
+        let tmp = TempDir::new().unwrap();
+        let config = create_test_config(tmp.path());
+        let mut engine = SerialEngine::new(config);
+        engine.running = true;
+        engine.state.transition(TargetState::Active);
+
+        let (ws_tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(1);
+        engine.set_ws_tx(ws_tx);
+
+        assert_eq!(engine.state.current(), TargetState::Dutabo);
+        // Should NOT produce a "suspicious transition" warning because
+        // Active → Dutabo is not in the suspicious match list
     }
 }

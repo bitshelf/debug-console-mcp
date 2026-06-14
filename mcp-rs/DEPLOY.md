@@ -1,8 +1,8 @@
-# embedded-debug-mcp 部署指南
+# debug-console-mcp 部署指南
 
 ## 概述
 
-`embedded-debug-mcp` 是一个标准的 **MCP (Model Context Protocol) 服务器**，
+`debug-console-mcp` 是一个标准的 **MCP (Model Context Protocol) 服务器**，
 使用 stdio transport (JSON-RPC 2.0 newline-delimited)。
 
 **不依赖任何特定 Agent** — 只要是 MCP 兼容的客户端都能使用。
@@ -19,7 +19,7 @@ cd embedded-debug/mcp-rs
 
 # 方式 B: 手动
 cargo build --release
-cp target/release/embedded-debug-mcp ~/.local/bin/
+cp target/release/debug-console-mcp ~/.local/bin/
 ```
 
 ### 第二步: 配置 `.target.conf`
@@ -48,8 +48,8 @@ RK_RESET_CHANNEL=1
 ```json
 {
   "mcpServers": {
-    "embedded-debug": {
-      "command": "embedded-debug-mcp",
+    "debug-console": {
+      "command": "debug-console-mcp",
       "env": { "RUST_LOG": "info" }
     }
   }
@@ -65,7 +65,7 @@ RK_RESET_CHANNEL=1
     "mcpServers": [
       {
         "name": "embedded-debug",
-        "command": "embedded-debug-mcp",
+        "command": "debug-console-mcp",
         "cwd": "/path/to/your/sdk"
       }
     ]
@@ -79,8 +79,8 @@ RK_RESET_CHANNEL=1
 ```json
 {
   "mcpServers": {
-    "embedded-debug": {
-      "command": "embedded-debug-mcp",
+    "debug-console": {
+      "command": "debug-console-mcp",
       "env": { "RUST_LOG": "info" }
     }
   }
@@ -92,8 +92,8 @@ RK_RESET_CHANNEL=1
 `codex.yaml`:
 ```yaml
 mcp_servers:
-  - name: embedded-debug
-    command: embedded-debug-mcp
+  - name: debug-console
+    command: debug-console-mcp
     env:
       TARGET_CONF: /path/to/.target.conf
 ```
@@ -104,9 +104,9 @@ mcp_servers:
 ```json
 {
   "mcp": {
-    "embedded-debug": {
+    "debug-console": {
       "command": {
-        "path": "embedded-debug-mcp",
+        "path": "debug-console-mcp",
         "env": {
           "TARGET_CONF": "/path/to/.target.conf"
         }
@@ -121,7 +121,7 @@ mcp_servers:
 `~/.config/goose/mcp.toml`:
 ```toml
 [mcp_servers.embedded-debug]
-command = "embedded-debug-mcp"
+command = "debug-console-mcp"
 cwd = "/path/to/sdk"
 ```
 
@@ -129,10 +129,10 @@ cwd = "/path/to/sdk"
 
 ```bash
 # 直接启动 (bash / zsh)
-TARGET_CONF=/path/to/.target.conf RUST_LOG=info embedded-debug-mcp
+TARGET_CONF=/path/to/.target.conf RUST_LOG=info debug-console-mcp
 
 # stdin/stdout 就是 JSON-RPC:
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | embedded-debug-mcp
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | debug-console-mcp
 ```
 
 ### 协议验证
@@ -140,14 +140,14 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | embedded-deb
 ```bash
 # 测试 initialize 握手
 printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n' | \
-  TARGET_CONF=/path/to/.target.conf embedded-debug-mcp 2>/dev/null
+  TARGET_CONF=/path/to/.target.conf debug-console-mcp 2>/dev/null
 
 # 预期输出:
 # {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05",...}}
 
 # 列出所有 tools
 printf '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n' | \
-  TARGET_CONF=/path/to/.target.conf embedded-debug-mcp 2>/dev/null
+  TARGET_CONF=/path/to/.target.conf debug-console-mcp 2>/dev/null
 ```
 
 ## 环境变量
@@ -163,13 +163,13 @@ printf '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n' | \
 ┌──────────────────────────────────────────────────────┐
 │ 任何 MCP 客户端 (Claude/Cursor/Continue/Zed/...)      │
 │                                                      │
-│  1. spawn embedded-debug-mcp 子进程                   │
+│  1. spawn debug-console-mcp 子进程                   │
 │  2. stdin → JSON-RPC request                          │
 │  3. stdout → JSON-RPC response                        │
 └──────────┬───────────────────────────────────────────┘
            │ stdio (pipe)
 ┌──────────▼───────────────────────────────────────────┐
-│ embedded-debug-mcp (Rust binary, 3MB)                 │
+│ debug-console-mcp (Rust binary, 3MB)                 │
 │                                                      │
 │  mcp.rs → handle_message()                           │
 │    ├── initialize → protocol version 2024-11-05      │
@@ -183,7 +183,7 @@ printf '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n' | \
 └──────────────────────────────────────────────────────┘
 ```
 
-## 13 个 MCP Tools
+## 15 个 MCP Tools
 
 | Tool | 说明 |
 |------|------|
@@ -193,7 +193,9 @@ printf '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n' | \
 | `serial_list_logs` | 列出所有归档启动日志 |
 | `serial_reset` | 继电器硬件复位 + 日志切割 |
 | `serial_enter_uboot` | 强制进入 U-Boot 交互提示符 |
+| `serial_enter_maskrom` | 强制进入 Rockchip MASKROM 模式 |
 | `serial_wait_pattern` | 阻塞等待指定正则模式出现 |
+| `serial_uboot_command` | 在 U-Boot 提示符下发送命令 |
 | `serial_new_log` | 手动切割日志 (不复位) |
 | `serial_poll_logs` | 增量获取新输出 |
 | `serial_get_config` | 获取当前目标配置 |
@@ -205,14 +207,14 @@ printf '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n' | \
 
 ```bash
 # 查看帮助
-embedded-debug-mcp --help
+debug-console-mcp --help
 
 # 调试模式 (日志输出到 stderr)
-embedded-debug-mcp --log-to-stderr -v
+debug-console-mcp --log-to-stderr -v
 
 # 手动测试连接
 nc -zv 192.168.1.231 2000
 
 # 模拟 MCP 客户端
-TARGET_CONF=.target.conf embedded-debug-mcp --log-to-stderr -v
+TARGET_CONF=.target.conf debug-console-mcp --log-to-stderr -v
 ```

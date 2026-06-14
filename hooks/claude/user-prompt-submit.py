@@ -7,6 +7,7 @@ Reads .dut-serial/target-state, outputs {"continue": true} or {"systemMessage": 
 
 import json
 import os
+import signal
 import sys
 from pathlib import Path
 
@@ -14,33 +15,48 @@ _HOOK_DIR = Path(__file__).resolve().parent
 if str(_HOOK_DIR) not in sys.path:
     sys.path.insert(0, str(_HOOK_DIR))
 
-from lib import find_project_dir, check_mcp_alive
+from lib import find_project_dir, check_mcp_alive, read_dut_configs, _is_embedded_server
 
 
-def _read_ser2net_host(project_dir: str) -> tuple[str, str]:
-    """从 .target.conf 读取 ser2net 地址."""
+def _read_target_conf(project_dir: str) -> dict:
+    """Read DEV_HOST_IP, SERIAL_PORT, and MCP_PORT from .target.conf."""
     conf = Path(project_dir) / ".target.conf"
+    result = {}
     if not conf.exists():
-        return ("", "")
-    host = port = ""
+        return result
     try:
         for line in conf.read_text().splitlines():
             line = line.strip()
             if line.startswith("DEV_HOST_IP="):
-                host = line.split("=", 1)[1].strip().strip('"').strip("'")
+                result["host"] = line.split("=", 1)[1].strip().strip('"').strip("'")
             elif line.startswith("SERIAL_PORT="):
-                port = line.split("=", 1)[1].strip().strip('"').strip("'")
+                result["port"] = line.split("=", 1)[1].strip().strip('"').strip("'")
     except OSError:
         pass
-    return (host, port)
+    return result
+
+
+def _read_mcp_port(project_dir: str) -> int:
+    """Read HTTP port from .mcp.json. Returns 3000 as default."""
+    mcp_json = Path(project_dir) / ".mcp.json"
+    if not mcp_json.exists():
+        return 3000
+    try:
+        cfg = json.loads(mcp_json.read_text())
+        url = cfg.get("mcpServers", {}).get("debug-console", {}).get("url", "")
+        if ":" in url:
+            return int(url.rsplit(":", 1)[-1].split("/")[0])
+    except (json.JSONDecodeError, ValueError, KeyError):
+        pass
+    return 3000
 
 
 def _check_ser2net(host: str, port: str) -> bool:
-    """TCP 连通性检查 ser2net 是否可达."""
+    """TCP connectivity check — ser2net reachable?"""
     import socket
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(3)
+        s.settimeout(2)  # 2s (was 3s — reduce user wait)
         s.connect((host, int(port)))
         s.close()
         return True
@@ -49,23 +65,44 @@ def _check_ser2net(host: str, port: str) -> bool:
 
 
 def _restart_mcp(project_dir: str) -> None:
-    """释放端口并重启 MCP HTTP server."""
+    """Release the MCP HTTP port and restart the server.
+    Only kills processes verified to be debug-console-mcp."""
     import subprocess
     import shutil
-    binary = shutil.which("embedded-debug-mcp") or os.path.expanduser("~/.local/bin/embedded-debug-mcp")
+    binary = shutil.which("debug-console-mcp") or os.path.expanduser("~/.local/bin/debug-console-mcp")
     if not Path(binary).exists():
         return
-    subprocess.run(["fuser", "-k", "3000/tcp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    mcp_port = _read_mcp_port(project_dir)
+
+    # Targeted kill: only kill debug-console-mcp processes on the MCP port.
+    try:
+        result = subprocess.run(
+            ["fuser", f"{mcp_port}/tcp"], capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            for pid_str in result.stdout.strip().split():
+                try:
+                    pid = int(pid_str)
+                    # Verify the process is a debug-console-mcp server before killing.
+                    if _is_embedded_server(pid):
+                        os.kill(pid, signal.SIGTERM)
+                except (ValueError, OSError, ProcessLookupError):
+                    pass
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
     subprocess.Popen(
-        [binary, "--http"],
+        [binary, "--http", f"127.0.0.1:{mcp_port}"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True, cwd=project_dir,
     )
 
 
-def read_target_state(project_dir: str) -> str:
-    """Read current target state from either daemon location."""
-    for subdir in [".dut-serial", "mcp-rs/.dut-serial"]:
+def read_target_state(project_dir: str, alias: str = None) -> str:
+    """Read current target state. If alias given, checks .dut-serial/<alias>/target-state."""
+    subdirs = [f".dut-serial/{alias}"] if alias else [".dut-serial", "mcp-rs/.dut-serial"]
+    for subdir in subdirs:
         sf = Path(project_dir) / subdir / "target-state"
         if sf.exists():
             try:
@@ -83,7 +120,26 @@ def main():
         print(json.dumps({"continue": True}))
         sys.exit(0)
 
-    state = read_target_state(project_dir)
+    # ── Multi-DUT state collection ──────────────────────────────────────
+    duts = read_dut_configs(project_dir) if project_dir else {}
+
+    # Read state from per-DUT directories (includes single-DUT case).
+    # Falls back to root .dut-serial/target-state only if no DUTs found in config.
+    if duts:
+        alerts = []
+        for alias, info in duts.items():
+            state = read_target_state(project_dir, alias)
+            if state in ("crashed", "DUT-off", "disconnected"):
+                alerts.append(f"[TARGET-ALERT] {alias} is {state}")
+        # NOTE: statusline-cache is written by StateManager::transition() with
+        # ANSI color codes — do NOT overwrite it here with plain text.
+        if alerts:
+            print(json.dumps({"systemMessage": " | ".join(alerts)}))
+            sys.exit(0)
+        # Single-DUT: use the first (only) DUT's state
+        state = read_target_state(project_dir, list(duts.keys())[0])
+    else:
+        state = read_target_state(project_dir)
 
     # PID liveness check: if MCP server is dead, state file is stale
     if state and not check_mcp_alive(project_dir):
@@ -108,11 +164,13 @@ def main():
         sys.exit(0)
 
     if state == "disconnected":
-        # 检查 ser2net 是否可达
-        host, port = _read_ser2net_host(project_dir)
+        # Check if ser2net is reachable
+        conf = _read_target_conf(project_dir)
+        host = conf.get("host", "")
+        port = conf.get("port", "")
         ser2net_alive = _check_ser2net(host, port) if host and port else False
         if ser2net_alive:
-            # dev host ser2net 正常 → 问题在本地 MCP → 自动重启
+            # ser2net OK → problem is local MCP → auto-restart
             _restart_mcp(project_dir)
             print(json.dumps({
                 "systemMessage": (
@@ -137,6 +195,7 @@ def main():
         sys.exit(0)
 
     print(json.dumps({"continue": True}))
+
 
 if __name__ == "__main__":
     main()

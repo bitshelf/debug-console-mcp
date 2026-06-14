@@ -4,7 +4,7 @@
 TCP 直连（无 socat），提供启动日志捕获、自动登录、崩溃检测、U-Boot 中断、
 继电器复位、**跨 SOC 自适应阶段检测**等功能。
 
-Rust edition 2024，零框架 MCP 实现（纯 JSON-RPC 2.0 over stdio）。
+Rust edition 2024，零框架 MCP 实现，支持 stdio JSON-RPC 2.0 和 HTTP transport。
 
 ## 架构
 
@@ -23,28 +23,50 @@ Build Machine                          Dev Host
 ## 构建
 
 ```bash
-cd ~/.config/ai-dev/skills/embedded-debug/mcp-rs
-cargo build --release
-# Binary: target/release/embedded-debug-mcp (3.0MB stripped)
+cd mcp-rs
+cargo build --release --locked
+# Binary: target/release/debug-console-mcp
 ```
 
 ## 配置
 
-在项目根目录创建 `.target.conf`:
+在项目根目录创建 `.target.toml`。当前实现仍能读取 legacy `.target.conf`，
+但新项目应使用 `[[dev_hosts]]` + `[[dut]]` 格式，和多 DUT/HTTP hook 工作流保持一致。
 
-```bash
-# 必填: 串口连接
-RK_DEV_HOST_IP=192.168.1.xxx
-RK_SERIAL_PORT=2000
+**.target.toml (推荐):**
 
-# 可选: 自动登录
-RK_LOGIN_USER=root
-RK_LOGIN_PASS=mypassword
+```toml
+[[dev_hosts]]
+alias = "rk-board-pc"
+ip = "192.168.1.xxx"
+user = "linaro"
 
-# 可选: 继电器复位
-RK_RELAY_PORT=2001
-RK_RESET_CHANNEL=2
-RK_MASKROM_CHANNEL=1
+[[dut]]
+alias = "rk3576"
+dev_host = "rk-board-pc"
+
+[dut.serial]
+port = 2000
+
+[dut.target]
+login_user = "root"
+login_prompt = ""
+
+[dut.uboot]
+interrupt_char = "ctrl_c"
+interrupt_strategy = "aggressive"
+
+[dut.relay]
+type = "usb-relay"
+# port = 2001
+# reset_ch = 1
+# maskrom_ch = 2
+# power_ch = 4
+
+[dut.monitor]
+hang_timeout = 60
+max_archived_logs = 10
+reference_log = ".dut-serial/rk3576/reference-boot.log"
 ```
 
 ## MCP Tools
@@ -56,21 +78,36 @@ RK_MASKROM_CHANNEL=1
 | `serial_get_logs` | 检索串口日志 (支持正则过滤) |
 | `serial_list_logs` | 列出所有归档启动日志 |
 | `serial_reset` | 硬件复位 + 日志切割 |
-| `serial_enter_uboot` | 强制进入 U-Boot 交互提示符 |
+| `serial_power_cycle` | 通过电源通道断电再上电 |
+| `serial_enter_uboot` | 强制进入 U-Boot 交互提示符 (retry up to failure_retry times) |
+| `serial_reboot_uboot` | 软重启 + Ctrl-C flood 进入 U-Boot (bootdelay=0 也有效) |
+| `serial_enter_maskrom` | 强制进入 Rockchip MASKROM 模式 |
 | `serial_wait_pattern` | 阻塞等待串口输出中出现指定模式 |
+| `serial_uboot_command` | 在 U-Boot 提示符下发送命令 |
 | `serial_new_log` | 手动切割日志 (不复位) |
 | `serial_poll_logs` | 增量获取新输出 (文件位置跟踪) |
 | `serial_get_config` | 获取当前目标配置 |
+| `serial_get_metrics` | 获取引擎运行指标 |
 | `serial_claim` | 夺取串口所有权 |
-| `serial_load_reference` | 🆕 加载参考启动日志启用自适应阶段检测 |
-| `serial_get_stages` | 🆕 查看已学习的启动阶段指纹 |
+| `serial_button` | 控制 reset/recovery/maskrom 按钮 |
+| `serial_pause` | 暂停串口引擎，供 dutabo 接管 |
+| `serial_resume` | 恢复串口引擎 |
+| `serial_send_raw` | 发送原始串口字节 |
+| `serial_load_reference` | 加载参考启动日志启用自适应阶段检测 |
+| `serial_get_stages` | 查看已学习的启动阶段指纹 |
+| `serial_get_unclassified` | 获取 StageLearner 未能分类的行（供 Agent 自学习） |
+| `serial_append_reference` | 追加锚点行到参考日志 + 热重载 StageLearner |
+| `serial_learn_connection` | 多次复位学习连接稳定性和参考日志 |
+| `serial_verify_relay` | 读回验证 CH340 继电器 |
+| `serial_flash_plan` | 根据 flash 配置生成烧录计划 |
+| `serial_flash` | 上传并执行固件烧录 |
 
 ## 模块结构
 
 ```
 src/
 ├── main.rs              # 入口: 初始化日志 + 启动 engine + MCP server
-├── mcp.rs               # MCP Server: JSON-RPC 2.0 over stdio + HTTP
+├── mcp.rs               # MCP Server: JSON-RPC 2.0 over stdio
 ├── mcp_http.rs          # Streamable HTTP transport (axum, :3000)
 ├── serial_engine.rs     # 核心引擎: 协调所有子系统
 ├── console.rs           # TCP 串口驱动: tokio TcpStream → ser2net
@@ -80,7 +117,10 @@ src/
 ├── command_queue.rs     # 命令队列: marker echo 串行化 + 响应路由
 ├── relay_manager.rs     # 继电器控制: 4 字节协议 over TCP
 ├── lock_manager.rs      # 互斥锁: O_EXCL 原子创建 + 僵尸清理
-├── config.rs            # 配置解析: shell 风格 .target.conf
+├── config.rs            # 配置解析: TOML .target.toml + legacy shell .target.conf fallback
+├── flash.rs             # dev host 烧录计划和执行
+├── inotify_watcher.rs   # 配置/状态文件变更监听辅助
+├── connection_learner.rs # 连接学习和参考日志生成
 └── marker.rs            # 标记符生成: 10 字符随机大写字母
 ```
 
@@ -110,15 +150,30 @@ serial_get_stages
 # StageLearner 使用 3-gram Jaccard 相似度 + 顺序约束
 ```
 
-### 算法
+### 检测流程 (v0.2.0+)
 
 ```
 对于每一行串口输出:
-  1. 计算与所有参考指纹的 3-gram Jaccard 相似度
-  2. 选择得分最高的阶段 (及其上下文锚定行)
-  3. 阈值过滤 (< 0.45 不匹配)
-  4. 顺序约束 (不允许阶段倒退 > 1)
-  5. 崩溃检测不受顺序约束 (任意位置均可触发)
+  1. 崩溃检测 (regex, 始终执行)
+  2. StageLearner 优先 (如果已加载参考日志):
+     a. 组合分数: 3-gram Jaccard * 0.6 + Jaro-Winkler * 0.4
+     b. 阈值过滤 (默认 0.45, 低于此值不匹配)
+     c. 顺序约束 (不允许阶段倒退 > 1)
+     d. DDR/SPL 匹配 → 触发 BootStart (日志分割)
+     e. 未匹配行 → 收集到 unclassified.log
+  3. login/password regex (始终执行, 触发自动登录)
+  4. Regex 回退 (仅当 StageLearner 未匹配时)
+```
+
+### Auto-Learning 闭环
+
+```
+StageLearner 未分类行
+  → serial_get_unclassified (Agent 获取)
+  → Agent 分析 + 裁剪关键锚点行
+  → serial_append_reference (追加 + 热重载)
+  → 下次 boot cycle 使用新指纹
+  → StageLearner 越用越准
 ```
 
 ### 跨 SOC 验证
@@ -137,10 +192,17 @@ serial_get_stages
 | `serde` | 1 | 序列化 |
 | `serde_json` | 1 | JSON-RPC 编解码 |
 | `regex` | 1 | boot stage / crash pattern / ANSI 清理 |
+| `toml` | 0.8 | TOML 配置解析 (.target.toml) |
+| `md-5` | 0.10 | 项目路径哈希 (statusline /dev/shm key) |
+| `inotify` | 0.11 | (removed: statusline-watch daemon deleted) |
 | `rand` | 0.8 | marker 生成 |
 | `chrono` | 0.4 | 时间戳格式化 |
 | `tracing` | 0.1 | 结构化日志 |
 | `tracing-subscriber` | 0.3 | 日志格式化 + env-filter |
+| `once_cell` | 1 | static lazy init (regex cache) |
+| `strsim` | 0.11 | StageLearner: Jaccard + Jaro-Winkler + Sorensen-Dice |
+| `axum` | 0.8 | Streamable HTTP transport |
+| `tower-http` | 0.6 | CORS middleware (HTTP transport) |
 
 ## 与 Python 版本的差异
 
@@ -163,20 +225,20 @@ serial_get_stages
 
 ```bash
 # 查看帮助
-embedded-debug-mcp --help
-embedded-debug-mcp -h
+debug-console-mcp --help
+debug-console-mcp -h
 
 # 查看版本
-embedded-debug-mcp --version
+debug-console-mcp --version
 
 # 启动 (默认: info 日志到文件)
-embedded-debug-mcp
+debug-console-mcp
 
 # 调试模式 (debug 日志)
-embedded-debug-mcp --verbose
+debug-console-mcp --verbose
 
 # 日志输出到 stderr (调试时方便查看)
-embedded-debug-mcp --log-to-stderr -v
+debug-console-mcp --log-to-stderr -v
 ```
 
 ## 部署到 Claude Code
@@ -188,8 +250,8 @@ embedded-debug-mcp --log-to-stderr -v
 ```json
 {
   "mcpServers": {
-    "embedded-debug": {
-      "command": "$HOME/.claude/skills/embedded-debug/mcp-rs/target/release/embedded-debug-mcp",
+    "debug-console": {
+      "command": "$HOME/.claude/skills/embedded-debug/mcp-rs/target/release/debug-console-mcp",
       "args": []
     }
   }
@@ -198,15 +260,15 @@ embedded-debug-mcp --log-to-stderr -v
 
 ### 方式二: SessionStart Hook 自动生成
 
-如果项目已有 `.target.conf`，`session-start.py` hook
-会自动检测并生成 `.mcp.json`:
+如果项目已有 `.target.toml`，`session-start.py` hook 会自动启动 HTTP MCP。
+必要时也可以由代码生成 `.mcp.json`:
 
 ```bash
 # Hook 会自动生成的 .mcp.json 示例:
 {
   "mcpServers": {
-    "embedded-debug": {
-      "command": "/home/user/.claude/skills/embedded-debug/mcp-rs/target/release/embedded-debug-mcp",
+    "debug-console": {
+      "command": "/home/user/.claude/skills/embedded-debug/mcp-rs/target/release/debug-console-mcp",
       "args": []
     }
   }
@@ -221,13 +283,13 @@ cd ~/.config/ai-dev/skills/embedded-debug/mcp-rs
 cargo build --release
 
 # 安装到 PATH
-sudo cp target/release/embedded-debug-mcp /usr/local/bin/
+sudo cp target/release/debug-console-mcp /usr/local/bin/
 
 # 然后在 .mcp.json 中使用:
 {
   "mcpServers": {
-    "embedded-debug": {
-      "command": "embedded-debug-mcp",
+    "debug-console": {
+      "command": "debug-console-mcp",
       "args": []
     }
   }
@@ -238,14 +300,14 @@ sudo cp target/release/embedded-debug-mcp /usr/local/bin/
 
 ```bash
 # 1. 确认二进制可执行
-file target/release/embedded-debug-mcp
+file target/release/debug-console-mcp
 # 应该输出: ELF 64-bit ... executable ...
 
 # 2. 确认帮助输出
-target/release/embedded-debug-mcp --help
+target/release/debug-console-mcp --help
 
-# 3. 确认项目有 .target.conf
-ls -la .target.conf
+# 3. 确认项目有 .target.toml
+ls -la .target.toml
 
 # 4. 启动 Claude Code 后查看状态栏
 # 成功时会显示: ● serial:active 或 ● serial:disconnected
@@ -255,7 +317,7 @@ ls -la .target.conf
 
 ```
 1. 构建         cargo build --release
-2. 配置         vi .target.conf          (在项目根目录)
+2. 配置         vi .target.toml          (在项目根目录)
 3. 部署         vi .mcp.json             (或依赖 hook)
 4. 启动         claude                   (Claude Code 自动 spawn MCP Server)
 5. 使用         serial_send_command "uname -a"
@@ -266,10 +328,10 @@ ls -la .target.conf
 
 | 现象 | 原因 | 解决 |
 |------|------|------|
-| 状态栏不显示 | 无 `.target.conf` 或 Server 未启动 | 检查项目根目录; 运行 `--log-to-stderr -v` 调试 |
+| 状态栏不显示 | 无 `.target.toml` 或 Server 未启动 | 检查项目根目录; 运行 `--log-to-stderr -v` 调试 |
 | `disconnected` | 连不上 ser2net | 检查 IP/端口; `nc -zv host port` |
 | `DUT-off` | 目标无输出 | `serial_send_command "echo ping"`; `serial_reset` |
-| 二进制不启动 | 依赖库缺失 | 检查动态链接: `ldd target/release/embedded-debug-mcp` |
+| 二进制不启动 | 依赖库缺失 | 检查动态链接: `ldd target/release/debug-console-mcp` |
 | 第二个实例被拒 | 同 host:port 互斥 | 退出第一个实例或等它释放锁 |
 
 ### 测试

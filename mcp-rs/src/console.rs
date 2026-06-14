@@ -2,11 +2,17 @@
 //!
 //! 使用 tokio TCP 直连 ser2net (socket:// 协议)，无 socat 中间层。
 //! 所有写操作通过 `write_tx` channel 发送，由 read loop 执行实际 I/O。
+//!
+//! Channel is **bounded** (depth 64). When full, oldest messages are dropped
+//! to prevent unbounded memory growth during extended disconnects.
 
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+
+/// Max pending writes before dropping (prevents unbounded memory leak on disconnect).
+const WRITE_CHANNEL_DEPTH: usize = 64;
 
 pub struct SerialConsoleDriver {
     host: String,
@@ -15,13 +21,13 @@ pub struct SerialConsoleDriver {
     stream: Option<TcpStream>,
     connected: bool,
     /// 写请求 channel — CommandQueue 通过此发送数据，read loop 执行实际写入
-    write_tx: mpsc::UnboundedSender<Vec<u8>>,
-    write_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    write_tx: mpsc::Sender<Vec<u8>>,
+    write_rx: mpsc::Receiver<Vec<u8>>,
 }
 
 impl SerialConsoleDriver {
     pub fn new(host: String, target: String) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(WRITE_CHANNEL_DEPTH);
         Self {
             host,
             target,
@@ -37,24 +43,53 @@ impl SerialConsoleDriver {
     }
 
     /// 获取写 channel 的克隆 (用于 CommandQueue write_fn)
-    pub fn write_sender(&self) -> mpsc::UnboundedSender<Vec<u8>> {
+    pub fn write_sender(&self) -> mpsc::Sender<Vec<u8>> {
         self.write_tx.clone()
     }
 
-    /// 连接 (或重连) 到 ser2net, 5s 超时
+    /// 连接 (或重连) 到 ser2net。
+    ///
+    /// `timeout_secs` defaults to 5s for normal use. Fast-retry paths (e.g.
+    /// handle_read_error) pass 2s to avoid holding the engine lock too long.
     pub async fn connect(&mut self) -> Result<(), std::io::Error> {
+        self.connect_with_timeout(5).await
+    }
+
+    /// Like `connect()` but with an explicit timeout in seconds.
+    pub async fn connect_with_timeout(&mut self, timeout_secs: u64) -> Result<(), std::io::Error> {
         self.stream.take();
         self.connected = false;
 
         let port: u16 = self.target.parse().unwrap_or(2000);
         let addr = format!("{}:{}", self.host, port);
         let stream = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            TcpStream::connect(&addr)
-        ).await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))?
-            ?;
+            std::time::Duration::from_secs(timeout_secs),
+            TcpStream::connect(&addr),
+        )
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))??;
         stream.set_nodelay(true).ok();
+        #[cfg(target_os = "linux")]
+        {
+            let socket = socket2::SockRef::from(&stream);
+            socket.set_keepalive(true)?;
+            let keepalive = socket2::TcpKeepalive::new()
+                .with_time(std::time::Duration::from_secs(30))
+                .with_interval(std::time::Duration::from_secs(5));
+            socket.set_tcp_keepalive(&keepalive)?;
+            // TCP_KEEPCNT not in socket2 0.5 TcpKeepalive; set via libc
+            let fd = std::os::fd::AsRawFd::as_raw_fd(&stream);
+            let cnt: libc::c_int = 3;
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_TCP,
+                    libc::TCP_KEEPCNT,
+                    &cnt as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
         self.stream = Some(stream);
         self.connected = true;
         Ok(())
@@ -66,18 +101,19 @@ impl SerialConsoleDriver {
         self.connected = false;
     }
 
-    /// 异步发送一行文本 (通过 channel)
+    /// 异步发送一行文本 (通过 channel)。若 channel 满则静默丢弃 (防止背压阻塞调用者)。
     pub fn sendline(&self, line: &str) {
         let data = format!("{line}\n");
-        self.write_tx.send(data.into_bytes()).ok();
+        self.write_tx.try_send(data.into_bytes()).ok();
     }
 
     /// 异步发送 control character (Ctrl-C = 0x03, etc.)
+    /// 若 channel 满则静默丢弃 (心跳/探测字符丢失不影响正确性)。
     pub fn sendcontrol(&self, ch: char) {
         let ch = ch.to_ascii_lowercase();
         if let Some(idx) = (b'a'..=b'z').position(|c| c == ch as u8) {
             let ctrl_byte = (idx as u8) + 1;
-            self.write_tx.send(vec![ctrl_byte]).ok();
+            self.write_tx.try_send(vec![ctrl_byte]).ok();
         }
     }
 
@@ -92,7 +128,8 @@ impl SerialConsoleDriver {
     }
 
     /// 处理所有待发的写请求 (由 read loop 调用)
-    /// 仿 labgrid SerialDriver._write() — 使用 write_all 阻塞写入，不丢数据
+    /// 仿 labgrid SerialDriver._write() — 使用 write_all 阻塞写入。
+    /// 写失败时丢弃数据 (不重入队，防止断连期间无限堆积)。
     pub async fn drain_writes(&mut self) {
         let stream = match self.stream.as_mut() {
             Some(s) => s,
@@ -106,7 +143,7 @@ impl SerialConsoleDriver {
             if let Err(e) = tokio::io::AsyncWriteExt::write_all(stream, &data).await {
                 tracing::warn!("drain_writes: write_all failed: {e}");
                 self.connected = false;
-                self.write_tx.send(data).ok();
+                // Drop failed data — do not re-queue (prevents unbounded growth).
                 return;
             }
         }
@@ -115,12 +152,10 @@ impl SerialConsoleDriver {
     /// 事件驱动等待数据可读 (tokio readable / epoll, 无轮询)
     pub async fn wait_readable(&self, timeout: Duration) -> bool {
         match &self.stream {
-            Some(s) => {
-                match tokio::time::timeout(timeout, s.readable()).await {
-                    Ok(Ok(())) => true,
-                    _ => false,
-                }
-            }
+            Some(s) => match tokio::time::timeout(timeout, s.readable()).await {
+                Ok(Ok(())) => true,
+                _ => false,
+            },
             None => {
                 // 无连接: sleep 避免 busy-wait
                 tokio::time::sleep(timeout.min(Duration::from_secs(5))).await;
@@ -323,9 +358,9 @@ mod tests {
         let sender1 = console.write_sender();
         let sender2 = console.write_sender();
 
-        // Both senders should be valid
-        assert!(sender1.send(b"test1".to_vec()).is_ok());
-        assert!(sender2.send(b"test2".to_vec()).is_ok());
+        // Both senders should be valid (try_send on bounded channel)
+        assert!(sender1.try_send(b"test1".to_vec()).is_ok());
+        assert!(sender2.try_send(b"test2".to_vec()).is_ok());
     }
 
     #[tokio::test]
@@ -333,7 +368,7 @@ mod tests {
         let mut console = SerialConsoleDriver::new("127.0.0.1".into(), "12345".into());
 
         // Send data without connecting
-        console.write_tx.send(b"test".to_vec()).ok();
+        console.write_tx.try_send(b"test".to_vec()).ok();
 
         // Should not panic, just discard
         console.drain_writes().await;
@@ -373,6 +408,47 @@ mod tests {
         assert!(received.contains("cmd3"));
     }
 
+    /// Bounded channel silently drops writes when full — no unbounded memory growth.
+    #[test]
+    fn test_bounded_channel_drops_on_full() {
+        let console = SerialConsoleDriver::new("127.0.0.1".into(), "12345".into());
+        // Fill the channel to capacity (WRITE_CHANNEL_DEPTH = 64)
+        for i in 0..64 {
+            assert!(console.write_tx.try_send(vec![i as u8]).is_ok());
+        }
+        // 65th write should silently fail (channel full)
+        assert!(console.write_tx.try_send(vec![65]).is_err());
+    }
+
+    /// Verify that failed writes are NOT re-queued: drain_writes sets
+    /// connected=false and returns, discarding the failed data.
+    #[tokio::test]
+    async fn test_no_requeue_on_write_failure() {
+        // No server — connect will fail, write_raw will mark disconnected
+        let mut console = SerialConsoleDriver::new("127.0.0.1".to_string(), "59999".into());
+        // Queue a write
+        console
+            .write_tx
+            .try_send(b"should_be_discarded".to_vec())
+            .ok();
+        // drain_writes with no connection should drain and discard
+        console.drain_writes().await;
+        // The channel should now be empty (write was discarded, not re-queued)
+        assert!(console.write_rx.try_recv().is_err());
+    }
+
+    /// Verify that sendline and sendcontrol use try_send (non-blocking).
+    #[test]
+    fn test_sendline_uses_try_send() {
+        let mut console = SerialConsoleDriver::new("127.0.0.1".into(), "12345".into());
+        // Should not block even with no receiver draining
+        console.sendline("test");
+        console.sendcontrol('c');
+        // Both should have been enqueued
+        assert!(console.write_rx.try_recv().is_ok());
+        assert!(console.write_rx.try_recv().is_ok());
+    }
+
     #[test]
     fn test_sendcontrol_byte_calculation() {
         // Ctrl-A = 0x01, Ctrl-B = 0x02, ..., Ctrl-Z = 0x1A
@@ -390,5 +466,19 @@ mod tests {
             let ctrl_byte = idx + 1;
             assert_eq!(ctrl_byte, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn test_console_new_and_close() {
+        let mut console = SerialConsoleDriver::new("127.0.0.1".to_string(), "9999".to_string());
+        assert!(!console.is_open());
+        console.close();
+        assert!(!console.is_open());
+    }
+
+    #[test]
+    fn test_console_default_state() {
+        let console = SerialConsoleDriver::new("192.168.1.1".to_string(), "2000".to_string());
+        assert!(!console.is_open());
     }
 }

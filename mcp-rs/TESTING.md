@@ -5,19 +5,19 @@
 ### 1. 部署
 ```bash
 cd mcp-rs && cargo build --release
-cp target/release/embedded-debug-mcp ~/.local/bin/
+cp target/release/debug-console-mcp ~/.local/bin/
 ```
 
 ### 2. 启动
 ```bash
 cd ~/project-with-target-conf
-nohup ~/.local/bin/embedded-debug-mcp --http > /dev/null 2>&1 &
+nohup ~/.local/bin/debug-console-mcp --http > /dev/null 2>&1 &
 ```
 
 ### 3. 冒烟检查 (每次修改代码后必做)
 ```bash
 # 3a. 进程存活
-pgrep embedded-debug-mcp
+pgrep debug-console-mcp
 
 # 3b. 健康检查
 curl -s http://localhost:3000/health  # → OK
@@ -91,8 +91,8 @@ watch -n 0.5 cat .dut-serial/target-state
 
 ### 实时日志 ✅
 ```bash
-# serial.current.log 实时写入所有串口数据
-tail -f .dut-serial/logs/serial.current.log
+# current.serial.log 实时写入所有串口数据
+tail -f .dut-serial/logs/current.serial.log
 # 预期: DDR init → SPL → U-Boot → kernel → shell, 完整启动日志
 # 结果: 332KB 完整日志, 实时更新 ✅
 ```

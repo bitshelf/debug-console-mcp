@@ -1,26 +1,105 @@
-//! State manager — 滞后防抖 + 原子写状态文件 + 三层状态空间。
+//! State manager — hysteresis-debounced finite state machine with three-tier
+//! visibility (internal → MCP API → statusline file).
 //!
-//! 三层:
-//! - 内部: stopped, connecting, active, booting, booted, uboot, crashed, DUT-off, disconnected
-//! - MCP API: 过滤后外露 (排除 stopped/connecting)
-//! - statusline 文件: 写入 7 种外部状态; stopped → 保留文件; connecting → 不写
+//! # State diagram
+//!
+//! ```text
+//!                    ┌──────────┐
+//!                    │  Stopped │  (internal — engine not started)
+//!                    └────┬─────┘
+//!                         │ start()
+//!                    ┌────▼─────┐
+//!                    │Connecting│  (internal — TCP handshake in progress)
+//!                    └────┬─────┘
+//!                    ┌────┴──────────────┐
+//!                    │                   │
+//!               ┌────▼─────┐       ┌─────▼──────┐
+//!               │  Active  │◄──────│Disconnected │  ✗ visible
+//!               └──┬───┬───┘       └─────┬──────┘
+//!                  │   │                 │
+//!      ┌───────────┘   └──────────┐      │
+//!      │              reconnect() │      │ read error /
+//!      │                          │      │ connect fail
+//! ┌────▼─────┐               ┌────▼─────┐
+//! │ Booting  │──────────────►│  UBoot   │  ◐/● visible
+//! └────┬─────┘               └────┬─────┘
+//!      │                          │
+//!      │ kernel panic             │ Ctrl-C interrupt
+//! ┌────▼─────┐                    │
+//! │ Crashed  │◄───────────────────┘  ✗ visible
+//! └────┬─────┘
+//!      │ (watchdog reboot)
+//!      └──────► Booting → ...
+//!
+//! ┌──────────┐
+//! │  DUT-off │  ✗ visible  (heartbeat timeout / no probe response)
+//! └────┬─────┘
+//!      │ (data arrives) → Active
+//!      │ (read error)   → Disconnected
+//!
+//! ┌──────────┐
+//! │  Dutabo  │  ● visible  (serial taken over by dutabo CLI)
+//! └──────────┘
+//!      │ (dutabo exits) → reconnect → probe → Active
+//! ```
+//!
+//! # Event sources and transitions
+//!
+//! | Event | Source | Old → New |
+//! |-------|--------|-----------|
+//! | TCP connect OK + probe finds shell/login | `probe_initial_state()` | any → Active |
+//! | SPL/DDR detected | `BootStageDetector::feed()` | any → Booting |
+//! | U-Boot prompt detected | `BootStageDetector::feed()` | Booting → UBoot |
+//! | Kernel panic / BUG / Oops | `BootStageDetector::feed()` | any → Crashed |
+//! | Heartbeat timeout (60s + 3× hysteresis) | `check_hang()` | Active/Booting → DUT-off |
+//! | Blank-line probe returned data | `read_loop_iter()` | DUT-off → Active |
+//! | TCP read error ("Connection closed") | `handle_read_error()` | any → Disconnected |
+//! | TCP connect fails (backoff retry) | `read_loop_iter()` | Disconnected → Disconnected |
+//! | TCP connect succeeds after backoff | `read_loop_iter()` | Disconnected → *probed* |
+//! | dutabo sentinel file created | `read_loop_iter()` | any → Dutabo |
+//! | dutabo sentinel removed | `read_loop_iter()` | Dutabo → *reconnected* |
+//!
+//! # Hysteresis / debounce
+//!
+//! - **Hang detection** (`check_hang`): state must be in hang-candidate set
+//!   (Active, Booting, Dutabo). `hang_count` increments each 2s watchdog tick
+//!   with no data. Must reach `hysteresis` (default 3 → 6s) before DUT-off.
+//! - **Heartbeat probes**: Active state with no data for `hang_timeout` (60s)
+//!   triggers a blank-line probe. If no response within 5s, `heartbeat_missed++`.
+//!   After `hysteresis` misses → DUT-off.
+//! - **Crash throttle**: crash events within 2s of each other are suppressed
+//!   (a single panic often produces multiple log lines matching crash patterns).
+//!
+//! # Visibility tiers
+//!
+//! | Tier | States visible | Consumers |
+//! |------|---------------|-----------|
+//! | Internal | All 10 states | `serial_engine.rs` logic |
+//! | MCP API | 7 states (excl. Stopped, Connecting, Booted) | `serial_get_state` tool |
+//! | Statusline | 6 states (excl. Stopped, Connecting, Booted, Disconnected) | `statusline.py` hook |
+//!
+//! `Disconnected` writes the state file but **deletes** the statusline cache,
+//! so `serial_get_state` reports it but the user's terminal does not flicker.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// 目标板状态
+/// Target board state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum TargetState {
     Stopped,
+    #[allow(dead_code)]
     Connecting,
     Active,
     Booting,
+    #[allow(dead_code)]
     Booted,
     UBoot,
     Crashed,
     DutOff,
     Disconnected,
+    /// Serial is taken over by dutabo interactive session
+    Dutabo,
 }
 
 impl TargetState {
@@ -35,6 +114,7 @@ impl TargetState {
             Self::Crashed => "crashed",
             Self::DutOff => "DUT-off",
             Self::Disconnected => "disconnected",
+            Self::Dutabo => "dutabo",
         }
     }
 
@@ -50,47 +130,106 @@ impl TargetState {
             "crashed" => Self::Crashed,
             "DUT-off" => Self::DutOff,
             "disconnected" => Self::Disconnected,
+            "dutabo" => Self::Dutabo,
             _ => Self::Disconnected,
         }
     }
 
-    /// MCP API 可见的状态 (排除 stopped/connecting)
+    /// MCP-visible states (excludes stopped/connecting).
     pub fn is_external(&self) -> bool {
         !matches!(self, Self::Stopped | Self::Connecting)
     }
 
-    /// 挂死/心跳检测候选: booting + active
-    /// booting: 长时间无输出 → 判定 hang
-    /// active:  长时间无输出 → 发送心跳探针检测是否存活
+    /// Hang/heartbeat detection candidates: booting + active.
+    /// booting: long silence → hang
+    /// active:  long silence → send heartbeat probe to check liveness
     fn is_hang_candidate(&self) -> bool {
-        matches!(self, Self::Booting | Self::Active)
+        matches!(self, Self::Booting | Self::Active | Self::Dutabo)
     }
 }
 
+/// Write a file with restricted permissions (0600) to prevent other users
+/// from reading potentially sensitive target information.
+fn write_secure(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    std::fs::write(path, content)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path)?.permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(path, perms)?;
+    }
+    Ok(())
+}
+
+/// Manages target device state with hysteresis debounce, atomic file writes,
+/// hang/heartbeat detection, and three-tier state visibility (internal, MCP-API, statusline).
 pub struct StateManager {
     current: TargetState,
     state_file: PathBuf,
+    /// Project-local cache (fallback, read by Python hook)
+    cache_file: PathBuf,
+    /// /dev/shm cache — zero-syscall read by Python hook via `cat`
+    shm_cache_file: PathBuf,
+    /// Notification directory for Agent proactive alerts
+    notify_dir: PathBuf,
     hang_timeout_secs: u64,
     hysteresis: u32,
     hang_count: u32,
     last_data_time: Instant,
-    /// 心跳探针: active 状态无数据时设为 true，触发 serial_engine 发探针
+    /// Heartbeat probe: set to true when active state has no data, triggers
+    /// serial_engine to send a probe.
     pub heartbeat_pending: bool,
-    /// 上次发探针的时间 (用于给板子响应窗口)
+    /// Time of last probe sent (gives the board a response window).
     last_probe_time: Instant,
-    /// 探针无响应次数 (累计超过 hysteresis → DUT-off)
+    /// Number of consecutive probe misses (exceeds hysteresis → DUT-off).
     heartbeat_missed: u32,
+    /// DUT alias for per-DUT state file paths (empty = single DUT, uses root .dut-serial/).
+    dut_alias: String,
+    /// Project root directory (for constructing alias-specific state paths).
+    project_dir: PathBuf,
+    /// Metrics: total commands successfully executed.
+    command_count: u64,
+    /// Metrics: total command errors (timeout, disconnection).
+    error_count: u64,
+    /// Metrics: engine start timestamp.
+    start_time: Instant,
+    /// Metrics: command latencies in ms (circular buffer, max 1000 samples).
+    latencies_ms: Vec<u64>,
 }
 
 impl StateManager {
-    pub fn new(project_dir: &Path, hang_timeout: u64, hysteresis: u32, dut_dir: &str) -> Self {
+    pub fn new(
+        project_dir: &Path,
+        hang_timeout: u64,
+        hysteresis: u32,
+        dut_dir: &str,
+        dut_alias: &str,
+    ) -> Self {
         let dut_dir_path = project_dir.join(dut_dir);
         let state_file = dut_dir_path.join("target-state");
+        let cache_file = dut_dir_path.join("statusline-cache");
+        let notify_dir = dut_dir_path.join("notifications");
+
+        // /dev/shm cache: keyed by project path hash so multiple projects don't collide
+        let shm_dir = if std::path::Path::new("/dev/shm").is_dir() {
+            "/dev/shm"
+        } else {
+            "/tmp"
+        };
+        let project_hash = Self::project_hash(project_dir);
+        let shm_cache_file =
+            std::path::PathBuf::from(format!("{}/claude-status-{}", shm_dir, project_hash));
+
         std::fs::create_dir_all(&dut_dir_path).ok();
+        std::fs::create_dir_all(&notify_dir).ok();
 
         Self {
             current: TargetState::Stopped,
             state_file,
+            cache_file,
+            shm_cache_file,
+            notify_dir,
             hang_timeout_secs: hang_timeout,
             hysteresis,
             hang_count: 0,
@@ -98,20 +237,41 @@ impl StateManager {
             heartbeat_pending: false,
             last_probe_time: Instant::now(),
             heartbeat_missed: 0,
+            dut_alias: dut_alias.to_string(),
+            project_dir: project_dir.to_path_buf(),
+            command_count: 0,
+            error_count: 0,
+            start_time: Instant::now(),
+            latencies_ms: Vec::new(),
         }
     }
 
-    /// 写入 PID 文件 — 仅 lock 成功后调用
-    pub fn write_pid(&self, project_dir: &Path, dut_dir: &str) {
-        let pid_file = project_dir.join(dut_dir).join("mcp.pid");
-        std::fs::write(&pid_file, std::process::id().to_string()).ok();
+    /// Stable 8-char hex hash matching Python's get_session_id() (md5).
+    /// Both MCP and statusline hook use the same project_dir → same hash.
+    fn project_hash(project_dir: &Path) -> String {
+        use md5::{Digest, Md5};
+        let canonical = project_dir
+            .canonicalize()
+            .unwrap_or_else(|_| project_dir.to_path_buf());
+        let mut hasher = Md5::new();
+        hasher.update(canonical.to_string_lossy().as_bytes());
+        let digest = hasher.finalize();
+        format!("{:08x}", digest).chars().take(8).collect()
     }
 
+    /// Write PID file with restricted permissions (0600).
+    /// Call only after the project-level lock is acquired.
+    pub fn write_pid(&self, project_dir: &Path, dut_dir: &str) {
+        let pid_file = project_dir.join(dut_dir).join("mcp.pid");
+        let _ = write_secure(&pid_file, &std::process::id().to_string());
+    }
+
+    /// Return the current internal target state.
     pub fn current(&self) -> TargetState {
         self.current
     }
 
-    /// MCP API 返回的状态 (stopped/connecting → None)
+    /// MCP API state (stopped/connecting → None)
     pub fn external_state(&self) -> Option<TargetState> {
         if self.current.is_external() {
             Some(self.current)
@@ -120,46 +280,175 @@ impl StateManager {
         }
     }
 
+    /// Increment the successful command counter.
+    pub fn inc_command(&mut self) {
+        self.command_count += 1;
+    }
+
+    /// Increment the command error counter.
+    pub fn inc_error(&mut self) {
+        self.error_count += 1;
+    }
+
+    /// Engine uptime in seconds since start.
+    pub fn uptime_secs(&self) -> f64 {
+        self.start_time.elapsed().as_secs_f64()
+    }
+
+    /// Number of commands successfully executed.
+    pub fn command_count(&self) -> u64 {
+        self.command_count
+    }
+
+    /// Number of command errors (timeout, disconnection).
+    pub fn error_count(&self) -> u64 {
+        self.error_count
+    }
+
+    /// Record a command latency in milliseconds.
+    pub fn record_latency(&mut self, ms: u64) {
+        if self.latencies_ms.len() >= 1000 {
+            self.latencies_ms.remove(0);
+        }
+        self.latencies_ms.push(ms);
+    }
+
+    /// Compute p50/p95/p99 latency from recorded samples.
+    pub fn latency_percentiles(&self) -> (u64, u64, u64) {
+        if self.latencies_ms.is_empty() {
+            return (0, 0, 0);
+        }
+        let mut sorted = self.latencies_ms.clone();
+        sorted.sort_unstable();
+        let p50 = sorted[(sorted.len() - 1) * 50 / 100];
+        let p95 = sorted[(sorted.len() - 1) * 95 / 100];
+        let p99 = sorted[(sorted.len() - 1) * 99 / 100];
+        (p50, p95, p99)
+    }
+
+    /// Transition to a new target state. No-op if `new` is the same as current.
+    /// Writes state files atomically for external states; deletes files on Stopped;
+    /// skips file writes for Connecting (avoiding statusline flicker).
     pub fn transition(&mut self, new: TargetState) {
         if new == self.current {
             return;
         }
-        tracing::info!("StateManager: {} → {}", self.current.as_str(), new.as_str());
+        // Warn on suspicious transitions — don't block, the external world
+        // can produce unexpected state sequences (e.g. board watchdog reboot
+        // during a crash). These warnings help diagnose bugs in the detector.
+        let from = self.current;
+        match (from, new) {
+            // Crashed → Active without an intervening boot is suspicious.
+            (TargetState::Crashed, TargetState::Active) => {
+                tracing::warn!("Suspicious transition: crashed → active (no boot cycle detected)");
+            }
+            // Dutabo takeover should come from a connected state.
+            (TargetState::Disconnected, TargetState::Dutabo) => {
+                tracing::warn!("Suspicious transition: disconnected → dutabo");
+            }
+            _ => {}
+        }
+        tracing::info!("StateManager: {} → {}", from.as_str(), new.as_str());
         self.current = new;
 
         match new {
             TargetState::Stopped => {
-                // MCP Server 关闭 → 删除状态文件，statusline 不显示任何状态
                 self.delete_state_file();
-                tracing::info!("StateManager: deleted state file (server stopped)");
+                self.delete_cache_file();
+                self.delete_shm_cache();
             }
             TargetState::Connecting => {
-                // 不写文件，避免 statusline 闪烁
+                // Don't write file — avoid statusline flicker
             }
-            _ => {
-                self.atomic_write(new.as_str());
+            TargetState::Active
+            | TargetState::Booting
+            | TargetState::Booted
+            | TargetState::UBoot
+            | TargetState::Crashed
+            | TargetState::Disconnected
+            | TargetState::DutOff
+            | TargetState::Dutabo => {
+                self.atomic_write(&self.state_file, new.as_str());
+                // Also write to per-DUT alias directory when alias is configured
+                if !self.dut_alias.is_empty() {
+                    let alias_state_file = self
+                        .project_dir
+                        .join(".dut-serial")
+                        .join(&self.dut_alias)
+                        .join("target-state");
+                    self.atomic_write(&alias_state_file, new.as_str());
+                }
+                let text = self.format_statusline(new);
+                self.atomic_write(&self.cache_file, &text);
+                self.atomic_write(&self.shm_cache_file, &text);
+                // Also write per-DUT cache when alias is configured
+                if !self.dut_alias.is_empty() && self.dut_alias != "default" {
+                    let alias_cache = self
+                        .project_dir
+                        .join(".dut-serial")
+                        .join(&self.dut_alias)
+                        .join("statusline-cache");
+                    self.atomic_write(&alias_cache, &text);
+                }
+                // Write Agent notification for critical states
+                if matches!(
+                    new,
+                    TargetState::Crashed | TargetState::DutOff | TargetState::Disconnected
+                ) {
+                    self.write_notification(new);
+                }
             }
         }
     }
 
-    /// 每次收到串口数据时调用 — 重置挂死和心跳计数器
+    /// Produce an ANSI-formatted statusline string for a given target state.
+    /// Format a statusline string with ANSI color. Uses the DUT alias
+    /// from .target.toml if available, otherwise "serial".
+    pub(crate) fn format_statusline(&self, state: TargetState) -> String {
+        let label = if self.dut_alias.is_empty() || self.dut_alias == "default" {
+            "serial"
+        } else {
+            &self.dut_alias
+        };
+        Self::format_statusline_labeled(state, label)
+    }
+
+    /// Format statusline with explicit label (for testing, or when no
+    /// StateManager instance is available).
+    pub(crate) fn format_statusline_labeled(state: TargetState, label: &str) -> String {
+        match state {
+            TargetState::Active => format!("\x1b[32m● {}:active\x1b[0m", label),
+            TargetState::Booting => format!("\x1b[33m◐ {}:booting\x1b[0m", label),
+            TargetState::Booted => format!("\x1b[32m● {}:booted\x1b[0m", label),
+            TargetState::UBoot => format!("\x1b[36m● {}:uboot\x1b[0m", label),
+            TargetState::Crashed => format!("\x1b[31m✗ {}:crashed\x1b[0m", label),
+            TargetState::Disconnected => format!("\x1b[31m✗ {}:disconnected\x1b[0m", label),
+            TargetState::DutOff => format!("\x1b[31m✗ {}:DUT-off\x1b[0m", label),
+            TargetState::Dutabo => format!("\x1b[35m● {}:dutabo\x1b[0m", label),
+            TargetState::Stopped | TargetState::Connecting => String::new(),
+        }
+    }
+
+    /// Called on every serial data arrival — resets hang and heartbeat counters.
+    /// Also resets `last_probe_time` so the next heartbeat cycle starts fresh.
     pub fn on_activity(&mut self) {
         self.last_data_time = Instant::now();
+        self.last_probe_time = Instant::now();
         self.hang_count = 0;
         self.heartbeat_pending = false;
         self.heartbeat_missed = 0;
     }
 
-    /// 标记心跳探针已发送 (由 serial_engine 调用), 记录发送时间
+    /// Mark that a heartbeat probe was sent (called by serial_engine).
     pub fn mark_probe_sent(&mut self) {
         self.last_probe_time = Instant::now();
         self.heartbeat_pending = false;
     }
 
-    /// 检测挂死 / 心跳超时
-    /// booting: 长时间无输出 → hang_count++ → DUT-off
-    /// active:  长时间无输出 → 发换行探针 (不执行命令);
-    ///          探针后 5s 内无响应 → miss++ → DUT-off
+    /// Check for hang / heartbeat timeout.
+    /// booting: long silence → hang_count++ → DUT-off
+    /// active:  long silence → send newline probe (no command);
+    ///          if no response within 5s → miss++ → DUT-off
     pub fn check_hang(&mut self) {
         if !self.current.is_hang_candidate() {
             self.hang_count = 0;
@@ -169,26 +458,30 @@ impl StateManager {
         let data_elapsed = self.last_data_time.elapsed().as_secs_f64();
         if self.current == TargetState::Active {
             let probe_elapsed = self.last_probe_time.elapsed().as_secs_f64();
-            // 探针已发送且等待超过 5s 响应窗口
+            // Probe sent and no response within 5s window
             if probe_elapsed > 5.0 && data_elapsed > self.hang_timeout_secs as f64 {
                 self.heartbeat_missed += 1;
                 tracing::warn!(
                     "Heartbeat miss #{}: no data for {:.0}s, probe sent {:.0}s ago",
-                    self.heartbeat_missed, data_elapsed, probe_elapsed
+                    self.heartbeat_missed,
+                    data_elapsed,
+                    probe_elapsed
                 );
                 if self.heartbeat_missed >= self.hysteresis {
                     tracing::warn!("Heartbeat: {} misses → DUT-off", self.heartbeat_missed);
                     self.transition(TargetState::DutOff);
                 } else {
-                    // 再次请求发探针
+                    // Request another probe
                     self.heartbeat_pending = true;
                 }
-            } else if data_elapsed > self.hang_timeout_secs as f64 && probe_elapsed > self.hang_timeout_secs as f64 {
-                // 首次超时，请求发探针
+            } else if data_elapsed > self.hang_timeout_secs as f64
+                && probe_elapsed > self.hang_timeout_secs as f64
+            {
+                // First timeout — request a probe
                 self.heartbeat_pending = true;
             }
         } else {
-            // Booting 状态 — 无输出超时 → 判定为 hang
+            // Booting state — no output timeout → hang
             if data_elapsed > self.hang_timeout_secs as f64 {
                 self.hang_count += 1;
                 if self.hang_count >= self.hysteresis {
@@ -204,23 +497,88 @@ impl StateManager {
         self.last_data_time.elapsed()
     }
 
-    fn atomic_write(&self, state: &str) {
-        let tmp = self.state_file.with_extension("tmp");
-        if let Err(e) = std::fs::write(&tmp, state) {
+    /// Write a notification JSON file for Agent proactive alerts.
+    /// Notifications are written to `.dut-serial/notifications/<timestamp>-<state>.json`.
+    fn write_notification(&self, state: TargetState) {
+        let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        let fname = format!("{ts}-{}.json", state.as_str());
+        let path = self.notify_dir.join(&fname);
+
+        let alert = match state {
+            TargetState::Crashed => serde_json::json!({
+                "type": "target_alert",
+                "state": "crashed",
+                "severity": "critical",
+                "message": "Target has crashed (Kernel panic/BUG/Oops detected). Check serial logs for crash details.",
+                "suggested_action": "Use serial_get_logs with pattern='panic|BUG|Oops' to analyze the crash.",
+                "timestamp": chrono::Local::now().to_rfc3339(),
+            }),
+            TargetState::DutOff => serde_json::json!({
+                "type": "target_alert",
+                "state": "DUT-off",
+                "severity": "warning",
+                "message": "Target is not responding (no serial output). May be powered off or hung.",
+                "suggested_action": "Try serial_reset to reboot the target, or check power supply.",
+                "timestamp": chrono::Local::now().to_rfc3339(),
+            }),
+            TargetState::Disconnected => serde_json::json!({
+                "type": "target_alert",
+                "state": "disconnected",
+                "severity": "warning",
+                "message": "Serial connection lost. ser2net may be down or network issue.",
+                "suggested_action": "Check ser2net on dev host, or use serial_claim to reconnect.",
+                "timestamp": chrono::Local::now().to_rfc3339(),
+            }),
+            _ => return,
+        };
+
+        if let Err(e) = write_secure(
+            &path,
+            &serde_json::to_string_pretty(&alert).unwrap_or_default(),
+        ) {
+            tracing::error!("Failed to write notification {path:?}: {e}");
+        } else {
+            tracing::info!("Agent notification written: {fname}");
+            // Also append to a consolidated alert log
+            let alert_log = self.notify_dir.join("alerts.log");
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&alert_log)
+                .ok();
+            if let Some(ref mut file) = f {
+                use std::io::Write;
+                writeln!(
+                    file,
+                    "{}",
+                    serde_json::to_string(&alert).unwrap_or_default()
+                )
+                .ok();
+            }
+        }
+    }
+
+    fn atomic_write(&self, path: &Path, content: &str) {
+        let tmp = path.with_extension("tmp");
+        if let Err(e) = write_secure(&tmp, content) {
             tracing::error!("StateManager: write failed: {e}");
             return;
         }
-        if let Err(e) = std::fs::rename(&tmp, &self.state_file) {
+        if let Err(e) = std::fs::rename(&tmp, path) {
             tracing::error!("StateManager: rename failed: {e}");
         }
     }
 
     fn delete_state_file(&self) {
-        if self.state_file.exists() {
-            if let Err(e) = std::fs::remove_file(&self.state_file) {
-                tracing::error!("StateManager: delete failed: {e}");
-            }
-        }
+        let _ = std::fs::remove_file(&self.state_file);
+    }
+
+    fn delete_cache_file(&self) {
+        let _ = std::fs::remove_file(&self.cache_file);
+    }
+
+    fn delete_shm_cache(&self) {
+        let _ = std::fs::remove_file(&self.shm_cache_file);
     }
 }
 
@@ -231,7 +589,7 @@ mod tests {
 
     fn create_test_state_manager(hang_timeout: u64, hysteresis: u32) -> (StateManager, TempDir) {
         let tmp = TempDir::new().unwrap();
-        let sm = StateManager::new(tmp.path(), hang_timeout, hysteresis, ".dut-serial");
+        let sm = StateManager::new(tmp.path(), hang_timeout, hysteresis, ".dut-serial", "");
         (sm, tmp)
     }
 
@@ -347,7 +705,7 @@ mod tests {
     #[test]
     fn test_pid_file_write() {
         let tmp = TempDir::new().unwrap();
-        let sm = StateManager::new(tmp.path(), 60, 3, ".dut-serial");
+        let sm = StateManager::new(tmp.path(), 60, 3, ".dut-serial", "");
         // PID not written in new() anymore — only after lock
         let pid_file = tmp.path().join(".dut-serial/mcp.pid");
         assert!(!pid_file.exists());
@@ -383,13 +741,14 @@ mod tests {
     fn test_hang_candidate() {
         assert!(!TargetState::Stopped.is_hang_candidate());
         assert!(!TargetState::Connecting.is_hang_candidate());
-        assert!(TargetState::Active.is_hang_candidate());    // heartbeat probe
+        assert!(TargetState::Active.is_hang_candidate()); // heartbeat probe
         assert!(TargetState::Booting.is_hang_candidate());
         assert!(!TargetState::Booted.is_hang_candidate());
         assert!(!TargetState::UBoot.is_hang_candidate());
         assert!(!TargetState::Crashed.is_hang_candidate());
         assert!(!TargetState::DutOff.is_hang_candidate());
-        assert!(!TargetState::Disconnected.is_hang_candidate()); // network issue, not target hang
+        assert!(!TargetState::Disconnected.is_hang_candidate());
+        assert!(TargetState::Dutabo.is_hang_candidate()); // Dutabo: keep watchdog alive
     }
 
     #[test]
@@ -397,11 +756,59 @@ mod tests {
         let (sm, tmp) = create_test_state_manager(60, 3);
         let state_file = tmp.path().join(".dut-serial/target-state");
 
-        sm.atomic_write("test-state");
+        sm.atomic_write(&state_file, "test-state");
         assert_eq!(std::fs::read_to_string(&state_file).unwrap(), "test-state");
 
-        sm.atomic_write("another-state");
-        assert_eq!(std::fs::read_to_string(&state_file).unwrap(), "another-state");
+        sm.atomic_write(&state_file, "another-state");
+        assert_eq!(
+            std::fs::read_to_string(&state_file).unwrap(),
+            "another-state"
+        );
+    }
+
+    #[test]
+    fn test_statusline_cache_write() {
+        let (mut sm, tmp) = create_test_state_manager(60, 3);
+        let cache_file = tmp.path().join(".dut-serial/statusline-cache");
+        let shm_file = std::path::PathBuf::from(format!(
+            "/dev/shm/claude-status-{}",
+            StateManager::project_hash(tmp.path())
+        ));
+
+        sm.transition(TargetState::Active);
+        assert!(cache_file.exists());
+        let content = std::fs::read_to_string(&cache_file).unwrap();
+        assert!(content.contains("serial:active"));
+        // /dev/shm cache is only written if /dev/shm exists
+        if std::path::Path::new("/dev/shm").is_dir() {
+            assert!(shm_file.exists());
+            let shm_content = std::fs::read_to_string(&shm_file).unwrap();
+            assert!(shm_content.contains("serial:active"));
+        }
+
+        sm.transition(TargetState::DutOff);
+        let content = std::fs::read_to_string(&cache_file).unwrap();
+        assert!(content.contains("serial:DUT-off"));
+    }
+
+    #[test]
+    fn test_format_statusline_all_states_have_text() {
+        let (sm, _tmp) = create_test_state_manager(60, 3);
+        for state in &[
+            TargetState::Active,
+            TargetState::Booting,
+            TargetState::Booted,
+            TargetState::UBoot,
+            TargetState::Crashed,
+            TargetState::Disconnected,
+            TargetState::DutOff,
+        ] {
+            let text = sm.format_statusline(*state);
+            assert!(!text.is_empty(), "{:?} should have statusline text", state);
+        }
+        // Stopped/Connecting produce empty string (no display)
+        assert_eq!(sm.format_statusline(TargetState::Stopped), "");
+        assert_eq!(sm.format_statusline(TargetState::Connecting), "");
     }
 
     #[test]
@@ -425,5 +832,51 @@ mod tests {
         sm.transition(TargetState::Disconnected);
         assert_eq!(sm.current(), TargetState::Disconnected);
         assert_eq!(sm.external_state(), Some(TargetState::Disconnected));
+    }
+
+    #[test]
+    fn test_format_statusline_has_ansi_colors() {
+        let sm = StateManager::new(&std::env::temp_dir(), 60, 3, ".dut-serial", "test-board");
+        let text = sm.format_statusline(TargetState::Active);
+        assert!(
+            text.contains("\x1b[32m"),
+            "Active state must have green ANSI code, got: {:?}",
+            text
+        );
+        assert!(text.contains("\x1b[0m"), "Must have ANSI reset code");
+        assert!(
+            text.contains("test-board"),
+            "Must use DUT alias 'test-board'"
+        );
+
+        let crash = sm.format_statusline(TargetState::Crashed);
+        assert!(
+            crash.contains("\x1b[31m"),
+            "Crashed state must have red ANSI code"
+        );
+        assert!(crash.contains("\x1b[0m"), "Must have ANSI reset code");
+
+        let dutoff = sm.format_statusline(TargetState::DutOff);
+        assert!(
+            dutoff.contains("\x1b[31m"),
+            "DUT-off state must have red ANSI code"
+        );
+        assert!(dutoff.contains("\x1b[0m"), "Must have ANSI reset code");
+
+        // "default" alias should use "serial" as label (backward compat)
+        let sm_default = StateManager::new(&std::env::temp_dir(), 60, 3, ".dut-serial", "default");
+        let text2 = sm_default.format_statusline(TargetState::Active);
+        assert!(
+            text2.contains("serial"),
+            "Default alias must use 'serial' label"
+        );
+
+        // Empty alias should also use "serial"
+        let sm_empty = StateManager::new(&std::env::temp_dir(), 60, 3, ".dut-serial", "");
+        let text3 = sm_empty.format_statusline(TargetState::Active);
+        assert!(
+            text3.contains("serial"),
+            "Empty alias must use 'serial' label"
+        );
     }
 }

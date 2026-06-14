@@ -7,5 +7,8 @@ uv.lock
 /mcp-rs/.dut-serial/
 /.dut-serial/
 /.target.conf
+/.target.toml
 /.mcp.json
+/mcp-rs/Cargo.lock
 .target.conf
+.target.toml
