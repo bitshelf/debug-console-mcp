@@ -109,10 +109,20 @@ pub enum BootEvent {
     Stage(String),
 }
 
-/// 临时 watcher (用于 serial_wait_pattern)
+/// Temporary watcher (for `serial_wait_pattern`). Carries an optional
+/// `pattern_index` so a multi-pattern wait can report *which* pattern matched
+/// (mirrors labgrid's `expect([p1, p2, TIMEOUT])` return index).
 struct Watcher {
     pattern: Regex,
-    sender: tokio::sync::mpsc::UnboundedSender<String>,
+    pattern_index: usize,
+    sender: tokio::sync::mpsc::UnboundedSender<WatcherMatch>,
+}
+
+/// A watcher match result: which pattern index fired and the matching line.
+#[derive(Debug, Clone)]
+pub struct WatcherMatch {
+    pub pattern_index: usize,
+    pub line: String,
 }
 
 // ── StageLearner: 文本相似度自适应阶段匹配 ──
@@ -374,19 +384,58 @@ impl BootStageDetector {
         Ok(())
     }
 
-    /// 添加临时 watcher (用于 wait_pattern)
-    pub fn add_watcher(&mut self, pattern: &str, sender: tokio::sync::mpsc::UnboundedSender<String>) {
+    /// Add a temporary watcher (for `serial_wait_pattern`). Single pattern;
+    /// `pattern_index` is 0. Use `add_watcher_multi` to wait on several
+    /// patterns at once and learn which one matched.
+    pub fn add_watcher(&mut self, pattern: &str, sender: tokio::sync::mpsc::UnboundedSender<WatcherMatch>) {
         if let Ok(re) = Regex::new(pattern) {
-            self.watchers.push(Watcher { pattern: re, sender });
+            self.watchers.push(Watcher { pattern: re, pattern_index: 0, sender });
         }
     }
 
-    /// 移除匹配指定 pattern 的 watcher
+    /// Add a multi-pattern watcher (labgrid `expect([p1, p2, ...])` semantics).
+    /// Each pattern is compiled independently and tagged with its index in
+    /// `patterns`. When any pattern matches, the watcher fires once with
+    /// `WatcherMatch { pattern_index, line }` and is then removed.
+    /// Returns the list of indices that were actually registered (patterns
+    /// that failed to compile are skipped).
+    ///
+    /// Currently used by tests; kept as a public API for future
+    /// multi-pattern wait tools (e.g. `serial_wait_login` matching
+    /// login/password/incorrect in one call).
+    #[allow(dead_code)]
+    pub fn add_watcher_multi(
+        &mut self,
+        patterns: &[&str],
+        sender: tokio::sync::mpsc::UnboundedSender<WatcherMatch>,
+    ) -> Vec<usize> {
+        let mut registered = Vec::new();
+        for (i, pat) in patterns.iter().enumerate() {
+            if let Ok(re) = Regex::new(pat) {
+                self.watchers.push(Watcher {
+                    pattern: re,
+                    pattern_index: i,
+                    sender: sender.clone(),
+                });
+                registered.push(i);
+            }
+        }
+        registered
+    }
+
+    /// Remove watchers matching the given pattern string.
     pub fn remove_watcher_by_pattern(&mut self, pattern: &str) {
         if let Ok(re) = Regex::new(pattern) {
             let re_str = re.as_str().to_string();
             self.watchers.retain(|w| w.pattern.as_str() != re_str);
         }
+    }
+
+    /// Remove all watchers sharing the same sender (identified by the
+    /// sender's `same_channel` identity). Used to clean up a
+    /// multi-pattern watcher group in one call.
+    pub fn remove_watcher_group(&mut self, sample: &tokio::sync::mpsc::UnboundedSender<WatcherMatch>) {
+        self.watchers.retain(|w| !w.sender.same_channel(sample));
     }
 
     /// 输入数据，返回检测到的事件列表
@@ -584,12 +633,16 @@ impl BootStageDetector {
         let mut to_remove = Vec::new();
         for (i, watcher) in self.watchers.iter().enumerate() {
             if watcher.pattern.is_match(line.as_bytes()) {
-                if watcher.sender.send(line.to_string()).is_err() {
+                let m = WatcherMatch {
+                    pattern_index: watcher.pattern_index,
+                    line: line.to_string(),
+                };
+                if watcher.sender.send(m).is_err() {
                     to_remove.push(i);
                 }
             }
         }
-        // 移除已关闭的 watcher (receiver 已 drop)
+        // Remove watchers whose receiver has been dropped.
         for i in to_remove.into_iter().rev() {
             self.watchers.remove(i);
         }
@@ -833,7 +886,39 @@ mod tests {
 
         detector.feed(b"custom_marker_line\n");
         let received = rx.try_recv().unwrap();
-        assert!(received.contains("custom_marker_line"));
+        assert!(received.line.contains("custom_marker_line"));
+        assert_eq!(received.pattern_index, 0);
+    }
+
+    #[test]
+    fn test_watcher_multi_reports_index() {
+        let mut detector = BootStageDetector::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Register three patterns; the second should match.
+        let registered = detector.add_watcher_multi(
+            &["never_matches_xyz", "login:", "panic"],
+            tx.clone(),
+        );
+        assert_eq!(registered, vec![0, 1, 2]);
+
+        detector.feed(b"some login: prompt\n");
+        let received = rx.try_recv().unwrap();
+        assert_eq!(received.pattern_index, 1);
+        assert!(received.line.contains("login:"));
+    }
+
+    #[test]
+    fn test_watcher_group_cleanup() {
+        let mut detector = BootStageDetector::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        detector.add_watcher_multi(&["aaa", "bbb"], tx.clone());
+        // Cleanup by the sample sender should remove both.
+        detector.remove_watcher_group(&tx);
+
+        detector.feed(b"aaa\nbbb\n");
+        assert!(rx.try_recv().is_err(), "group cleanup should remove all watchers sharing the sender");
     }
 
     #[test]

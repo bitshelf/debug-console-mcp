@@ -30,10 +30,11 @@ def _is_valid_project_dir(d: Path) -> bool:
 
 
 def find_project_dir() -> Optional[str]:
-    """Find project root by walking up from CWD to find .target.conf.
+    """Find project root by walking up from CWD to find .target.toml or
+    .target.conf (TOML preferred).
 
     Only returns directories that pass _is_valid_project_dir() — a stray
-    .target.conf in /tmp (from a previous session) will be ignored.
+    config in /tmp (from a previous session) will be ignored.
     """
     if env := os.environ.get("TARGET_CONF"):
         p = Path(env)
@@ -43,8 +44,10 @@ def find_project_dir() -> Optional[str]:
                 return str(d)
     d = Path.cwd()
     while True:
-        if (d / ".target.conf").exists() and _is_valid_project_dir(d):
-            return str(d)
+        # Prefer TOML, fall back to shell conf (matches Rust config.rs).
+        for name in (".target.toml", ".target.conf"):
+            if (d / name).exists() and _is_valid_project_dir(d):
+                return str(d)
         parent = d.parent
         if parent == d:
             break

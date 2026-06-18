@@ -64,13 +64,35 @@ fn tool_definitions() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "wait_boot": {"type": "boolean", "default": true, "description": "Wait for boot to complete"},
+                    "failure_retry": {"type": "integer", "default": 3, "description": "Retry the reset+wait on timeout (lava RetryAction semantics)"},
+                    "failure_retry_interval": {"type": "number", "default": 1.0, "description": "Seconds between retries"},
                 },
             }),
         },
         ToolDef {
             name: "serial_enter_uboot",
-            description: "Force target into U-Boot interactive prompt via relay reset + Ctrl-C flood.",
-            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            description: "Force target into U-Boot interactive prompt via relay reset + continuous Ctrl-C flood. Works even with bootdelay=0. Retries up to failure_retry times on timeout.",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "failure_retry": {"type": "integer", "default": 3, "description": "Number of retry attempts on timeout"},
+                    "failure_retry_interval": {"type": "number", "default": 1.0, "description": "Seconds between retries"},
+                    "flood_duration_secs": {"type": "number", "default": 15.0, "description": "Total Ctrl-C flood duration (must cover SPL→U-Boot window, typically 3-8s)"},
+                    "flood_interval_ms": {"type": "integer", "default": 100, "description": "Interval between Ctrl-C bytes (100ms = 10 bytes/s, avoids UART FIFO overflow)"},
+                },
+            }),
+        },
+        ToolDef {
+            name: "serial_reboot_uboot",
+            description: "Soft reboot from Linux + continuous Ctrl-C flood to enter U-Boot prompt. Works even with bootdelay=0. Retries up to failure_retry times on timeout.",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "failure_retry": {"type": "integer", "default": 3, "description": "Number of retry attempts on timeout"},
+                    "failure_retry_interval": {"type": "number", "default": 1.0, "description": "Seconds between retries"},
+                    "flood_interval_ms": {"type": "integer", "default": 100, "description": "Interval between Ctrl-C bytes (100ms)"},
+                },
+            }),
         },
         ToolDef {
             name: "serial_enter_maskrom",
@@ -96,7 +118,7 @@ fn tool_definitions() -> Vec<ToolDef> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "description": "U-Boot command (e.g. 'version', 'help', 'reboot loader')"},
+                    "command": {"type": "string", "description": "U-Boot command (e.g. 'version', 'help', 'reboot loader', 'rockusb 0 mmc 0')"},
                     "timeout": {"type": "integer", "default": 15, "description": "Timeout in seconds"},
                 },
                 "required": ["command"],
@@ -461,31 +483,249 @@ impl McpServer {
             .cloned()
             .unwrap_or(Value::Null);
 
-        // serial_enter_uboot: 释放锁后 await prompt
+        // serial_enter_uboot: relay reset + continuous Ctrl-C flood, then
+        // await U-Boot prompt. Retries up to `failure_retry` times.
+        //
+        // CRITICAL: The flood must release the engine lock between bursts so
+        // the read loop can process U-Boot banners and trigger the watcher.
+        // The old code held the lock for the entire flood (1.6s), blocking
+        // the read loop — the watcher never fired even when U-Boot appeared.
+        //
+        // For bootdelay=0: SPL/BL31/OP-TEE don't read the serial port, so
+        // Ctrl-C chars accumulate in the UART FIFO. When U-Boot's abortboot()
+        // calls tstc(), even ONE pending Ctrl-C interrupts. We send 1 byte
+        // per 100ms for up to 15s, releasing the lock between each burst.
         if name == "serial_enter_uboot" {
-            let mut rx = {
-                let mut engine = self.engine.lock().await;
-                if !engine.relay.configured() {
+            let failure_retry = args.get("failure_retry").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
+            let failure_retry_interval =
+                args.get("failure_retry_interval").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            let flood_duration_secs =
+                args.get("flood_duration_secs").and_then(|v| v.as_f64()).unwrap_or(15.0);
+            let flood_interval_ms =
+                args.get("flood_interval_ms").and_then(|v| v.as_u64()).unwrap_or(100);
+
+            let mut last_error = String::new();
+            for attempt in 1..=failure_retry {
+                // Phase 1: relay reset + initial burst (holds lock ~1s).
+                let mut rx = {
+                    let mut engine = self.engine.lock().await;
+                    if !engine.relay.configured() {
+                        return serde_json::json!({
+                            "content": [{"type": "text", "text": "{\"success\": false, \"error\": \"No relay configured\"}"}]
+                        });
+                    }
+                    let rx = engine.queue_enter_uboot();
+                    engine.do_relay_reset_and_flood().await;
+                    rx
+                };
+
+                // Phase 2: continuous low-rate Ctrl-C flood, RELEASING the
+                // lock between each byte so the read loop can process
+                // U-Boot banners and trigger the watcher.
+                let flood_rounds = (flood_duration_secs * 1000.0 / flood_interval_ms as f64) as u64;
+                let mut matched: Option<Result<crate::boot_detector::WatcherMatch, ()>> = None;
+                for i in 0..flood_rounds {
+                    // Check if watcher already fired (non-blocking).
+                    match rx.try_recv() {
+                        Ok(m) => {
+                            matched = Some(Ok(m));
+                            break;
+                        }
+                        Err(_) => {} // Empty or closed — keep flooding
+                    }
+                    // Send one Ctrl-C, then release lock for the interval.
+                    {
+                        let mut engine = self.engine.lock().await;
+                        engine.flood_one().await;
+                    }
+                    // Release lock and let read loop process data.
+                    tokio::time::sleep(std::time::Duration::from_millis(flood_interval_ms)).await;
+                    if i % 50 == 0 {
+                        tracing::debug!("enter_uboot flood: {}/{} rounds", i, flood_rounds);
+                    }
+                }
+
+                // Phase 3: if watcher hasn't fired yet, wait a bit more
+                // (U-Boot may have appeared in the last interval).
+                if matched.is_none() {
+                    match tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv()).await {
+                        Ok(Some(m)) => matched = Some(Ok(m)),
+                        _ => matched = Some(Err(())),
+                    }
+                }
+
+                let result = {
+                    let mut engine = self.engine.lock().await;
+                    let pattern = r"=>|U-Boot[>#]";
+                    engine.detector.remove_watcher_by_pattern(pattern);
+                    match matched {
+                        Some(Ok(_m)) => {
+                            engine.state.transition(crate::state_manager::TargetState::UBoot);
+                            serde_json::json!({"success": true, "state_after": "uboot", "attempts": attempt})
+                        }
+                        _ => {
+                            last_error = "Timed out waiting for U-Boot prompt".to_string();
+                            serde_json::json!({
+                                "success": false,
+                                "state_after": engine.state.current().as_str(),
+                                "error": &last_error,
+                                "attempts": attempt,
+                            })
+                        }
+                    }
+                };
+                if result["success"].as_bool().unwrap_or(false) {
                     return serde_json::json!({
-                        "content": [{"type": "text", "text": "{\"success\": false, \"error\": \"No relay configured\"}"}]
+                        "content": [{"type": "text", "text": serde_json::to_string(&result).unwrap_or_default()}]
                     });
                 }
-                let rx = engine.queue_enter_uboot();
-                engine.do_relay_reset_and_flood().await;
-                rx
-            };
-            let matched = tokio::time::timeout(std::time::Duration::from_secs(20), rx.recv()).await;
+                if attempt < failure_retry {
+                    tokio::time::sleep(std::time::Duration::from_secs_f64(failure_retry_interval)).await;
+                }
+            }
+            let result = serde_json::json!({
+                "success": false,
+                "state_after": self.engine.lock().await.state.current().as_str(),
+                "error": format!("{last_error} after {failure_retry} attempts"),
+                "attempts": failure_retry,
+            });
+            return serde_json::json!({
+                "content": [{"type": "text", "text": serde_json::to_string(&result).unwrap_or_default()}]
+            });
+        }
+
+        // serial_reboot_uboot: soft reboot + continuous Ctrl-C flood to
+        // enter U-Boot. Retries up to `failure_retry` times.
+        //
+        // Same flood strategy as serial_enter_uboot: release lock between
+        // Ctrl-C bursts so read loop can process banners.
+        if name == "serial_reboot_uboot" {
+            let failure_retry = args.get("failure_retry").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
+            let failure_retry_interval =
+                args.get("failure_retry_interval").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            let flood_interval_ms =
+                args.get("flood_interval_ms").and_then(|v| v.as_u64()).unwrap_or(100);
+
+            let mut last_error = String::new();
+            for attempt in 1..=failure_retry {
+                // Phase 1: send reboot + set up SPL watcher, release lock.
+                let mut spl_rx = {
+                    let mut engine = self.engine.lock().await;
+                    engine.state.transition(crate::state_manager::TargetState::Booting);
+                    engine.console.sendline("reboot");
+                    engine.console.drain_writes().await;
+                    engine.logs.flush_boot_log();
+                    engine.logs.mark_boot_start();
+                    engine.detector.reset_cycle();
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                    engine.detector.add_watcher(r"U-Boot\s+SPL", tx);
+                    rx
+                };
+                // Phase 2: wait for SPL without lock.
+                let _spl_ok = tokio::time::timeout(std::time::Duration::from_secs(30), spl_rx.recv()).await;
+                // Phase 3: SPL detected → arm U-Boot watcher + start flood.
+                let mut uboot_rx = {
+                    let mut engine = self.engine.lock().await;
+                    engine.detector.remove_watcher_by_pattern(r"U-Boot\s+SPL");
+                    engine.queue_enter_uboot()
+                };
+
+                // Phase 4: continuous low-rate Ctrl-C flood, RELEASING the
+                // lock between bursts so read loop can process U-Boot banner
+                // and trigger the watcher. 1 byte per 100ms for 15 seconds.
+                let flood_rounds = 15000u64 / flood_interval_ms;
+                let mut matched: Option<Result<crate::boot_detector::WatcherMatch, ()>> = None;
+                for i in 0..flood_rounds {
+                    match uboot_rx.try_recv() {
+                        Ok(m) => {
+                            matched = Some(Ok(m));
+                            break;
+                        }
+                        Err(_) => {}
+                    }
+                    {
+                        let mut engine = self.engine.lock().await;
+                        engine.flood_one().await;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(flood_interval_ms)).await;
+                    if i % 50 == 0 {
+                        tracing::debug!("reboot_uboot flood: {}/{} rounds", i, flood_rounds);
+                    }
+                }
+
+                if matched.is_none() {
+                    match tokio::time::timeout(std::time::Duration::from_secs(3), uboot_rx.recv()).await {
+                        Ok(Some(m)) => matched = Some(Ok(m)),
+                        _ => matched = Some(Err(())),
+                    }
+                }
+
+                let result = {
+                    let mut engine = self.engine.lock().await;
+                    let pattern = r"=>|U-Boot[>#]";
+                    engine.detector.remove_watcher_by_pattern(pattern);
+                    match matched {
+                        Some(Ok(_m)) => {
+                            engine.state.transition(crate::state_manager::TargetState::UBoot);
+                            serde_json::json!({"success": true, "state_after": "uboot", "attempts": attempt})
+                        }
+                        _ => {
+                            last_error = "Timed out waiting for U-Boot prompt".to_string();
+                            serde_json::json!({
+                                "success": false,
+                                "state_after": engine.state.current().as_str(),
+                                "error": &last_error,
+                                "attempts": attempt,
+                            })
+                        }
+                    }
+                };
+                if result["success"].as_bool().unwrap_or(false) {
+                    return serde_json::json!({
+                        "content": [{"type": "text", "text": serde_json::to_string(&result).unwrap_or_default()}]
+                    });
+                }
+                if attempt < failure_retry {
+                    tokio::time::sleep(std::time::Duration::from_secs_f64(failure_retry_interval)).await;
+                }
+            }
+            let result = serde_json::json!({
+                "success": false,
+                "state_after": self.engine.lock().await.state.current().as_str(),
+                "error": format!("{last_error} after {failure_retry} attempts"),
+                "attempts": failure_retry,
+            });
+            return serde_json::json!({
+                "content": [{"type": "text", "text": serde_json::to_string(&result).unwrap_or_default()}]
+            });
+        }
+
+        // serial_wait_pattern: release lock, await watcher, avoid read-loop
+        // deadlock. Supports `probe_on_timeout` (lava `force_prompt_wait`):
+        // on timeout, send a newline to provoke a prompt and retry up to 6
+        // times at `timeout/10` each.
+        if name == "serial_wait_pattern" {
+            let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let timeout = args.get("timeout").and_then(|v| v.as_f64()).unwrap_or(60.0);
+            let send_ctrl_c = args.get("action").and_then(|v| v.as_str()).is_some_and(|a| a == "send_ctrl_c");
+            // Auto-enable probe for prompt-like patterns (cheap heuristic).
+            let probe_on_timeout = pattern.contains("login")
+                || pattern.contains("prompt")
+                || pattern.contains("=>")
+                || pattern.contains(r"\$")
+                || pattern.contains("#");
             let result = {
                 let mut engine = self.engine.lock().await;
-                // BUGFIX: always cleanup watcher to prevent memory leak
-                let pattern = r"=>|U-Boot[>#]";
-                engine.detector.remove_watcher_by_pattern(pattern);
-                if let Ok(Some(_line)) = matched {
-                    engine.state.transition(crate::state_manager::TargetState::UBoot);
-                    serde_json::json!({"success": true, "state_after": "uboot"})
-                } else {
-                    serde_json::json!({"success": false, "state_after": engine.state.current().as_str(), "error": "Timed out waiting for U-Boot prompt"})
-                }
+                engine
+                    .wait_pattern_internal_opts(&pattern, timeout, probe_on_timeout)
+                    .await
+            };
+            let result = if send_ctrl_c && result["matched"].as_bool().unwrap_or(false) {
+                let engine = self.engine.lock().await;
+                engine.console.sendcontrol('c');
+                serde_json::json!({"matched": true, "matched_line": null})
+            } else {
+                result
             };
             return serde_json::json!({
                 "content": [{"type": "text", "text": serde_json::to_string(&result).unwrap_or_default()}]
@@ -552,30 +792,18 @@ impl McpServer {
                     .get("wait_boot")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
-                engine.reset_target(wait_boot).await
+                let failure_retry = args
+                    .get("failure_retry")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(3) as usize;
+                let failure_retry_interval = args
+                    .get("failure_retry_interval")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(1.0);
+                engine.reset_target(wait_boot, failure_retry, failure_retry_interval).await
             }
             "serial_enter_maskrom" => engine.enter_maskrom().await,
-            "serial_wait_pattern" => {
-                let pattern = args
-                    .get("pattern")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let timeout = args
-                    .get("timeout")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(60.0);
-                let result = engine.wait_pattern(pattern, timeout).await;
-                // 处理 action: send_ctrl_c
-                if result["matched"].as_bool().unwrap_or(false)
-                    && args
-                        .get("action")
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|a| a == "send_ctrl_c")
-                {
-                    engine.console.sendcontrol('c');
-                }
-                result
-            }
+            // serial_wait_pattern moved to handle_call_tool (lock release)
             "serial_uboot_command" => {
                 let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
                 let timeout = args.get("timeout").and_then(|v| v.as_f64()).unwrap_or(15.0);
@@ -808,6 +1036,7 @@ mod tests {
             values,
             config_path: None,
             project_dir: Some(tmp.path().to_path_buf()),
+            format: crate::config::ConfigFormat::None,
         };
 
         crate::serial_engine::new_shared_engine(config)
@@ -864,7 +1093,7 @@ mod tests {
 
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 15, "Expected 15 MCP tools");
+        assert_eq!(tools.len(), 16, "Expected 16 MCP tools");
 
         // Check some tool names
         let tool_names: Vec<&str> = tools

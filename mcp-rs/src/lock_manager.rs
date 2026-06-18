@@ -1,8 +1,9 @@
-//! Host:port 互斥锁 — O_EXCL 原子创建，僵尸清理。
+//! Host:port mutual-exclusion lock — O_EXCL atomic creation + zombie cleanup.
 
 use std::path::Path;
 
-/// 检查项目级单例: 同一 project_dir/.dut-serial/mcp.pid 已有活跃进程则返回其 PID
+/// Check project-level singleton: if an active MCP process already holds
+/// `project_dir/.dut-serial/mcp.pid`, return its PID.
 pub fn check_project_singleton(project_dir: &Path, dut_dir: &str) -> Option<u32> {
     let pid_file = project_dir.join(dut_dir).join("mcp.pid");
     if !pid_file.exists() {
@@ -11,52 +12,61 @@ pub fn check_project_singleton(project_dir: &Path, dut_dir: &str) -> Option<u32>
     let content = std::fs::read_to_string(&pid_file).ok()?;
     let pid: u32 = content.trim().parse().ok()?;
     if process_alive(pid) {
-        // 验证是 embedded-debug-mcp 进程 (不是其他进程重用了 PID)
+        // Verify it's actually an embedded-debug-mcp process (not some other
+        // process that reused the PID).
         if let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
             if comm.contains("embedded-debug") {
                 return Some(pid);
             }
         }
     }
-    // 僵尸 PID 文件 → 清理
+    // Stale PID file → clean up.
     std::fs::remove_file(&pid_file).ok();
     None
 }
 
-/// 获取 host:target 的锁 (target 可以是端口号或设备路径)。
-/// 返回 `None` = 成功，`Some(pid)` = 冲突 PID。
+/// Acquire the lock for `host:target` (`target` may be a TCP port or device path).
+/// Returns `None` on success, `Some(pid)` if a conflict exists.
+///
+/// Uses a bounded retry loop (max 8 attempts) instead of unbounded recursion
+/// to prevent stack overflow under persistent races.
 pub fn acquire_lock(host: &str, target: &str, lock_dir: &str) -> Option<u32> {
     let lock_key = format!("{:x}", fnv1a_hash(&format!("{host}:{target}")))[..8].to_string();
-    let lock_dir = Path::new(lock_dir);
-    let lock_path = lock_dir.join(format!("{lock_key}.lock"));
+    let lock_dir_path = Path::new(lock_dir);
+    let lock_path = lock_dir_path.join(format!("{lock_key}.lock"));
 
-    std::fs::create_dir_all(lock_dir).ok();
+    std::fs::create_dir_all(lock_dir_path).ok();
 
-    // 检查已有锁
-    if lock_path.exists() {
-        if let Some(conflicting_pid) = check_existing_lock(&lock_path) {
-            return Some(conflicting_pid);
+    const MAX_RETRIES: usize = 8;
+    for _ in 0..MAX_RETRIES {
+        // Check existing lock.
+        if lock_path.exists() {
+            if let Some(conflicting_pid) = check_existing_lock(&lock_path) {
+                return Some(conflicting_pid);
+            }
+            // Stale lock → clean up.
+            std::fs::remove_file(&lock_path).ok();
         }
-        // 僵尸锁 → 清理
-        std::fs::remove_file(&lock_path).ok();
-    }
 
-    // O_EXCL 原子创建
-    match try_create_lock(&lock_path, host, target) {
-        Ok(()) => None,
-        Err(_) => {
-            // 竞态: 另一个进程抢先创建
-            if let Some(pid) = check_existing_lock(&lock_path) {
-                Some(pid)
-            } else {
+        // O_EXCL atomic creation.
+        match try_create_lock(&lock_path, host, target) {
+            Ok(()) => return None,
+            Err(_) => {
+                // Race: another process created the lock first.
+                if let Some(pid) = check_existing_lock(&lock_path) {
+                    return Some(pid);
+                }
+                // The winner disappeared between create and check — retry.
                 std::fs::remove_file(&lock_path).ok();
-                acquire_lock(host, target, lock_dir.to_str().unwrap_or("/tmp/embedded-debug/locks"))
+                continue;
             }
         }
     }
+    // Exhausted retries — report a conflict with our own PID as a fallback.
+    Some(std::process::id())
 }
 
-/// 释放 host:target 锁
+/// Release the lock for `host:target`.
 pub fn release_lock(host: &str, target: &str, lock_dir: &str) {
     let lock_key = format!("{:x}", fnv1a_hash(&format!("{host}:{target}")))[..8].to_string();
     let lock_path = Path::new(lock_dir).join(format!("{lock_key}.lock"));
@@ -74,16 +84,33 @@ fn check_existing_lock(lock_path: &Path) -> Option<u32> {
     }
 }
 
-// Minimal libc kill binding — avoid nix dependency for one syscall.
-unsafe extern "C" {
+// Minimal libc bindings — avoid a `nix`/`libc` dependency for two syscalls.
+// `C-unwind` is used so an unwind across the FFI boundary is safe under
+// Rust 2024 edition (per Cargo.toml).
+unsafe extern "C-unwind" {
     fn kill(pid: i32, sig: i32) -> i32;
+    fn __errno_location() -> *mut i32;
 }
 
+/// Check whether a process is alive.
+///
+/// `kill(pid, 0)` returns 0 if the process exists AND the caller has
+/// permission to signal it. If the process exists but the caller lacks
+/// permission, `errno` is set to `EPERM` (= 1 on Linux) and `kill` returns
+/// -1 — the process is still alive. We treat both cases as alive to avoid
+/// mistaking another user's process for a zombie and deleting its lock (which
+/// would defeat mutual exclusion).
 fn process_alive(pid: u32) -> bool {
-    // kill(pid, 0) 检查进程是否存在
-    // SAFETY: kill(2) with sig=0 is a standard process existence check on Unix
+    // SAFETY: kill(2) with sig=0 is a standard existence check on Unix.
     let ret = unsafe { kill(pid as i32, 0) };
-    ret == 0
+    if ret == 0 {
+        return true;
+    }
+    // Check errno for EPERM (process exists, permission denied).
+    // SAFETY: __errno_location returns a pointer to a thread-local int; reading
+    // it is safe in a single-threaded context here.
+    let errno = unsafe { *__errno_location() };
+    errno == 1 // EPERM on Linux
 }
 
 fn try_create_lock(lock_path: &Path, host: &str, target: &str) -> Result<(), ()> {
@@ -106,7 +133,8 @@ fn try_create_lock(lock_path: &Path, host: &str, target: &str) -> Result<(), ()>
 }
 
 /// FNV-1a 64-bit hash — fast non-cryptographic hash for lock key uniqueness.
-/// host:port space is small (hundreds), collision probability is negligible.
+/// The `host:port` space is small (hundreds), so collision probability is
+/// negligible.
 fn fnv1a_hash(input: &str) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
     for byte in input.as_bytes() {
@@ -129,7 +157,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "embedded-debug-test-{}-{}", std::process::id(), id
         ));
-        // 清理旧目录
+        // Clean up any old directory.
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -258,5 +286,22 @@ mod tests {
 
         // Very high PID should not be alive
         assert!(!process_alive(999999999));
+    }
+
+    #[test]
+    fn test_acquire_lock_respects_custom_dir() {
+        // Regression: the old recursive code changed lock_dir on retry. Verify
+        // the lock is created in the specified directory.
+        let dir = temp_lock_dir();
+        let dir_str = dir.to_str().unwrap();
+        assert!(acquire_lock("10.0.0.5", "7000", dir_str).is_none());
+
+        // The lock file must be in `dir`, not in /tmp/embedded-debug/locks.
+        let lock_key = format!("{:x}", fnv1a_hash("10.0.0.5:7000"))[..8].to_string();
+        let lock_path = dir.join(format!("{lock_key}.lock"));
+        assert!(lock_path.exists(), "lock should be in custom dir, not default");
+
+        release_lock("10.0.0.5", "7000", dir_str);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

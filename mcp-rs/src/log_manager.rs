@@ -1,10 +1,16 @@
-//! Log manager — per-power-cycle 日志切割，存于 .dut-serial/logs/。
+//! Log manager — per-power-cycle log rotation, stored in `.dut-serial/logs/`.
 //!
-//! 一次上电→掉电 = 一个 boot-NNN.log。
+//! One power-on → power-off cycle = one `boot-NNN.log` archive file.
+//! `serial.current.log` is always a **regular file** holding the current cycle's
+//! data; `boot-NNN.log` files are standalone archives created on boot boundaries.
+//! No symlinks are used (symlinks caused a truncation bug when `start_new_cycle`
+//! opened `serial.current.log` with `O_TRUNC`, which followed the symlink and
+//! erased the just-flushed archive).
 
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 pub struct LogManager {
     log_dir: PathBuf,
@@ -13,14 +19,15 @@ pub struct LogManager {
     max_file_size: u64,
     current_file: Option<fs::File>,
     current_path: Option<PathBuf>,
-    /// serial.full.log: 全量连续日志 (从不截断)
+    /// `serial.full.log`: continuous full log (never truncated).
     full_file: Option<fs::File>,
     boot_number: u32,
-    /// 内存环形缓冲 — 板子运行时数据暂存于此, 检测到启动后落盘
+    /// In-memory ring buffer — board data is buffered here while running;
+    /// flushed to a numbered boot file when a new boot cycle is detected.
     pub ring_buffer: Vec<u8>,
-    /// 当前启动序列在 ring_buffer 中的起始位置
+    /// Start offset of the current boot sequence within `ring_buffer`.
     boot_start_pos: usize,
-    /// ring_buffer 最大容量 (默认 2MB)
+    /// Ring buffer max capacity (default 2 MB).
     max_buffer_size: usize,
 }
 
@@ -40,7 +47,7 @@ impl LogManager {
             boot_number: 0,
             ring_buffer: Vec::new(),
             boot_start_pos: 0,
-            max_buffer_size: 2 * 1024 * 1024, // 2MB
+            max_buffer_size: 2 * 1024 * 1024, // 2 MB
         }
     }
 
@@ -64,8 +71,13 @@ impl LogManager {
         n
     }
 
-    /// 打开当前周期日志文件
-    #[allow(dead_code)]
+    /// Open the current cycle log file (test helper).
+    ///
+    /// Creates a numbered `boot-NNN.log` and points `current_path` at it.
+    /// Production code uses `ensure_current_file` + `mark_boot_start` instead.
+    /// Kept as a public test helper because several test modules across the
+    /// crate rely on it to set up a known boot-cycle state quickly.
+    #[cfg(test)]
     pub fn open_current(&mut self) {
         let n = self.next_boot_number();
         fs::create_dir_all(&self.log_dir).ok();
@@ -84,12 +96,6 @@ impl LogManager {
                 file.write_all(header.as_bytes()).ok();
                 self.current_file = Some(file);
                 self.current_path = Some(path);
-
-                // 更新符号链接 serial.current.log → 当前日志
-                let link = self.log_dir.join("serial.current.log");
-                std::fs::remove_file(&link).ok();
-                #[cfg(unix)]
-                std::os::unix::fs::symlink(&fname, &link).ok();
             }
             Err(e) => {
                 tracing::error!("Failed to open log file {path:?}: {e}");
@@ -97,38 +103,39 @@ impl LogManager {
         }
     }
 
-    /// 追加原始串口数据: 写入 serial.current.log + serial.full.log + 内存缓冲
+    /// Append raw serial data: writes to `serial.current.log` +
+    /// `serial.full.log` + the in-memory ring buffer.
     pub fn write(&mut self, data: &[u8]) {
         if self.current_file.is_none() {
             self.ensure_current_file();
         }
         let clean = strip_ansi_and_null(data);
-        // serial.current.log (当前启动周期)
+        // serial.current.log (current boot cycle)
         if let Some(ref mut file) = self.current_file {
             if !clean.is_empty() {
                 file.write_all(&clean).ok();
             }
         }
-        // serial.full.log (全量连续, 从不截断)
+        // serial.full.log (continuous, never truncated)
         if let Some(ref mut file) = self.full_file {
             if !clean.is_empty() {
                 file.write_all(&clean).ok();
             }
         }
-        // 内存环形缓冲
+        // In-memory ring buffer
         self.ring_buffer.extend_from_slice(&clean);
         if self.ring_buffer.len() > self.max_buffer_size {
             let drain = self.ring_buffer.len() - self.max_buffer_size / 2;
             self.ring_buffer.drain(..drain);
             self.boot_start_pos = self.boot_start_pos.saturating_sub(drain);
         }
-        // 文件大小限制检查 → 超出则 rotate
+        // File size limit check → rotate if exceeded
         if self.max_file_size > 0 {
             if let Some(ref file) = self.current_file {
                 if let Ok(meta) = file.metadata() {
                     if meta.len() > self.max_file_size {
                         self.rotate();
-                        // 将当前数据写入新文件（rotate 已创建新文件）
+                        // Write current data into the new file (rotate already created it)
                         if let Some(ref mut f) = self.current_file {
                             f.write_all(&clean).ok();
                         }
@@ -138,19 +145,28 @@ impl LogManager {
         }
     }
 
-    /// 确保 serial.current.log + serial.full.log 已打开
+    /// Ensure `serial.current.log` + `serial.full.log` are open.
+    ///
+    /// If `serial.current.log` exists as a **symlink** (leftover from a
+    /// previous version that used symlinks), remove it and create a regular
+    /// file instead — this prevents append-mode writes from following the
+    /// symlink into an archive file.
     pub fn ensure_current_file(&mut self) {
         fs::create_dir_all(&self.log_dir).ok();
-        // serial.current.log (当前启动周期, flush_boot_log/open_current 管理 symlink)
+        // serial.current.log (current boot cycle, always a regular file)
         if self.current_file.is_none() {
             let path = self.log_dir.join("serial.current.log");
-            // 不删除 symlink: 由 flush_boot_log / open_current 统一管理
+            // If a symlink lingered from an older version, remove it so we
+            // don't append into an archive file via the symlink.
+            if path.is_symlink() {
+                fs::remove_file(&path).ok();
+            }
             match fs::OpenOptions::new().create(true).append(true).open(&path) {
                 Ok(file) => { self.current_file = Some(file); self.current_path = Some(path); }
                 Err(e) => tracing::error!("Failed to open serial.current.log: {e}"),
             }
         }
-        // serial.full.log (全量连续, 从不截断)
+        // serial.full.log (continuous, never truncated)
         if self.full_file.is_none() {
             let full = self.log_dir.join("serial.full.log");
             match fs::OpenOptions::new().create(true).append(true).open(&full) {
@@ -160,17 +176,24 @@ impl LogManager {
         }
     }
 
-    /// 标记新启动周期: 保存快照 → 截断 serial.current.log → 重置缓冲
+    /// Mark a new boot cycle: save snapshot → truncate
+    /// `serial.current.log` → reset ring buffer position.
     pub fn mark_boot_start(&mut self) {
         self.flush_boot_log();
         self.start_new_cycle();
     }
 
-    /// 结束当前周期，关闭旧文件，截断 serial.current.log，创建新 symlink
+    /// End the current cycle: close the old file handle, remove any existing
+    /// `serial.current.log` (symlink or regular), and create a fresh empty
+    /// regular file for the new cycle.
     fn start_new_cycle(&mut self) {
         self.current_file.take();
-        // Truncate serial.current.log so the new cycle starts fresh
         let path = self.log_dir.join("serial.current.log");
+        // Remove whatever is at `serial.current.log` (regular file or stale
+        // symlink) so that `OpenOptions::truncate` acts on a NEW regular file,
+        // NOT on a symlink target (which would erase a just-flushed archive).
+        fs::remove_file(&path).ok();
+        fs::create_dir_all(&self.log_dir).ok();
         self.current_file = fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -182,16 +205,16 @@ impl LogManager {
         self.boot_start_pos = self.ring_buffer.len();
     }
 
-    /// 将缓冲区内容保存为新启动日志文件
+    /// Flush the ring buffer contents to a new numbered boot log file.
     pub fn flush_boot_log(&mut self) {
         if self.boot_start_pos >= self.ring_buffer.len() {
-            return; // 无新数据
+            return; // No new data
         }
         let boot_data = self.ring_buffer[self.boot_start_pos..].to_vec();
         if boot_data.is_empty() {
             return;
         }
-        // 创建新日志文件
+        // Create a new archive file
         fs::create_dir_all(&self.log_dir).ok();
         let n = self.next_boot_number();
         let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
@@ -200,38 +223,29 @@ impl LogManager {
 
         if let Ok(mut file) = fs::OpenOptions::new().append(true).create(true).open(&path) {
             file.write_all(&boot_data).ok();
-            self.current_path = Some(path);
-            // 更新 symlink serial.current.log → 最新 boot 文件
-            let link = self.log_dir.join("serial.current.log");
-            std::fs::remove_file(&link).ok();
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(&fname, &link).ok();
             tracing::info!("Boot log saved: {} ({} bytes)", fname, boot_data.len());
         }
-        // 清理旧日志
+        // Clean up old logs
         self.cleanup_old_logs();
-        // 重置起点
+        // Reset the start position
         self.boot_start_pos = self.ring_buffer.len();
     }
 
-    /// 切割: flush buffer → 打开新日志 → 清理旧日志
-    /// 显式 rotate 始终创建新 boot 文件 + 更新 symlink（即使 ring buffer 为空）
+    /// Rotate: flush buffer → open a new log → clean up old logs.
+    /// An explicit `rotate` always creates a new boot file (even if the ring
+    /// buffer is empty).
     pub fn rotate(&mut self) {
         let had_data = self.boot_start_pos < self.ring_buffer.len();
         self.flush_boot_log();
         if !had_data {
-            // flush_boot_log 因无 ring buffer 数据而跳过 → 手动创建空 boot 文件 + symlink
+            // flush_boot_log skipped (no ring buffer data) → manually create
+            // an empty boot file so the cycle boundary is recorded.
             fs::create_dir_all(&self.log_dir).ok();
             let n = self.next_boot_number();
             let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
             let fname = format!("boot-{:03}_{ts}.log", n);
             let path = self.log_dir.join(&fname);
             fs::OpenOptions::new().create(true).append(true).open(&path).ok();
-            // 更新 symlink
-            let link = self.log_dir.join("serial.current.log");
-            std::fs::remove_file(&link).ok();
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(&fname, &link).ok();
         }
         self.start_new_cycle();
     }
@@ -241,7 +255,7 @@ impl LogManager {
         self.full_file.take();
     }
 
-    /// 列出所有归档启动日志 (最新在前)
+    /// List all archived boot logs (newest first).
     pub fn list_archives(&self) -> Vec<ArchiveInfo> {
         let mut logs = self.list_log_files();
         logs.sort_by(|a, b| b.path.cmp(&a.path));
@@ -251,12 +265,12 @@ impl LogManager {
                 index: i,
                 filename: p.name,
                 size_bytes: p.size,
-                path: p.path,
             })
             .collect()
     }
 
-    /// 读取指定归档日志
+    /// Read a specified archive log. Streams via `BufReader` to avoid loading
+    /// the entire file into memory at once (prevents OOM on large logs).
     pub fn read_log(&self, archive_index: usize, lines: usize, pattern: Option<&str>) -> LogContent {
         let logs = self.list_log_files_sorted();
         if archive_index >= logs.len() {
@@ -268,33 +282,49 @@ impl LogManager {
             };
         }
         let target = &logs[archive_index];
-        let content = fs::read_to_string(&target.path).unwrap_or_default();
-        let all_lines: Vec<&str> = content.lines().collect();
-        let total_lines = all_lines.len();
+        let filename = target.name.clone();
 
-        let filtered: Vec<&str> = if let Some(pat) = pattern {
-            if let Ok(re) = regex::RegexBuilder::new(pat)
-                .case_insensitive(true)
-                .build()
-            {
-                all_lines.into_iter().filter(|l| re.is_match(l)).collect()
-            } else {
-                all_lines
-            }
-        } else {
-            all_lines
+        let re = pattern.and_then(|pat| {
+            regex::RegexBuilder::new(pat).case_insensitive(true).build().ok()
+        });
+
+        // Stream the file line by line to avoid OOM on large files.
+        let file = match fs::File::open(&target.path) {
+            Ok(f) => f,
+            Err(_) => return LogContent {
+                content: String::new(),
+                filename,
+                total_lines: 0,
+                filtered_lines: 0,
+            },
         };
+        let reader = BufReader::new(file);
+
+        let mut total_lines: usize = 0;
+        let mut filtered: Vec<String> = Vec::new();
+
+        for line in reader.lines().map_while(Result::ok) {
+            total_lines += 1;
+            let matches = match &re {
+                Some(rx) => rx.is_match(&line),
+                None => true,
+            };
+            if matches {
+                filtered.push(line);
+            }
+        }
 
         let filtered_lines = filtered.len();
-        let result: Vec<&str> = if lines > 0 && filtered.len() > lines {
-            filtered[filtered.len() - lines..].to_vec()
+        // Keep only the last `lines` entries if a limit is set.
+        let result: Vec<String> = if lines > 0 && filtered.len() > lines {
+            filtered.split_off(filtered.len() - lines)
         } else {
             filtered
         };
 
         LogContent {
             content: result.join("\n"),
-            filename: target.name.clone(),
+            filename,
             total_lines,
             filtered_lines,
         }
@@ -304,14 +334,11 @@ impl LogManager {
 
     fn cleanup_old_logs(&self) {
         let mut logs = self.list_log_files();
-        // Sort by modification time, oldest first
-        logs.sort_by(|a, b| {
-            let ta = std::fs::metadata(&a.path).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
-            let tb = std::fs::metadata(&b.path).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
-            ta.cmp(&tb)
-        });
+        // Sort by filename (includes timestamp) for deterministic ordering.
+        logs.sort_by(|a, b| a.path.cmp(&b.path));
         if logs.len() > self.max_logs {
-            for old in &logs[..logs.len() - self.max_logs] {
+            let to_remove = logs.len() - self.max_logs;
+            for old in &logs[..to_remove] {
                 fs::remove_file(&old.path).ok();
                 tracing::debug!("Cleaned old log: {}", old.name);
             }
@@ -345,26 +372,29 @@ impl LogManager {
     }
 }
 
-/// 过滤 ANSI 转义码 + null 字节 + 其他控制字符（保留 \n \r \t）
+/// Strip ANSI escape codes + null bytes + other control chars (keep \n \r \t).
+/// The regex is compiled once and cached via `LazyLock`.
 fn strip_ansi_and_null(data: &[u8]) -> Vec<u8> {
-    let re_ansi = regex::bytes::Regex::new(r"(\x1b\[|\x9b)[0-?]*[ -/]*[@-~]|\x1b[>=]|\x1b[()][A-Z0-9]").unwrap();
+    static RE_ANSI: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+        regex::bytes::Regex::new(r"(\x1b\[|\x9b)[0-?]*[ -/]*[@-~]|\x1b[>=]|\x1b[()][A-Z0-9]").unwrap()
+    });
     let mut result = Vec::with_capacity(data.len());
     let mut i = 0;
     while i < data.len() {
         let b = data[i];
         if b == 0x00 {
-            // 跳过 null 字节
+            // Skip null bytes
             i += 1;
             continue;
         }
         if b == 0x1b || b == 0x9b {
-            // ANSI 序列起始终，用 regex 跳过整段
-            if let Some(m) = re_ansi.find(&data[i..]) {
+            // ANSI escape sequence start — skip the whole sequence via regex
+            if let Some(m) = RE_ANSI.find(&data[i..]) {
                 i += m.end();
                 continue;
             }
         }
-        // 保留可打印字符 + newline/cr/tab
+        // Keep printable chars + newline/cr/tab
         if b >= 0x20 || b == b'\n' || b == b'\r' || b == b'\t' {
             result.push(b);
         }
@@ -375,18 +405,15 @@ fn strip_ansi_and_null(data: &[u8]) -> Vec<u8> {
 
 struct LogFileInfo {
     name: String,
-    #[allow(dead_code)]
     size: u64,
     path: PathBuf,
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct ArchiveInfo {
     pub index: usize,
     pub filename: String,
     pub size_bytes: u64,
-    pub path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -410,16 +437,13 @@ mod tests {
 
     #[test]
     fn test_open_current_creates_file() {
-        let (mut lm, tmp) = create_test_log_manager(10, 100);
+        let (mut lm, _tmp) = create_test_log_manager(10, 100);
         lm.open_current();
 
         assert_eq!(lm.boot_number(), 1);
         assert!(lm.current_path().is_some());
         assert!(lm.current_path().unwrap().exists());
         assert_eq!(lm.current_path().unwrap().extension().unwrap(), "log");
-
-        let log_dir = tmp.path().join(".dut-serial/logs");
-        assert!(log_dir.join("serial.current.log").exists());
     }
 
     #[test]
@@ -482,9 +506,7 @@ mod tests {
         lm.write(b"boot 0\n");
 
         // Create 4 more logs via rotate (total 5)
-        // Need 1+ second delays to avoid timestamp collisions in filenames
         for i in 1..5 {
-            std::thread::sleep(std::time::Duration::from_secs(2));
             lm.rotate();
             lm.write(format!("boot {i}\n").as_bytes());
         }
@@ -508,9 +530,9 @@ mod tests {
         let archives = lm.list_archives();
         assert_eq!(archives.len(), 3);
 
-        // Should be ordered newest first (by path, which includes timestamp)
-        assert!(archives[0].path > archives[1].path);
-        assert!(archives[1].path > archives[2].path);
+        // Should be ordered newest first (by filename, which includes timestamp)
+        assert!(archives[0].filename > archives[1].filename);
+        assert!(archives[1].filename > archives[2].filename);
     }
 
     #[test]
@@ -555,15 +577,17 @@ mod tests {
     fn test_read_log_archive_index() {
         let (mut lm, _tmp) = create_test_log_manager(10, 100);
 
-        // Create boot 1
-        lm.open_current();
+        // Use the production path (ensure_current_file + write + rotate) so the
+        // archive semantics match real behavior: each rotate flushes the current
+        // cycle's ring buffer into a numbered boot-NNN.log archive.
+        lm.ensure_current_file();
         lm.write(b"boot 1 data\n");
+        lm.rotate(); // archives "boot 1 data" into boot-001
 
-        // Create boot 2
-        lm.rotate();
         lm.write(b"boot 2 data\n");
+        lm.rotate(); // archives "boot 2 data" into boot-002
 
-        // Read boot 2 (index 0)
+        // Read boot 2 (index 0 = newest)
         let result = lm.read_log(0, 100, None);
         assert!(result.content.contains("boot 2 data"));
 
@@ -574,21 +598,6 @@ mod tests {
         // Invalid index
         let result = lm.read_log(99, 100, None);
         assert_eq!(result.content, "");
-    }
-
-    #[test]
-    fn test_symlink_updated() {
-        let (mut lm, tmp) = create_test_log_manager(10, 100);
-
-        lm.open_current();
-        let link = tmp.path().join(".dut-serial/logs/serial.current.log");
-        assert!(link.is_symlink());
-
-        let target1 = fs::read_link(&link).unwrap();
-        lm.rotate();
-        let target2 = fs::read_link(&link).unwrap();
-
-        assert_ne!(target1, target2);
     }
 
     #[test]
@@ -626,7 +635,7 @@ mod tests {
 
     #[test]
     fn test_max_file_size_rotation() {
-        let (mut lm, _tmp) = create_test_log_manager(10, 0); // 0 MB → never rotate by size (no limit)
+        let (mut lm, _tmp) = create_test_log_manager(10, 0); // 0 MB → no size limit
 
         lm.open_current();
         let path1 = lm.current_path().unwrap().to_path_buf();
@@ -641,8 +650,8 @@ mod tests {
 
     // ── Smoke tests: boot log splitting ─────────────────────────────────
 
-    /// ensure_current_file() opens serial.current.log WITHOUT creating a
-    /// numbered boot-NNN.log.  Boot log files are only created on BootStart.
+    /// `ensure_current_file()` opens `serial.current.log` WITHOUT creating a
+    /// numbered `boot-NNN.log`.  Boot log files are only created on BootStart.
     #[test]
     fn test_ensure_current_file_no_numbered_log() {
         let (mut lm, tmp) = create_test_log_manager(10, 100);
@@ -650,8 +659,9 @@ mod tests {
 
         lm.ensure_current_file();
 
-        // serial.current.log should exist as a regular file
+        // serial.current.log should exist as a regular file (not a symlink)
         assert!(log_dir.join("serial.current.log").exists());
+        assert!(!log_dir.join("serial.current.log").is_symlink());
         // But no numbered boot-NNN.log should have been created
         let numbered: Vec<_> = std::fs::read_dir(&log_dir)
             .unwrap()
@@ -669,7 +679,7 @@ mod tests {
         );
     }
 
-    /// Only mark_boot_start() creates numbered boot logs.
+    /// Only `mark_boot_start()` creates numbered boot logs.
     #[test]
     fn test_mark_boot_start_creates_numbered_log() {
         let (mut lm, tmp) = create_test_log_manager(10, 100);
@@ -694,10 +704,44 @@ mod tests {
             })
             .collect();
         assert_eq!(numbered.len(), 1, "mark_boot_start should create exactly 1 boot log");
-        assert!(log_dir.join("serial.current.log").is_symlink());
+        // serial.current.log is a regular file (not a symlink)
+        assert!(!log_dir.join("serial.current.log").is_symlink());
     }
 
-    /// After mark_boot_start, new data goes to a fresh cycle (new current).
+    /// After `mark_boot_start`, the archived boot log retains its data (the
+    /// symlink-truncation regression test).
+    #[test]
+    fn test_mark_boot_start_preserves_archive_content() {
+        let (mut lm, tmp) = create_test_log_manager(10, 100);
+        let log_dir = tmp.path().join(".dut-serial/logs");
+
+        lm.ensure_current_file();
+        lm.write(b"boot 1 line A\n");
+        lm.write(b"boot 1 line B\n");
+
+        lm.mark_boot_start();
+
+        // The archived boot-NNN.log must NOT be empty (regression: symlink
+        // truncation used to erase it).
+        let numbered: Vec<_> = std::fs::read_dir(&log_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("boot-") && n.ends_with(".log"))
+            })
+            .collect();
+        assert_eq!(numbered.len(), 1);
+        let archive_content = fs::read_to_string(numbered[0].path()).unwrap();
+        assert!(
+            archive_content.contains("boot 1 line A"),
+            "archived boot log must preserve its data, got: {archive_content:?}"
+        );
+        assert!(archive_content.contains("boot 1 line B"));
+    }
+
+    /// After `mark_boot_start`, new data goes to a fresh cycle.
     #[test]
     fn test_mark_boot_start_resets_cycle() {
         let (mut lm, tmp) = create_test_log_manager(10, 100);
@@ -718,7 +762,8 @@ mod tests {
         assert!(!current.contains("boot 1 data")); // flushed to numbered log
     }
 
-    /// Double mark_boot_start with no data in between should not create empty logs.
+    /// Double `mark_boot_start` with no data in between should not create
+    /// empty logs.
     #[test]
     fn test_double_mark_boot_start_no_empty_logs() {
         let (mut lm, tmp) = create_test_log_manager(10, 100);

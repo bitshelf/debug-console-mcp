@@ -56,7 +56,8 @@ MASKROM_CHANNEL=1
 | `serial_get_logs` | 检索串口日志 (支持正则过滤) |
 | `serial_list_logs` | 列出所有归档启动日志 |
 | `serial_reset` | 硬件复位 + 日志切割 |
-| `serial_enter_uboot` | 强制进入 U-Boot 交互提示符 |
+| `serial_enter_uboot` | 强制进入 U-Boot 交互提示符 (retry up to failure_retry times) |
+| `serial_reboot_uboot` | 软重启 + Ctrl-C flood 进入 U-Boot (bootdelay=0 也有效) |
 | `serial_enter_maskrom` | 强制进入 Rockchip MASKROM 模式 |
 | `serial_wait_pattern` | 阻塞等待串口输出中出现指定模式 |
 | `serial_uboot_command` | 在 U-Boot 提示符下发送命令 |
@@ -139,10 +140,17 @@ serial_get_stages
 | `serde` | 1 | 序列化 |
 | `serde_json` | 1 | JSON-RPC 编解码 |
 | `regex` | 1 | boot stage / crash pattern / ANSI 清理 |
+| `toml` | 0.8 | TOML 配置解析 (.target.toml) |
+| `md-5` | 0.10 | 项目路径哈希 (statusline /dev/shm key) |
+| `inotify` | 0.11 | (removed: statusline-watch daemon deleted) |
 | `rand` | 0.8 | marker 生成 |
 | `chrono` | 0.4 | 时间戳格式化 |
 | `tracing` | 0.1 | 结构化日志 |
 | `tracing-subscriber` | 0.3 | 日志格式化 + env-filter |
+| `once_cell` | 1 | static lazy init (regex cache) |
+| `strsim` | 0.11 | StageLearner 文本相似度 (Sorensen-Dice) |
+| `axum` | 0.8 | Streamable HTTP transport |
+| `tower-http` | 0.6 | CORS middleware (HTTP transport) |
 
 ## 与 Python 版本的差异
 

@@ -35,7 +35,7 @@ cp .target.conf.example .target.conf
 vi .target.conf   # 设置 RK_DEV_HOST_IP, RK_SERIAL_PORT
 ```
 
-Claude Code 启动时，SessionStart hook 自动检测 `.target.conf`，生成 `.mcp.json` 并启动 Rust MCP Server (stdio transport)。
+Claude Code 启动时，SessionStart hook 自动检测 `.target.toml`（或 `.target.conf`）。在 **stdio 模式**下（默认），Claude Code 根据 `.mcp.json` 自动 spawn Rust MCP Server；在 **HTTP 模式**下，hook 启动 HTTP server 进程。
 
 ## 功能
 

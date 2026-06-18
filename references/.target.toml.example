@@ -1,0 +1,28 @@
+# Embedded Debug Target Configuration (TOML)
+# Copy to project root as .target.toml
+
+[dev_host]
+ip = "192.168.1.xxx"
+# user = "linaro"
+# pass = ""
+
+[serial]
+port = 2000          # ser2net TCP port on Dev Host
+
+[target]
+login_user = "root"
+login_pass = ""
+
+[uboot]
+# interrupt_char: "ctrl_c" for Rockchip, "2" for Allwinner, 0x03 for hex
+interrupt_char = "ctrl_c"
+interrupt_strategy = "aggressive"
+
+[relay]
+# port = 2001
+# reset_channel = 1
+# maskrom_channel = 2
+
+[monitor]
+hang_timeout = 60
+max_archived_logs = 10

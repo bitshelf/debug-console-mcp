@@ -31,8 +31,9 @@ CACHE_TTL = 10
 def _project_root() -> str:
     d = Path.cwd()
     while True:
-        if (d / ".target.conf").exists() and _is_valid_project_dir(d):
-            return str(d)
+        for name in (".target.toml", ".target.conf"):
+            if (d / name).exists() and _is_valid_project_dir(d):
+                return str(d)
         parent = d.parent
         if parent == d:
             break
@@ -77,14 +78,38 @@ def _refresh_git_cache_async() -> None:
     except FileExistsError:
         return
     try:
-        Popen(
-            ["bash", "-c",
-             f'cd "{os.getcwd()}" && '
-             f'BRANCH=$(git branch --show-current 2>/dev/null || git rev-parse --short HEAD 2>/dev/null || echo "?"); '
-             f'git diff --quiet 2>/dev/null && git diff --cached --quiet 2>/dev/null || BRANCH="$BRANCH*"; '
-             f'echo "$(date +%s) $BRANCH" > "{cache}" 2>/dev/null; '
-             f'rmdir "{lock_dir}" 2>/dev/null'],
-            stdout=DEVNULL, stderr=DEVNULL, start_new_session=True)
+        # Use subprocess with cwd and argument list — no shell injection.
+        # The script writes the result to the cache file atomically.
+        import subprocess
+        script = (
+            'BRANCH=$(git branch --show-current 2>/dev/null || git rev-parse --short HEAD 2>/dev/null || echo "?"); '
+            'git diff --quiet 2>/dev/null && git diff --cached --quiet 2>/dev/null || BRANCH="$BRANCH*"; '
+            'echo "$(date +%s) $BRANCH"'
+        )
+        proc = subprocess.Popen(
+            ["bash", "-c", script],
+            cwd=os.getcwd(),
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+        def _finish():
+            try:
+                out, _ = proc.communicate(timeout=5)
+                if out:
+                    with open(cache, "w") as f:
+                        f.write(out.decode().strip())
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+            finally:
+                try:
+                    os.rmdir(lock_dir)
+                except OSError:
+                    pass
+
+        # Run the finish in a thread so we don't block the hook.
+        import threading
+        threading.Thread(target=_finish, daemon=True).start()
     except OSError:
         try:
             os.rmdir(lock_dir)

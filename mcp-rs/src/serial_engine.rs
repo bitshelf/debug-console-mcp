@@ -32,6 +32,7 @@ pub struct SerialEngine {
     serial_target: String,
     login_user: String,
     login_pass: String,
+    pub interrupt_char: u8,
     /// poll_logs 的 file position tracking
     poll_position: u64,
 }
@@ -48,6 +49,7 @@ impl SerialEngine {
         // 提取所有需要的配置值（在 config 被 move 之前）
         let login_user = config.login_user();
         let login_pass = config.login_pass();
+        let interrupt_char = config.uboot_interrupt_char();
 
         Self {
             console: SerialConsoleDriver::new(host.clone(), serial_target.clone()),
@@ -79,6 +81,7 @@ impl SerialEngine {
             serial_target,
             login_user,
             login_pass,
+            interrupt_char,
             poll_position: 0,
         }
     }
@@ -539,63 +542,135 @@ impl SerialEngine {
         })
     }
 
-    pub async fn reset_target(&mut self, wait_boot: bool) -> serde_json::Value {
+    pub async fn reset_target(&mut self, wait_boot: bool, failure_retry: usize, failure_retry_interval: f64) -> serde_json::Value {
         if !self.relay.configured() {
             return serde_json::json!({"success": false, "error": "No relay configured"});
         }
-        // 立即切状态, 不等 relay 完成
+        // Immediate state transition (don't wait for relay).
         self.state.transition(TargetState::Booting);
         let ok = self.relay.reset().await;
-        if ok {
-            self.logs.flush_boot_log();
-            self.logs.mark_boot_start();
-            self.detector.reset_cycle();
-            if wait_boot {
-                let result = self.wait_pattern_internal("login:", 120.0).await;
+        if !ok {
+            return serde_json::json!({
+                "success": false,
+                "error": "relay reset failed",
+                "new_boot_number": self.logs.boot_number(),
+            });
+        }
+        self.logs.flush_boot_log();
+        self.logs.mark_boot_start();
+        self.detector.reset_cycle();
+
+        if !wait_boot {
+            return serde_json::json!({
+                "success": true,
+                "new_boot_number": self.logs.boot_number(),
+                "log_path": self.logs.current_path().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
+            });
+        }
+
+        // Wait for login: with force_prompt_wait (lava semantics). Retry the
+        // whole reset+wait up to `failure_retry` times on timeout.
+        let mut attempts = 0usize;
+        loop {
+            attempts += 1;
+            let result = self.wait_pattern_internal_opts("login:", 120.0, true).await;
+            if result["matched"].as_bool().unwrap_or(false) {
                 return serde_json::json!({
                     "success": true,
                     "new_boot_number": self.logs.boot_number(),
                     "log_path": self.logs.current_path().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
-                    "boot_complete": result["matched"],
+                    "boot_complete": true,
+                    "attempts": attempts,
                 });
             }
+            if attempts >= failure_retry {
+                return serde_json::json!({
+                    "success": true,
+                    "new_boot_number": self.logs.boot_number(),
+                    "log_path": self.logs.current_path().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
+                    "boot_complete": false,
+                    "attempts": attempts,
+                    "error": "login prompt not detected within timeout",
+                });
+            }
+            // Retry: re-assert relay reset and re-arm.
+            tracing::info!("reset_target retry {}/{}", attempts, failure_retry);
+            tokio::time::sleep(Duration::from_secs_f64(failure_retry_interval)).await;
+            self.state.transition(TargetState::Booting);
+            if self.relay.reset().await {
+                self.logs.flush_boot_log();
+                self.logs.mark_boot_start();
+                self.detector.reset_cycle();
+            }
         }
-        serde_json::json!({
-            "success": ok,
-            "new_boot_number": self.logs.boot_number(),
-            "log_path": self.logs.current_path().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
-        })
     }
 
-    /// 设置 enter_uboot 并返回 receiver (调用方 release lock 后 await)
-    pub fn queue_enter_uboot(&mut self) -> tokio::sync::mpsc::UnboundedReceiver<String> {
+    /// Set up the U-Boot prompt watcher and return a receiver (caller must
+    /// release the engine lock before awaiting).
+    pub fn queue_enter_uboot(&mut self) -> tokio::sync::mpsc::UnboundedReceiver<crate::boot_detector::WatcherMatch> {
         let pattern = r"=>|U-Boot[>#]".to_string();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         self.detector.add_watcher(&pattern, tx);
         rx
     }
 
-    /// 执行 relay reset + Ctrl-C flood (持有 lock, 快速完成)
+    /// Set up a single-pattern wait and return a receiver (caller must
+    /// release the engine lock before awaiting). Kept for tools that need
+    /// the lock-released await pattern (e.g. `serial_enter_uboot`).
+    #[allow(dead_code)]
+    pub fn queue_wait_pattern(&mut self, pattern: &str) -> tokio::sync::mpsc::UnboundedReceiver<crate::boot_detector::WatcherMatch> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.detector.add_watcher(pattern, tx);
+        rx
+    }
+
+    /// Relay reset + initial Ctrl-C burst (holds the lock, ~1 second).
+    ///
+    /// Only does the relay reset + a short pre-burst. The long continuous
+    /// flood is done by `continuous_flood` which releases the lock between
+    /// bursts so the read loop can process U-Boot banners and trigger
+    /// watchers.
+    ///
+    /// The key insight for bootdelay=0: SPL/BL31/OP-TEE don't read the
+    /// serial port, so Ctrl-C chars just sit in the UART FIFO. When
+    /// U-Boot's `abortboot()` finally calls `tstc()`, even ONE pending
+    /// Ctrl-C is enough to interrupt. We send 1 byte per 100ms (not
+    /// 100-byte floods) to avoid overflowing the 16-byte UART FIFO.
     pub async fn do_relay_reset_and_flood(&mut self) {
         self.state.transition(TargetState::Booting);
+        let ch = self.interrupt_char;
+
+        // Pre-reset burst: clear any pending input on the host side.
         if self.console.is_open() {
-            let flood: Vec<u8> = vec![0x03; 100];
-            self.console.write_raw(&flood).await;
+            let pre: Vec<u8> = vec![ch; 4];
+            self.console.write_raw(&pre).await;
         }
+
+        // Relay reset — board begins rebooting.
         self.relay.reset().await;
         self.logs.flush_boot_log();
         self.logs.mark_boot_start();
         self.detector.reset_cycle();
-        for _ in 0..8 {
+
+        // Short post-reset burst (the long flood is done separately).
+        for _ in 0..5 {
             if self.console.is_open() {
-                let flood: Vec<u8> = vec![0x03; 100];
-                self.console.write_raw(&flood).await;
+                self.console.write_raw(&[ch]).await;
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
-    /// 通过继电器 MASKROM 序列强制进入 Rockchip maskrom 模式
+    /// Send one Ctrl-C byte (called in a loop by the enter-uboot tool,
+    /// with the lock released between calls so the read loop can process
+    /// U-Boot banners and trigger watchers).
+    pub async fn flood_one(&mut self) {
+        if self.console.is_open() {
+            self.console.write_raw(&[self.interrupt_char]).await;
+        }
+    }
+
+    /// Force the target into Rockchip MASKROM mode via the relay sequence.
     pub async fn enter_maskrom(&mut self) -> serde_json::Value {
         if !self.relay.configured() {
             return serde_json::json!({"success": false, "error": "No relay configured"});
@@ -616,32 +691,83 @@ impl SerialEngine {
         })
     }
 
-    pub async fn wait_pattern(&mut self, pattern: &str, timeout: f64) -> serde_json::Value {
-        let result = self.wait_pattern_internal(pattern, timeout).await;
-        serde_json::json!({
-            "matched": result["matched"],
-            "matched_line": result["matched_line"],
-            "elapsed_seconds": 0,
-        })
+    /// Wait for a pattern (no probe-on-timeout). Convenience wrapper around
+    /// `wait_pattern_internal_opts` for callers that don't need the probe
+    /// behavior.
+    #[allow(dead_code)]
+    pub async fn wait_pattern_internal(&mut self, pattern: &str, timeout: f64) -> serde_json::Value {
+        self.wait_pattern_internal_opts(pattern, timeout, false).await
     }
 
-    async fn wait_pattern_internal(&mut self, pattern: &str, timeout: f64) -> serde_json::Value {
+    /// Wait for a pattern with optional `force_prompt_wait` semantics
+    /// (labgrid/lava: on timeout, send a newline to provoke a prompt and
+    /// retry up to `max_probes` times at `timeout/10` each).
+    ///
+    /// When `probe_on_timeout` is true and the wait times out, this sends
+    /// `"\n"` to the console and retries — useful for noisy consoles where
+    /// kernel logs overlap the prompt. Mirrors lava's `force_prompt_wait`
+    /// (shell.py:332) 6× `timeout/10` cadence.
+    pub async fn wait_pattern_internal_opts(
+        &mut self,
+        pattern: &str,
+        timeout: f64,
+        probe_on_timeout: bool,
+    ) -> serde_json::Value {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        self.detector.add_watcher(pattern, tx);
+        self.detector.add_watcher(pattern, tx.clone());
 
-        let result = tokio::time::timeout(Duration::from_secs_f64(timeout), rx.recv()).await;
+        let max_probes = if probe_on_timeout { 6usize } else { 0 };
+        let partial = if probe_on_timeout { timeout / 10.0 } else { timeout };
+        let mut elapsed = 0.0f64;
+        let mut probes = 0usize;
 
-        self.detector.remove_watcher_by_pattern(pattern);
+        loop {
+            let remaining = (timeout - elapsed).max(0.0);
+            let wait = partial.min(remaining);
+            let result = tokio::time::timeout(
+                Duration::from_secs_f64(wait),
+                rx.recv(),
+            )
+            .await;
 
-        match result {
-            Ok(Some(line)) => serde_json::json!({
-                "matched": true,
-                "matched_line": line,
-            }),
-            _ => serde_json::json!({
-                "matched": false,
-                "matched_line": null,
-            }),
+            match result {
+                Ok(Some(m)) => {
+                    self.detector.remove_watcher_group(&tx);
+                    return serde_json::json!({
+                        "matched": true,
+                        "matched_line": m.line,
+                        "pattern_index": m.pattern_index,
+                    });
+                }
+                Ok(None) => {
+                    self.detector.remove_watcher_group(&tx);
+                    return serde_json::json!({
+                        "matched": false,
+                        "matched_line": null,
+                    });
+                }
+                Err(_) => {
+                    elapsed += wait;
+                    if elapsed >= timeout || probes >= max_probes {
+                        self.detector.remove_watcher_group(&tx);
+                        return serde_json::json!({
+                            "matched": false,
+                            "matched_line": null,
+                            "probes_sent": probes,
+                        });
+                    }
+                    // Provoke a fresh prompt (lava force_prompt_wait).
+                    if self.console.is_open() {
+                        tracing::info!(
+                            "wait_pattern timeout {:.1}s, probing with newline (attempt {}/{})",
+                            elapsed, probes + 1, max_probes
+                        );
+                        self.console.sendline("");
+                        self.console.drain_writes().await;
+                    }
+                    probes += 1;
+                }
+            }
         }
     }
 
@@ -755,6 +881,7 @@ mod tests {
             values,
             config_path: None,
             project_dir: Some(project_dir.to_path_buf()),
+            format: crate::config::ConfigFormat::None,
         }
     }
 
@@ -888,7 +1015,7 @@ mod tests {
         let config = create_test_config(tmp.path());
         let mut engine = SerialEngine::new(config);
 
-        let result = engine.reset_target(false).await;
+        let result = engine.reset_target(false, 1, 1.0).await;
         assert_eq!(result["success"], false);
         assert_eq!(result["error"], "No relay configured");
     }
@@ -921,6 +1048,7 @@ mod tests {
             values,
             config_path: None,
             project_dir: Some(tmp.path().to_path_buf()),
+            format: crate::config::ConfigFormat::None,
         };
         let mut engine = SerialEngine::new(config);
 

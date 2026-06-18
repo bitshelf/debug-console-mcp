@@ -1,6 +1,6 @@
-//! Command queue — 串行化执行 + marker 响应路由。
+//! Command queue — serialized execution + marker response routing.
 //!
-//! 仿 labgrid UBootDriver._run() 的 marker echo 模式:
+//! Mirrors labgrid's `UBootDriver._run()` marker-echo pattern:
 //!   echo '{marker[:4]}''{marker[4:]}'; {cmd}; echo "$?"; echo '{marker[:4]}''{marker[4:]}'
 
 use std::collections::VecDeque;
@@ -10,7 +10,7 @@ use tokio::sync::oneshot;
 
 use crate::marker::gen_marker;
 
-/// ANSI escape codes 清理 (LazyLock 缓存编译)
+/// Strip ANSI escape codes (regex compiled once via `LazyLock`).
 fn strip_ansi(data: &[u8]) -> Vec<u8> {
     use std::sync::LazyLock;
     static RE_VT100: LazyLock<regex::Regex> = LazyLock::new(|| {
@@ -28,7 +28,7 @@ struct PendingCommand {
     begin_sent: bool,
     found_begin: bool,
     buffer: Vec<u8>,
-    /// 跨 chunk 搜索缓冲 (比 labgrid 的 before 缓冲)
+    /// Cross-chunk search buffer (cf. labgrid's `before` buffer).
     search_buf: Vec<u8>,
     sent_at: Instant,
 }
@@ -75,7 +75,7 @@ impl CommandQueue {
         self.write_fn = Some(f);
     }
 
-    /// 提交命令并返回 receiver 等待结果
+    /// Submit a command and return a receiver to await the result.
     pub fn execute(&mut self, command: String, timeout_secs: f64) -> oneshot::Receiver<CommandResult> {
         let (tx, rx) = oneshot::channel();
         let marker = gen_marker();
@@ -99,17 +99,18 @@ impl CommandQueue {
         rx
     }
 
-    /// 扫描串口数据流，寻找 begin/end marker 提取命令输出
+    /// Scan the serial data stream for begin/end markers and extract command output.
     pub fn feed_serial_data(&mut self, data: &[u8]) {
         let data = strip_ansi(data);
 
-        // 先检查超时
+        // Check timeout first — MUST dequeue_next() to avoid queue deadlock.
         if let Some(ref pc) = self.current {
             if pc.begin_sent && pc.sent_at.elapsed().as_secs_f64() > pc.timeout_secs {
                 if let Some(pc) = self.current.take() {
                     let output = String::from_utf8_lossy(&pc.buffer).to_string();
                     pc.resolve(output.trim().to_string(), true, None);
                 }
+                self.dequeue_next();
             }
         }
 
@@ -120,25 +121,25 @@ impl CommandQueue {
 
         let marker = pc.marker_bytes();
 
-        // 步骤 1: 还没找到 begin_marker — 累加跨 chunk 缓冲
+        // Step 1: begin_marker not yet found — accumulate cross-chunk search buffer.
         if !pc.found_begin {
             pc.search_buf.extend_from_slice(&data);
-            // 限制搜索缓冲大小，防止内存无限增长
+            // Cap the search buffer to prevent unbounded memory growth.
             if pc.search_buf.len() > 65536 {
                 let drain = pc.search_buf.len() - 32768;
                 pc.search_buf.drain(..drain);
             }
             if let Some(idx) = find_subsequence(&pc.search_buf, &marker) {
                 pc.found_begin = true;
-                // 提取 marker 之后的所有数据到 output buffer
+                // Copy everything after the marker into the output buffer.
                 pc.buffer = pc.search_buf[idx + marker.len()..].to_vec();
-                pc.search_buf.clear(); // 释放搜索缓冲
+                pc.search_buf.clear(); // release the search buffer
             } else {
                 return;
             }
         }
 
-        // 步骤 2: 已找到 begin_marker, 累加数据到 buffer 并扫描 end_marker
+        // Step 2: begin_marker found — append data to buffer and scan for end_marker.
         pc.buffer.extend_from_slice(&data);
         if pc.buffer.len() > 65536 {
             let drain = pc.buffer.len() - 32768;
@@ -151,19 +152,10 @@ impl CommandQueue {
                 .trim()
                 .to_string();
 
-            // 提取 exit code (最后一个 marker 之前, echo "$?" 输出那个数字)
-            let mut exit_code = None;
-            let mut clean_output = output.clone();
-            for line in output.lines().rev() {
-                let stripped = line.trim();
-                if let Ok(code) = stripped.parse::<i32>() {
-                    exit_code = Some(code);
-                    // 从 output 末尾移除 exit code 行 (保留前面所有内容)
-                    let end = output.rfind(stripped).unwrap_or(output.len());
-                    clean_output = output[..end].trim().to_string();
-                    break;
-                }
-            }
+            // Extract exit code: the LAST line before the end marker should be
+            // `echo "$?"` output (a single integer 0-255). Only parse the very
+            // last line, and only accept 0-255 to avoid misreading data lines.
+            let (clean_output, exit_code) = extract_exit_code(&output);
 
             let rest = pc.buffer[idx + marker.len()..].to_vec();
             if let Some(pc) = self.current.take() {
@@ -176,7 +168,8 @@ impl CommandQueue {
         }
     }
 
-    /// 检查当前命令是否超时 (由外部 read loop 定期调用)
+    /// Check whether the current command has timed out (called periodically by
+    /// the external read loop).
     pub fn check_timeouts(&mut self) {
         if let Some(ref pc) = self.current {
             if pc.begin_sent && pc.sent_at.elapsed().as_secs_f64() > pc.timeout_secs {
@@ -197,7 +190,7 @@ impl CommandQueue {
         );
 
         if let Some(ref write_fn) = self.write_fn {
-            pc.search_buf.clear(); // 清空旧缓冲，防止匹配前一个命令的 marker
+            pc.search_buf.clear(); // clear stale buffer to avoid matching a previous command's marker
             write_fn(line.as_bytes());
             pc.sent_at = Instant::now();
             pc.begin_sent = true;
@@ -215,9 +208,39 @@ impl CommandQueue {
     }
 }
 
-/// 在 haystack 中查找 needle 的首次出现位置
+/// Find the first occurrence of `needle` in `haystack`.
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0); // empty needle matches at position 0 (defensive)
+    }
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Extract the exit code from the last line of command output.
+///
+/// The shell command template ends with `echo "$?"`, so the very last line
+/// should be a single integer in 0-255. Only the **last** line is examined
+/// (not all lines in reverse) to avoid misreading data lines that happen to
+/// be integers (e.g. `wc -l` output). The value is constrained to 0-255
+/// (shell `$?` range) — negative or out-of-range values are ignored.
+///
+/// Returns `(output_without_exit_code_line, Some(code))` or `(original_output, None)`.
+fn extract_exit_code(output: &str) -> (String, Option<i32>) {
+    let trimmed = output.trim_end();
+    if let Some(last_line) = trimmed.lines().next_back() {
+        let stripped = last_line.trim();
+        // Only accept a bare integer in the 0-255 range (shell $? semantics).
+        if let Ok(code) = stripped.parse::<u32>() {
+            if code <= 255 {
+                let exit_code = code as i32;
+                // Remove the exit-code line from the output.
+                let end = trimmed.rfind(stripped).unwrap_or(trimmed.len());
+                let clean = trimmed[..end].trim_end().to_string();
+                return (clean, Some(exit_code));
+            }
+        }
+    }
+    (output.to_string(), None)
 }
 
 #[cfg(test)]
@@ -261,9 +284,54 @@ mod tests {
 
     #[test]
     fn test_find_subsequence_empty() {
-        // Empty needle is a special case - windows(0) would panic
-        // Our implementation doesn't handle it, so we skip this test
-        // assert_eq!(find_subsequence(b"hello", b""), Some(0));
+        // Empty needle matches at position 0 (defensive).
+        assert_eq!(find_subsequence(b"hello", b""), Some(0));
+        assert_eq!(find_subsequence(b"", b""), Some(0));
+    }
+
+    #[test]
+    fn test_extract_exit_code_valid() {
+        let (out, code) = extract_exit_code("line1\nline2\n0");
+        assert_eq!(code, Some(0));
+        assert_eq!(out, "line1\nline2");
+    }
+
+    #[test]
+    fn test_extract_exit_code_nonzero() {
+        let (out, code) = extract_exit_code("error msg\n127");
+        assert_eq!(code, Some(127));
+        assert_eq!(out, "error msg");
+    }
+
+    #[test]
+    fn test_extract_exit_code_no_code() {
+        let (out, code) = extract_exit_code("just output\nno number");
+        assert_eq!(code, None);
+        assert_eq!(out, "just output\nno number");
+    }
+
+    #[test]
+    fn test_extract_exit_code_out_of_range() {
+        // Values > 255 are not valid shell exit codes → ignored.
+        let (out, code) = extract_exit_code("data\n300");
+        assert_eq!(code, None);
+        assert_eq!(out, "data\n300");
+    }
+
+    #[test]
+    fn test_extract_exit_code_negative() {
+        // Negative values are not valid shell exit codes → ignored.
+        let (_out, code) = extract_exit_code("data\n-1");
+        assert_eq!(code, None);
+    }
+
+    #[test]
+    fn test_extract_exit_code_data_line_is_number() {
+        // A data line that is a number should NOT be misread as exit code
+        // because only the LAST line is examined.
+        let (out, code) = extract_exit_code("42\nactual output");
+        assert_eq!(code, None);
+        assert_eq!(out, "42\nactual output");
     }
 
     #[test]

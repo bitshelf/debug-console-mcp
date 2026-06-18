@@ -1,21 +1,23 @@
-//! State manager — 滞后防抖 + 原子写状态文件 + 三层状态空间。
+//! State manager — hysteresis debounce + atomic state file writes +
+//! three-tier state space.
 //!
-//! 三层:
-//! - 内部: stopped, connecting, active, booting, booted, uboot, crashed, DUT-off, disconnected
-//! - MCP API: 过滤后外露 (排除 stopped/connecting)
-//! - statusline 文件: 写入 7 种外部状态; stopped → 保留文件; connecting → 不写
+//! Three tiers:
+//! - Internal: stopped, connecting, active, booting, booted, uboot, crashed, DUT-off, disconnected
+//! - MCP API: filtered for external visibility (excludes stopped/connecting)
+//! - Statusline file: writes 7 external states; stopped → delete file; connecting → no write
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// 目标板状态
+/// Target board state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum TargetState {
     Stopped,
+    #[allow(dead_code)]
     Connecting,
     Active,
     Booting,
+    #[allow(dead_code)]
     Booted,
     UBoot,
     Crashed,
@@ -54,14 +56,14 @@ impl TargetState {
         }
     }
 
-    /// MCP API 可见的状态 (排除 stopped/connecting)
+    /// MCP-visible states (excludes stopped/connecting).
     pub fn is_external(&self) -> bool {
         !matches!(self, Self::Stopped | Self::Connecting)
     }
 
-    /// 挂死/心跳检测候选: booting + active
-    /// booting: 长时间无输出 → 判定 hang
-    /// active:  长时间无输出 → 发送心跳探针检测是否存活
+    /// Hang/heartbeat detection candidates: booting + active.
+    /// booting: long silence → hang
+    /// active:  long silence → send heartbeat probe to check liveness
     fn is_hang_candidate(&self) -> bool {
         matches!(self, Self::Booting | Self::Active)
     }
@@ -78,11 +80,12 @@ pub struct StateManager {
     hysteresis: u32,
     hang_count: u32,
     last_data_time: Instant,
-    /// 心跳探针: active 状态无数据时设为 true，触发 serial_engine 发探针
+    /// Heartbeat probe: set to true when active state has no data, triggers
+    /// serial_engine to send a probe.
     pub heartbeat_pending: bool,
-    /// 上次发探针的时间 (用于给板子响应窗口)
+    /// Time of last probe sent (gives the board a response window).
     last_probe_time: Instant,
-    /// 探针无响应次数 (累计超过 hysteresis → DUT-off)
+    /// Number of consecutive probe misses (exceeds hysteresis → DUT-off).
     heartbeat_missed: u32,
 }
 
@@ -133,7 +136,7 @@ impl StateManager {
         format!("{:08x}", digest).chars().take(8).collect()
     }
 
-    /// 写入 PID 文件 — 仅 lock 成功后调用
+    /// Write PID file — call only after lock is acquired.
     pub fn write_pid(&self, project_dir: &Path, dut_dir: &str) {
         let pid_file = project_dir.join(dut_dir).join("mcp.pid");
         std::fs::write(&pid_file, std::process::id().to_string()).ok();
@@ -143,7 +146,7 @@ impl StateManager {
         self.current
     }
 
-    /// MCP API 返回的状态 (stopped/connecting → None)
+    /// MCP API state (stopped/connecting → None)
     pub fn external_state(&self) -> Option<TargetState> {
         if self.current.is_external() {
             Some(self.current)
@@ -166,7 +169,7 @@ impl StateManager {
                 self.delete_shm_cache();
             }
             TargetState::Connecting => {
-                // 不写文件，避免 statusline 闪烁
+                // Don't write file — avoid statusline flicker
             }
             TargetState::Active
             | TargetState::Booting
@@ -198,24 +201,26 @@ impl StateManager {
         text.to_string()
     }
 
-    /// 每次收到串口数据时调用 — 重置挂死和心跳计数器
+    /// Called on every serial data arrival — resets hang and heartbeat counters.
+    /// Also resets `last_probe_time` so the next heartbeat cycle starts fresh.
     pub fn on_activity(&mut self) {
         self.last_data_time = Instant::now();
+        self.last_probe_time = Instant::now();
         self.hang_count = 0;
         self.heartbeat_pending = false;
         self.heartbeat_missed = 0;
     }
 
-    /// 标记心跳探针已发送 (由 serial_engine 调用), 记录发送时间
+    /// Mark that a heartbeat probe was sent (called by serial_engine).
     pub fn mark_probe_sent(&mut self) {
         self.last_probe_time = Instant::now();
         self.heartbeat_pending = false;
     }
 
-    /// 检测挂死 / 心跳超时
-    /// booting: 长时间无输出 → hang_count++ → DUT-off
-    /// active:  长时间无输出 → 发换行探针 (不执行命令);
-    ///          探针后 5s 内无响应 → miss++ → DUT-off
+    /// Check for hang / heartbeat timeout.
+    /// booting: long silence → hang_count++ → DUT-off
+    /// active:  long silence → send newline probe (no command);
+    ///          if no response within 5s → miss++ → DUT-off
     pub fn check_hang(&mut self) {
         if !self.current.is_hang_candidate() {
             self.hang_count = 0;
@@ -225,7 +230,7 @@ impl StateManager {
         let data_elapsed = self.last_data_time.elapsed().as_secs_f64();
         if self.current == TargetState::Active {
             let probe_elapsed = self.last_probe_time.elapsed().as_secs_f64();
-            // 探针已发送且等待超过 5s 响应窗口
+            // Probe sent and no response within 5s window
             if probe_elapsed > 5.0 && data_elapsed > self.hang_timeout_secs as f64 {
                 self.heartbeat_missed += 1;
                 tracing::warn!(
@@ -236,15 +241,15 @@ impl StateManager {
                     tracing::warn!("Heartbeat: {} misses → DUT-off", self.heartbeat_missed);
                     self.transition(TargetState::DutOff);
                 } else {
-                    // 再次请求发探针
+                    // Request another probe
                     self.heartbeat_pending = true;
                 }
             } else if data_elapsed > self.hang_timeout_secs as f64 && probe_elapsed > self.hang_timeout_secs as f64 {
-                // 首次超时，请求发探针
+                // First timeout — request a probe
                 self.heartbeat_pending = true;
             }
         } else {
-            // Booting 状态 — 无输出超时 → 判定为 hang
+            // Booting state — no output timeout → hang
             if data_elapsed > self.hang_timeout_secs as f64 {
                 self.hang_count += 1;
                 if self.hang_count >= self.hysteresis {

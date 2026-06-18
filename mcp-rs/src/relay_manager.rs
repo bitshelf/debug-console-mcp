@@ -1,9 +1,10 @@
-//! Relay manager — TCP 直连 ser2net 控制 CH340 继电器，4 字节协议。
+//! Relay manager — TCP direct connection to ser2net controlling a CH340
+//! relay, 4-byte protocol.
 //!
-//! 来自 serial_relay/src/main.rs 协议:
+//! Protocol (from serial_relay/src/main.rs):
 //!   Packet: [0xA0, channel(1-4), opcode, checksum]
 //!   checksum = (0xA0 + channel + opcode) & 0xFF
-//!   Baud: 9600 8N1 (ser2net 端已配置)
+//!   Baud: 9600 8N1 (configured on the ser2net side)
 
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -21,8 +22,6 @@ impl RelayManager {
     const HEADER: u8 = 0xA0;
     const OP_ON: u8 = 0x01;
     const OP_OFF: u8 = 0x00;
-    #[allow(dead_code)]
-    const OP_TOGGLE: u8 = 0x04;
     const OP_STATUS: u8 = 0x05;
 
     pub fn new(host: String, port: u16, reset_channel: u8, maskrom_channel: u8) -> Self {
@@ -35,21 +34,23 @@ impl RelayManager {
         }
     }
 
+    /// Check if the relay is configured and the reset channel is valid (1-4).
     pub fn configured(&self) -> bool {
         self.port > 0 && self.reset_ch > 0 && self.reset_ch <= 4
+    }
+
+    /// Check if MASKROM mode is available (maskrom channel configured 1-4).
+    pub fn maskrom_configured(&self) -> bool {
+        self.configured() && self.maskrom_ch > 0 && self.maskrom_ch <= 4
     }
 
     pub fn maskrom_ch(&self) -> u8 {
         self.maskrom_ch
     }
 
-    /// 确保 TCP 连接已打开 (5s 超时)
+    /// Ensure the TCP connection is open (5s timeout).
     async fn ensure_open(&mut self) -> Result<(), std::io::Error> {
-        let need_connect = match &self.stream {
-            None => true,
-            Some(_) => false,
-        };
-        if need_connect {
+        if self.stream.is_none() {
             let addr = format!("{}:{}", self.host, self.port);
             let stream = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
@@ -63,7 +64,7 @@ impl RelayManager {
         Ok(())
     }
 
-    /// 强制关闭并重建连接
+    /// Force-close and rebuild the connection.
     async fn force_reconnect(&mut self) -> Result<(), std::io::Error> {
         self.stream.take();
         self.ensure_open().await
@@ -73,13 +74,15 @@ impl RelayManager {
         self.stream.take();
     }
 
-    /// 发送 4 字节命令包 (带自动重连重试)
+    /// Send a 4-byte command packet (with auto-reconnect retry).
+    /// Drains any relay response from the TCP buffer after sending to prevent
+    /// stale data accumulating and causing backpressure on subsequent writes.
     async fn send_command(&mut self, channel: u8, opcode: u8) -> Result<Vec<u8>, std::io::Error> {
         let checksum = (Self::HEADER as u16 + channel as u16 + opcode as u16) & 0xFF;
         let packet = [Self::HEADER, channel, opcode, checksum as u8];
 
         for attempt in 0..2 {
-            // 确保连接
+            // Ensure connection
             if let Err(e) = self.ensure_open().await {
                 if attempt == 0 {
                     self.stream.take();
@@ -90,7 +93,7 @@ impl RelayManager {
 
             let stream = self.stream.as_mut().unwrap();
 
-            // 清空输入缓冲 + 发送命令
+            // Send command
             match stream.write_all(&packet).await {
                 Ok(_) => {}
                 Err(_e) if attempt == 0 => {
@@ -101,10 +104,11 @@ impl RelayManager {
             }
             stream.flush().await?;
 
-            // 等待继电器响应
+            // Wait for relay hardware to process
             tokio::time::sleep(Duration::from_millis(50)).await;
 
             if opcode == Self::OP_STATUS {
+                // STATUS query: read the response
                 let mut buf = [0u8; 16];
                 match tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buf)).await
                 {
@@ -113,6 +117,11 @@ impl RelayManager {
                     Err(_) => return Ok(Vec::new()),
                 }
             }
+
+            // ON/OFF: drain any response the relay sends back to prevent
+            // stale data from accumulating in the TCP kernel buffer.
+            let mut drain_buf = [0u8; 16];
+            let _ = tokio::time::timeout(Duration::from_millis(50), stream.read(&mut drain_buf)).await;
             return Ok(Vec::new());
         }
 
@@ -130,7 +139,8 @@ impl RelayManager {
         self.send_command(channel, Self::OP_OFF).await.map(|_| ())
     }
 
-    /// 脉冲复位: RESET=低 → 500ms → RESET=高
+    /// Pulse reset: RESET=low → 500ms → RESET=high.
+    /// On failure, attempts to release the reset channel (rollback).
     pub async fn reset(&mut self) -> bool {
         if !self.configured() {
             return false;
@@ -138,7 +148,8 @@ impl RelayManager {
         match self.do_reset().await {
             Ok(_) => true,
             Err(e) => {
-                tracing::warn!("Relay reset failed: {e}");
+                tracing::warn!("Relay reset failed: {e}, rolling back");
+                let _ = self.channel_off(self.reset_ch).await;
                 false
             }
         }
@@ -151,17 +162,16 @@ impl RelayManager {
         Ok(())
     }
 
-    /// MASKROM 序列: MASKROM=低 → RESET=低 → RESET=高 → MASKROM=高
-    /// 任何步骤失败 → 回滚释放所有引脚
+    /// MASKROM sequence: MASKROM=low → RESET=low → RESET=high → MASKROM=high.
+    /// Any step failure → rollback (release all pins).
     pub async fn enter_maskrom(&mut self) -> bool {
-        if !self.configured() || self.maskrom_ch == 0 {
+        if !self.maskrom_configured() {
             return false;
         }
         match self.do_maskrom().await {
             Ok(_) => true,
             Err(e) => {
                 tracing::warn!("Relay maskrom failed: {e}, rolling back");
-                // 回滚: 确保所有引脚释放
                 let _ = self.channel_off(self.reset_ch).await;
                 let _ = self.channel_off(self.maskrom_ch).await;
                 false
@@ -210,14 +220,29 @@ mod tests {
     }
 
     #[test]
+    fn test_maskrom_not_configured_zero_channel() {
+        let relay = RelayManager::new("127.0.0.1".to_string(), 2001, 2, 0);
+        assert!(!relay.maskrom_configured());
+    }
+
+    #[test]
+    fn test_maskrom_not_configured_channel_too_high() {
+        let relay = RelayManager::new("127.0.0.1".to_string(), 2001, 2, 5);
+        assert!(!relay.maskrom_configured());
+    }
+
+    #[test]
+    fn test_maskrom_configured() {
+        let relay = RelayManager::new("127.0.0.1".to_string(), 2001, 2, 1);
+        assert!(relay.maskrom_configured());
+    }
+
+    #[test]
     fn test_packet_checksum() {
-        // Header = 0xA0, channel = 2, opcode ON = 0x01
-        // checksum = (0xA0 + 2 + 1) & 0xFF = 0xA3
         let header: u8 = 0xA0;
         let channel: u8 = 2;
         let opcode: u8 = RelayManager::OP_ON;
         let checksum = (header as u16 + channel as u16 + opcode as u16) & 0xFF;
-
         assert_eq!(checksum as u8, 0xA3);
     }
 
@@ -245,7 +270,6 @@ mod tests {
     #[tokio::test]
     async fn test_relay_close() {
         let mut relay = RelayManager::new("127.0.0.1".to_string(), 2001, 2, 1);
-        // Close without connecting should not panic
         relay.close();
     }
 
@@ -261,7 +285,7 @@ mod tests {
             // Read ON packet
             let n = socket.read(&mut buf).await.unwrap();
             assert_eq!(n, 4);
-            assert_eq!(buf[0], 0xA0); // header
+            assert_eq!(buf[0], 0xA0);
             assert_eq!(buf[2], RelayManager::OP_ON);
 
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -299,7 +323,6 @@ mod tests {
 
     #[test]
     fn test_channel_boundaries() {
-        // Valid channels: 1-4
         assert!(RelayManager::new("127.0.0.1".to_string(), 2001, 1, 1).configured());
         assert!(RelayManager::new("127.0.0.1".to_string(), 2001, 2, 1).configured());
         assert!(RelayManager::new("127.0.0.1".to_string(), 2001, 3, 1).configured());

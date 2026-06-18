@@ -44,7 +44,7 @@ Options:
   -v, --verbose      Increase log verbosity (debug level on stderr).
                      Default: info level to {project}/.dut-serial/mcp.log.
       --log-to-stderr  Log to stderr instead of file (useful for debugging).
-      --http [HOST:PORT]  Run as Streamable HTTP server (default: 0.0.0.0:3000).
+      --http [HOST:PORT]  Run as Streamable HTTP server (default: 127.0.0.1:3000).
 
 Environment:
   TARGET_CONF        Path to .target.conf file (alternative to CWD search).
@@ -105,7 +105,7 @@ async fn main() {
     let mut verbose = false;
     let mut log_to_stderr = false;
     let mut http_mode = false;
-    let mut http_bind = "0.0.0.0:3000".to_string();
+    let mut http_bind = "127.0.0.1:3000".to_string();
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -224,7 +224,7 @@ async fn main() {
         let (host, port) = if let Some((h, p)) = http_bind.rsplit_once(':') {
             (h.to_string(), p.parse::<u16>().unwrap_or(3000))
         } else {
-            ("0.0.0.0".to_string(), 3000u16)
+            ("127.0.0.1".to_string(), 3000u16)
         };
         tracing::info!("Starting Streamable HTTP on {host}:{port}");
         if let Err(e) = mcp_http::run_http(engine.clone(), &host, port).await {
