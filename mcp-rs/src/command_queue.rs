@@ -1,7 +1,7 @@
 //! Command queue — serialized execution + marker response routing.
 //!
 //! Mirrors labgrid's `UBootDriver._run()` marker-echo pattern:
-//!   echo '{marker[:4]}''{marker[4:]}'; {cmd}; echo "$?"; echo '{marker[:4]}''{marker[4:]}'
+//!   echo '{marker[:4]}''{marker[4:]}'; {cmd}; echo "EXIT:$?"; echo '{marker[:4]}''{marker[4:]}'
 
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -31,6 +31,8 @@ struct PendingCommand {
     /// Cross-chunk search buffer (cf. labgrid's `before` buffer).
     search_buf: Vec<u8>,
     sent_at: Instant,
+    /// Skip the first marker (shell echo of sent command), use the second as real begin.
+    skip_count: u8,
 }
 
 impl PendingCommand {
@@ -76,7 +78,11 @@ impl CommandQueue {
     }
 
     /// Submit a command and return a receiver to await the result.
-    pub fn execute(&mut self, command: String, timeout_secs: f64) -> oneshot::Receiver<CommandResult> {
+    pub fn execute(
+        &mut self,
+        command: String,
+        timeout_secs: f64,
+    ) -> oneshot::Receiver<CommandResult> {
         let (tx, rx) = oneshot::channel();
         let marker = gen_marker();
         let pc = PendingCommand {
@@ -89,6 +95,7 @@ impl CommandQueue {
             buffer: Vec::new(),
             search_buf: Vec::new(),
             sent_at: Instant::now(),
+            skip_count: 0,
         };
 
         if self.current.is_none() {
@@ -114,7 +121,9 @@ impl CommandQueue {
             }
         }
 
-        let Some(ref mut pc) = self.current else { return };
+        let Some(ref mut pc) = self.current else {
+            return;
+        };
         if !pc.begin_sent {
             return;
         }
@@ -122,6 +131,7 @@ impl CommandQueue {
         let marker = pc.marker_bytes();
 
         // Step 1: begin_marker not yet found — accumulate cross-chunk search buffer.
+        // stty -echo suppresses shell echo, so the first marker is the real one.
         if !pc.found_begin {
             pc.search_buf.extend_from_slice(&data);
             // Cap the search buffer to prevent unbounded memory growth.
@@ -131,9 +141,8 @@ impl CommandQueue {
             }
             if let Some(idx) = find_subsequence(&pc.search_buf, &marker) {
                 pc.found_begin = true;
-                // Copy everything after the marker into the output buffer.
                 pc.buffer = pc.search_buf[idx + marker.len()..].to_vec();
-                pc.search_buf.clear(); // release the search buffer
+                pc.search_buf.clear();
             } else {
                 return;
             }
@@ -153,8 +162,7 @@ impl CommandQueue {
                 .to_string();
 
             // Extract exit code: the LAST line before the end marker should be
-            // `echo "$?"` output (a single integer 0-255). Only parse the very
-            // last line, and only accept 0-255 to avoid misreading data lines.
+            // `echo "EXIT:$?"` output (prefixed with EXIT: for unambiguous parsing).
             let (clean_output, exit_code) = extract_exit_code(&output);
 
             let rest = pc.buffer[idx + marker.len()..].to_vec();
@@ -184,9 +192,16 @@ impl CommandQueue {
 
     fn send_command(&mut self, mut pc: PendingCommand) {
         let m = &pc.marker;
+        // stty -echo suppresses shell echo → no marker in echoed text → clean output
+        // EXIT: prefix makes exit code extraction unambiguous — no false matches on
+        // bare numeric output lines (e.g. "wc -l" → "42" would be misread as exit code).
         let line = format!(
-            "echo '{}''{}'; {}; echo \"$?\"; echo '{}''{}'\n",
-            &m[..4], &m[4..], pc.command, &m[..4], &m[4..],
+            "stty -echo; echo '{}''{}'; {}; echo \"EXIT:$?\"; echo '{}''{}'; stty echo\n",
+            &m[..4],
+            &m[4..],
+            pc.command,
+            &m[..4],
+            &m[4..],
         );
 
         if let Some(ref write_fn) = self.write_fn {
@@ -194,6 +209,7 @@ impl CommandQueue {
             write_fn(line.as_bytes());
             pc.sent_at = Instant::now();
             pc.begin_sent = true;
+            pc.skip_count = 0;
             self.current = Some(pc);
         }
     }
@@ -218,25 +234,25 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// Extract the exit code from the last line of command output.
 ///
-/// The shell command template ends with `echo "$?"`, so the very last line
-/// should be a single integer in 0-255. Only the **last** line is examined
-/// (not all lines in reverse) to avoid misreading data lines that happen to
-/// be integers (e.g. `wc -l` output). The value is constrained to 0-255
-/// (shell `$?` range) — negative or out-of-range values are ignored.
+/// The shell command template ends with `echo "EXIT:$?"`, so the very last
+/// line should be `EXIT:<0-255>`. Using an unambiguous prefix prevents false
+/// matches on data lines that happen to be integers (e.g. `wc -l` → `42`).
 ///
 /// Returns `(output_without_exit_code_line, Some(code))` or `(original_output, None)`.
 fn extract_exit_code(output: &str) -> (String, Option<i32>) {
     let trimmed = output.trim_end();
     if let Some(last_line) = trimmed.lines().next_back() {
         let stripped = last_line.trim();
-        // Only accept a bare integer in the 0-255 range (shell $? semantics).
-        if let Ok(code) = stripped.parse::<u32>() {
-            if code <= 255 {
-                let exit_code = code as i32;
-                // Remove the exit-code line from the output.
-                let end = trimmed.rfind(stripped).unwrap_or(trimmed.len());
-                let clean = trimmed[..end].trim_end().to_string();
-                return (clean, Some(exit_code));
+        // Parse EXIT:<digits> prefix for unambiguous extraction.
+        if let Some(num_str) = stripped.strip_prefix("EXIT:") {
+            if let Ok(code) = num_str.parse::<u32>() {
+                if code <= 255 {
+                    let exit_code = code as i32;
+                    // Remove the exit-code line from the output.
+                    let end = trimmed.rfind(stripped).unwrap_or(trimmed.len());
+                    let clean = trimmed[..end].trim_end().to_string();
+                    return (clean, Some(exit_code));
+                }
             }
         }
     }
@@ -291,14 +307,14 @@ mod tests {
 
     #[test]
     fn test_extract_exit_code_valid() {
-        let (out, code) = extract_exit_code("line1\nline2\n0");
+        let (out, code) = extract_exit_code("line1\nline2\nEXIT:0");
         assert_eq!(code, Some(0));
         assert_eq!(out, "line1\nline2");
     }
 
     #[test]
     fn test_extract_exit_code_nonzero() {
-        let (out, code) = extract_exit_code("error msg\n127");
+        let (out, code) = extract_exit_code("error msg\nEXIT:127");
         assert_eq!(code, Some(127));
         assert_eq!(out, "error msg");
     }
@@ -313,25 +329,42 @@ mod tests {
     #[test]
     fn test_extract_exit_code_out_of_range() {
         // Values > 255 are not valid shell exit codes → ignored.
-        let (out, code) = extract_exit_code("data\n300");
+        let (out, code) = extract_exit_code("data\nEXIT:300");
         assert_eq!(code, None);
-        assert_eq!(out, "data\n300");
+        assert_eq!(out, "data\nEXIT:300");
     }
 
     #[test]
     fn test_extract_exit_code_negative() {
         // Negative values are not valid shell exit codes → ignored.
-        let (_out, code) = extract_exit_code("data\n-1");
+        let (_out, code) = extract_exit_code("data\nEXIT:-1");
         assert_eq!(code, None);
     }
 
     #[test]
     fn test_extract_exit_code_data_line_is_number() {
         // A data line that is a number should NOT be misread as exit code
-        // because only the LAST line is examined.
+        // because only the LAST line is examined and it must have EXIT: prefix.
         let (out, code) = extract_exit_code("42\nactual output");
         assert_eq!(code, None);
         assert_eq!(out, "42\nactual output");
+    }
+
+    #[test]
+    fn test_extract_exit_code_wc_l_style_output() {
+        // Regression: output from commands like `wc -l` that end with numbers
+        // must not be misread as exit codes. EXIT: prefix prevents this.
+        let (out, code) = extract_exit_code("total lines processed\n242");
+        assert_eq!(code, None);
+        assert_eq!(out, "total lines processed\n242");
+    }
+
+    #[test]
+    fn test_extract_exit_code_no_exit_prefix() {
+        // Bare 0 without EXIT: prefix → not an exit code.
+        let (out, code) = extract_exit_code("command output\n0");
+        assert_eq!(code, None);
+        assert_eq!(out, "command output\n0");
     }
 
     #[test]
@@ -350,10 +383,10 @@ mod tests {
         // Should have written the command with markers
         let written_data = written.lock().unwrap();
         let cmd_str = String::from_utf8_lossy(&written_data);
-        assert!(cmd_str.starts_with("echo '"));
+        assert!(cmd_str.starts_with("stty -echo; echo '"));
         assert!(cmd_str.contains("uname -a"));
-        assert!(cmd_str.contains("echo \"$?\""));
-        assert!(cmd_str.ends_with("'\n"));
+        assert!(cmd_str.contains("echo \"EXIT:$?\""));
+        assert!(cmd_str.ends_with("; stty echo\n"));
     }
 
     #[test]
@@ -364,10 +397,7 @@ mod tests {
         let marker_bytes = marker.as_bytes();
 
         // Simulate serial data with marker appearing twice
-        let serial_data = format!(
-            "{}\noutput line 1\noutput line 2\n0\n{}\n",
-            marker, marker
-        );
+        let serial_data = format!("{}\noutput line 1\noutput line 2\nEXIT:0\n{}\n", marker, marker);
 
         // Verify the marker appears twice in the data
         let first_pos = serial_data.find(&marker);
@@ -419,5 +449,103 @@ mod tests {
         let input = b"plain text without escapes";
         let result = strip_ansi(input);
         assert_eq!(result, b"plain text without escapes");
+    }
+
+    /// Regression: shell echo of the sent command contains the marker text,
+    /// causing CommandQueue to match the wrong marker as begin. The fix
+    /// skips the first marker (echoed command) and uses the second (real output).
+    #[test]
+    fn test_skip_echoed_marker() {
+        let mut cq = CommandQueue::new();
+
+        // Set up a write_fn that captures the sent command
+        let sm = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sm_clone = sm.clone();
+        let write_fn = Box::new(move |data: &[u8]| {
+            *sm_clone.lock().unwrap() = String::from_utf8_lossy(data).to_string();
+        });
+        cq.set_write_fn(write_fn);
+
+        let mut rx = cq.execute("dmesg | grep -iE 'opp|cpu' | head -5".to_string(), 90.0);
+
+        let sent = sm.lock().unwrap();
+        let marker: String = sent
+            .split('\'')
+            .nth(1)
+            .unwrap()
+            .chars()
+            .chain(sent.split('\'').nth(3).unwrap().chars())
+            .collect();
+        assert_eq!(marker.len(), 10);
+
+        let marker_bytes = marker.as_bytes().to_vec();
+
+        // Simulate serial data with shell echo (same as 2>&1, pipe, redirect):
+        // 1. Echoed command line (contains marker)
+        // 2. Newline
+        // 3. Actual marker output (from echo command)
+        // 4. Command output
+        // 5. Exit code
+        // 6. End marker
+        // With stty -echo, the sent command is NOT echoed. Only the output appears.
+        let mut serial_stream = Vec::new();
+        // Actual marker output (from echo 'MARKER')
+        serial_stream.extend_from_slice(&marker_bytes);
+        serial_stream.push(b'\n');
+        // Command output
+        serial_stream.extend_from_slice(b"CPU0: 408000\nOPP table v2\nCPU1: 600000\n");
+        // Exit code
+        serial_stream.extend_from_slice(b"EXIT:0\n");
+        // End marker
+        serial_stream.extend_from_slice(&marker_bytes);
+        serial_stream.push(b'\n');
+
+        cq.feed_serial_data(&serial_stream);
+
+        let result = rx.try_recv().unwrap();
+        assert!(!result.timed_out);
+        assert_eq!(result.exit_code, Some(0));
+        assert!(result.output.contains("CPU0: 408000"));
+        assert!(result.output.contains("OPP table v2"));
+        // Should NOT contain the echoed command text
+        assert!(!result.output.contains("echo '"));
+        assert!(!result.output.contains("dmesg"));
+    }
+
+    /// Verifies that piping with 2>&1 works correctly (regression test
+    /// for the pipe/special-char marker interference issue).
+    #[test]
+    fn test_pipe_and_redirect_not_garbled() {
+        let mut cq = CommandQueue::new();
+
+        let sm = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sm_clone = sm.clone();
+        let write_fn = Box::new(move |data: &[u8]| {
+            *sm_clone.lock().unwrap() = String::from_utf8_lossy(data).to_string();
+        });
+        cq.set_write_fn(write_fn);
+
+        let mut rx = cq.execute("ls /sys/devices/system/cpu/cpufreq/ 2>&1".to_string(), 90.0);
+
+        let sent = sm.lock().unwrap();
+        let parts: Vec<&str> = sent.split('\'').collect();
+        let marker: String = format!("{}{}", parts[1], parts[3]);
+        let mb = marker.as_bytes().to_vec();
+
+        // With stty -echo, no echoed command text. Only output appears.
+        let mut data = Vec::new();
+        data.extend_from_slice(&mb); // real marker
+        data.push(b'\n');
+        data.extend_from_slice(b"policy0\npolicy4\n");
+        data.extend_from_slice(b"EXIT:0\n");
+        data.extend_from_slice(&mb);
+        data.push(b'\n');
+
+        cq.feed_serial_data(&data);
+        let result = rx.try_recv().unwrap();
+        assert!(!result.timed_out);
+        assert!(result.output.contains("policy0"));
+        assert!(!result.output.contains("echo '"));
+        assert!(!result.output.contains("ls /sys"));
     }
 }

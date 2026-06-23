@@ -23,6 +23,8 @@ pub enum TargetState {
     Crashed,
     DutOff,
     Disconnected,
+    /// Serial is taken over by dutabo interactive session
+    Dutabo,
 }
 
 impl TargetState {
@@ -37,6 +39,7 @@ impl TargetState {
             Self::Crashed => "crashed",
             Self::DutOff => "DUT-off",
             Self::Disconnected => "disconnected",
+            Self::Dutabo => "dutabo",
         }
     }
 
@@ -52,6 +55,7 @@ impl TargetState {
             "crashed" => Self::Crashed,
             "DUT-off" => Self::DutOff,
             "disconnected" => Self::Disconnected,
+            "dutabo" => Self::Dutabo,
             _ => Self::Disconnected,
         }
     }
@@ -65,7 +69,7 @@ impl TargetState {
     /// booting: long silence → hang
     /// active:  long silence → send heartbeat probe to check liveness
     fn is_hang_candidate(&self) -> bool {
-        matches!(self, Self::Booting | Self::Active)
+        matches!(self, Self::Booting | Self::Active | Self::Dutabo)
     }
 }
 
@@ -76,6 +80,8 @@ pub struct StateManager {
     cache_file: PathBuf,
     /// /dev/shm cache — zero-syscall read by Python hook via `cat`
     shm_cache_file: PathBuf,
+    /// Notification directory for Agent proactive alerts
+    notify_dir: PathBuf,
     hang_timeout_secs: u64,
     hysteresis: u32,
     hang_count: u32,
@@ -94,6 +100,7 @@ impl StateManager {
         let dut_dir_path = project_dir.join(dut_dir);
         let state_file = dut_dir_path.join("target-state");
         let cache_file = dut_dir_path.join("statusline-cache");
+        let notify_dir = dut_dir_path.join("notifications");
 
         // /dev/shm cache: keyed by project path hash so multiple projects don't collide
         let shm_dir = if std::path::Path::new("/dev/shm").is_dir() {
@@ -102,17 +109,18 @@ impl StateManager {
             "/tmp"
         };
         let project_hash = Self::project_hash(project_dir);
-        let shm_cache_file = std::path::PathBuf::from(format!(
-            "{}/claude-status-{}", shm_dir, project_hash
-        ));
+        let shm_cache_file =
+            std::path::PathBuf::from(format!("{}/claude-status-{}", shm_dir, project_hash));
 
         std::fs::create_dir_all(&dut_dir_path).ok();
+        std::fs::create_dir_all(&notify_dir).ok();
 
         Self {
             current: TargetState::Stopped,
             state_file,
             cache_file,
             shm_cache_file,
+            notify_dir,
             hang_timeout_secs: hang_timeout,
             hysteresis,
             hang_count: 0,
@@ -177,11 +185,19 @@ impl StateManager {
             | TargetState::UBoot
             | TargetState::Crashed
             | TargetState::Disconnected
-            | TargetState::DutOff => {
+            | TargetState::DutOff
+            | TargetState::Dutabo => {
                 self.atomic_write(&self.state_file, new.as_str());
                 let text = Self::format_statusline(new);
                 self.atomic_write(&self.cache_file, &text);
                 self.atomic_write(&self.shm_cache_file, &text);
+                // Write Agent notification for critical states
+                if matches!(
+                    new,
+                    TargetState::Crashed | TargetState::DutOff | TargetState::Disconnected
+                ) {
+                    self.write_notification(new);
+                }
             }
         }
     }
@@ -196,6 +212,7 @@ impl StateManager {
             TargetState::Crashed => "\x1b[31m✗ serial:crashed\x1b[0m",
             TargetState::Disconnected => "\x1b[31m✗ serial:disconnected\x1b[0m",
             TargetState::DutOff => "\x1b[31m✗ serial:DUT-off\x1b[0m",
+            TargetState::Dutabo => "\x1b[35m● serial:dutabo\x1b[0m",
             TargetState::Stopped | TargetState::Connecting => "",
         };
         text.to_string()
@@ -235,7 +252,9 @@ impl StateManager {
                 self.heartbeat_missed += 1;
                 tracing::warn!(
                     "Heartbeat miss #{}: no data for {:.0}s, probe sent {:.0}s ago",
-                    self.heartbeat_missed, data_elapsed, probe_elapsed
+                    self.heartbeat_missed,
+                    data_elapsed,
+                    probe_elapsed
                 );
                 if self.heartbeat_missed >= self.hysteresis {
                     tracing::warn!("Heartbeat: {} misses → DUT-off", self.heartbeat_missed);
@@ -244,7 +263,9 @@ impl StateManager {
                     // Request another probe
                     self.heartbeat_pending = true;
                 }
-            } else if data_elapsed > self.hang_timeout_secs as f64 && probe_elapsed > self.hang_timeout_secs as f64 {
+            } else if data_elapsed > self.hang_timeout_secs as f64
+                && probe_elapsed > self.hang_timeout_secs as f64
+            {
                 // First timeout — request a probe
                 self.heartbeat_pending = true;
             }
@@ -263,6 +284,67 @@ impl StateManager {
 
     pub fn last_data_elapsed(&self) -> std::time::Duration {
         self.last_data_time.elapsed()
+    }
+
+    /// Write a notification JSON file for Agent proactive alerts.
+    /// Notifications are written to `.dut-serial/notifications/<timestamp>-<state>.json`.
+    fn write_notification(&self, state: TargetState) {
+        let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        let fname = format!("{ts}-{}.json", state.as_str());
+        let path = self.notify_dir.join(&fname);
+
+        let alert = match state {
+            TargetState::Crashed => serde_json::json!({
+                "type": "target_alert",
+                "state": "crashed",
+                "severity": "critical",
+                "message": "Target has crashed (Kernel panic/BUG/Oops detected). Check serial logs for crash details.",
+                "suggested_action": "Use serial_get_logs with pattern='panic|BUG|Oops' to analyze the crash.",
+                "timestamp": chrono::Local::now().to_rfc3339(),
+            }),
+            TargetState::DutOff => serde_json::json!({
+                "type": "target_alert",
+                "state": "DUT-off",
+                "severity": "warning",
+                "message": "Target is not responding (no serial output). May be powered off or hung.",
+                "suggested_action": "Try serial_reset to reboot the target, or check power supply.",
+                "timestamp": chrono::Local::now().to_rfc3339(),
+            }),
+            TargetState::Disconnected => serde_json::json!({
+                "type": "target_alert",
+                "state": "disconnected",
+                "severity": "warning",
+                "message": "Serial connection lost. ser2net may be down or network issue.",
+                "suggested_action": "Check ser2net on dev host, or use serial_claim to reconnect.",
+                "timestamp": chrono::Local::now().to_rfc3339(),
+            }),
+            _ => return,
+        };
+
+        if let Err(e) = std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&alert).unwrap_or_default(),
+        ) {
+            tracing::error!("Failed to write notification {path:?}: {e}");
+        } else {
+            tracing::info!("Agent notification written: {fname}");
+            // Also append to a consolidated alert log
+            let alert_log = self.notify_dir.join("alerts.log");
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&alert_log)
+                .ok();
+            if let Some(ref mut file) = f {
+                use std::io::Write;
+                writeln!(
+                    file,
+                    "{}",
+                    serde_json::to_string(&alert).unwrap_or_default()
+                )
+                .ok();
+            }
+        }
     }
 
     fn atomic_write(&self, path: &Path, content: &str) {
@@ -448,13 +530,14 @@ mod tests {
     fn test_hang_candidate() {
         assert!(!TargetState::Stopped.is_hang_candidate());
         assert!(!TargetState::Connecting.is_hang_candidate());
-        assert!(TargetState::Active.is_hang_candidate());    // heartbeat probe
+        assert!(TargetState::Active.is_hang_candidate()); // heartbeat probe
         assert!(TargetState::Booting.is_hang_candidate());
         assert!(!TargetState::Booted.is_hang_candidate());
         assert!(!TargetState::UBoot.is_hang_candidate());
         assert!(!TargetState::Crashed.is_hang_candidate());
         assert!(!TargetState::DutOff.is_hang_candidate());
-        assert!(!TargetState::Disconnected.is_hang_candidate()); // network issue, not target hang
+        assert!(!TargetState::Disconnected.is_hang_candidate());
+        assert!(TargetState::Dutabo.is_hang_candidate()); // Dutabo: keep watchdog alive
     }
 
     #[test]
@@ -466,7 +549,10 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&state_file).unwrap(), "test-state");
 
         sm.atomic_write(&state_file, "another-state");
-        assert_eq!(std::fs::read_to_string(&state_file).unwrap(), "another-state");
+        assert_eq!(
+            std::fs::read_to_string(&state_file).unwrap(),
+            "another-state"
+        );
     }
 
     #[test]

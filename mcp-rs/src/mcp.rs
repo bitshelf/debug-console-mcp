@@ -165,9 +165,129 @@ fn tool_definitions() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "serial_get_unclassified",
+            description: "Get serial output lines that StageLearner could not classify into any known boot stage. Use this to identify new boot patterns, then call serial_append_reference to add them to the reference log for future detection.",
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+        },
+        ToolDef {
+            name: "serial_append_reference",
+            description: "Append key anchor lines to the reference boot log and hot-reload StageLearner. Use after analyzing unclassified lines from serial_get_unclassified. The lines become new fingerprints — StageLearner will match them on future boot cycles without restart. Choose distinctive lines that mark a boot stage boundary (e.g. 'DDR fdeec6f4fc typ...', 'U-Boot SPL board init', 'Linux version 5.10.0'). Avoid lines with timestamps, memory addresses, or random numbers.",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "lines": {
+                        "type": "string",
+                        "description": "Key anchor lines to append (newline-separated). Pick distinctive lines that mark a boot stage boundary."
+                    }
+                },
+                "required": ["lines"],
+            }),
+        },
+        ToolDef {
             name: "serial_get_stages",
             description: "Get the learned stage fingerprints from the reference log (if loaded). Shows what patterns the adaptive detector uses for each boot stage.",
             input_schema: serde_json::json!({"type": "object", "properties": {}}),
+        },
+        ToolDef {
+            name: "serial_learn_connection",
+            description: "Run connection learning to verify serial connectivity. Performs 3x hardware reset (if relay configured) or software reboot cycles, compares boot log similarity. If similarity >= 93%, generates reference boot log for stage detection. If relay reset similarity < 10%, marks relay as broken and suggests software reboot fallback.",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "method": {
+                        "type": "string",
+                        "description": "Learning method: 'hardware' (relay reset, default), 'software' (reboot command), or 'auto' (try hardware first, fallback to software)"
+                    },
+                },
+            }),
+        },
+        ToolDef {
+            name: "serial_verify_relay",
+            description: "Verify CH340 relay control by sending ON/OFF commands and reading back state. Returns whether the relay is controllable and responding correctly.",
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+        },
+        ToolDef {
+            name: "serial_button",
+            description: "Control a DUT button (reset/recovery/maskrom) via the power control abstraction. Supports press, release, and pulse actions. Buttons must be configured in .target.toml [relay] section.",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "button": {
+                        "type": "string",
+                        "description": "Button name: 'reset', 'maskrom', or 'recovery'"
+                    },
+                    "action": {
+                        "type": "string",
+                        "description": "Action: 'press', 'release', or 'pulse' (press+delay+release)"
+                    },
+                    "delay_ms": {
+                        "type": "integer",
+                        "description": "Delay in milliseconds for pulse action (default: 500)"
+                    },
+                },
+                "required": ["button", "action"],
+            }),
+        },
+        ToolDef {
+            name: "serial_flash_plan",
+            description: "Generate a flash plan from .target.toml [flash] config. Resolves symlinks, computes upload path, shows the flash commands that will be executed. Does NOT execute anything — use serial_flash to execute.",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "image_path": {
+                        "type": "string",
+                        "description": "Local path to the firmware image (e.g. update.img or boot.img)"
+                    },
+                    "image_type": {
+                        "type": "string",
+                        "description": "Image type: 'full' (complete firmware) or 'kernel' (kernel/boot only). Default: auto-detect from flash config."
+                    },
+                },
+                "required": ["image_path"],
+            }),
+        },
+        ToolDef {
+            name: "serial_pause",
+            description: "Pause the serial engine — stops read loop, watchdog heartbeat, and all Agent-initiated serial output. Use before taking over the serial port with dutabo serial. Call serial_resume to resume.",
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+        },
+        ToolDef {
+            name: "serial_resume",
+            description: "Resume the serial engine after serial_pause. Restarts read loop and watchdog.",
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+        },
+        ToolDef {
+            name: "serial_send_raw",
+            description: "Send raw bytes to the serial port without any markers or command wrapping. Use for interactive terminal sessions (dutabo serial).",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "data": {"type": "string", "description": "Raw data to send (supports \\n, \\r, \\x03 for Ctrl-C etc.)"},
+                },
+                "required": ["data"],
+            }),
+        },
+        ToolDef {
+            name: "serial_flash",
+            description: "Execute firmware flash to target device. Uploads image to dev host, verifies sha256, optionally enters MASKROM and flashes loader, then flashes the main image. Requires [flash] section in .target.toml. WARNING: This modifies the target device firmware.",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "image_path": {
+                        "type": "string",
+                        "description": "Local path to the firmware image (e.g. update.img)"
+                    },
+                    "image_type": {
+                        "type": "string",
+                        "description": "Image type: 'full' (default) or 'kernel'"
+                    },
+                    "skip_upload": {
+                        "type": "boolean",
+                        "description": "Skip upload if image already on dev host (default: false)"
+                    },
+                },
+                "required": ["image_path"],
+            }),
         },
     ]
 }
@@ -209,7 +329,7 @@ impl From<JsonRpcRawRequest> for JsonRpcRequest {
 }
 
 #[derive(Serialize)]
-pub(crate) struct JsonRpcResponse {
+pub struct JsonRpcResponse {
     jsonrpc: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<Value>,
@@ -220,7 +340,7 @@ pub(crate) struct JsonRpcResponse {
 }
 
 #[derive(Serialize)]
-struct JsonRpcError {
+pub struct JsonRpcError {
     code: i32,
     message: String,
 }
@@ -314,7 +434,10 @@ impl McpServer {
     }
 
     /// Public handler for HTTP transport (takes raw request, produces raw response)
-    pub async fn handle_raw_message(&mut self, request: JsonRpcRawRequest) -> Option<JsonRpcResponse> {
+    pub async fn handle_raw_message(
+        &mut self,
+        request: JsonRpcRawRequest,
+    ) -> Option<JsonRpcResponse> {
         self.handle_message(request.into()).await
     }
 
@@ -425,7 +548,8 @@ impl McpServer {
                 })
             }
             "resources/read" => {
-                let uri = request.params
+                let uri = request
+                    .params
                     .and_then(|p| p.get("uri").cloned())
                     .and_then(|v| v.as_str().map(|s| s.to_string()))
                     .unwrap_or_default();
@@ -452,7 +576,8 @@ impl McpServer {
                 })
             }
             "prompts/get" => {
-                let name = request.params
+                let name = request
+                    .params
                     .and_then(|p| p.get("name").cloned())
                     .and_then(|v| v.as_str().map(|s| s.to_string()))
                     .unwrap_or_default();
@@ -474,14 +599,8 @@ impl McpServer {
 
     /// 处理 tools/call 请求
     async fn handle_call_tool(&mut self, params: Value) -> Value {
-        let name = params
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let args = params
-            .get("arguments")
-            .cloned()
-            .unwrap_or(Value::Null);
+        let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let args = params.get("arguments").cloned().unwrap_or(Value::Null);
 
         // serial_enter_uboot: relay reset + continuous Ctrl-C flood, then
         // await U-Boot prompt. Retries up to `failure_retry` times.
@@ -496,26 +615,34 @@ impl McpServer {
         // calls tstc(), even ONE pending Ctrl-C interrupts. We send 1 byte
         // per 100ms for up to 15s, releasing the lock between each burst.
         if name == "serial_enter_uboot" {
-            let failure_retry = args.get("failure_retry").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
-            let failure_retry_interval =
-                args.get("failure_retry_interval").and_then(|v| v.as_f64()).unwrap_or(1.0);
-            let flood_duration_secs =
-                args.get("flood_duration_secs").and_then(|v| v.as_f64()).unwrap_or(15.0);
-            let flood_interval_ms =
-                args.get("flood_interval_ms").and_then(|v| v.as_u64()).unwrap_or(100);
+            let failure_retry = args
+                .get("failure_retry")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(3) as usize;
+            let failure_retry_interval = args
+                .get("failure_retry_interval")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0);
+            let flood_duration_secs = args
+                .get("flood_duration_secs")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(15.0);
+            let flood_interval_ms = args
+                .get("flood_interval_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(100);
 
             let mut last_error = String::new();
             for attempt in 1..=failure_retry {
                 // Phase 1: relay reset + initial burst (holds lock ~1s).
                 let mut rx = {
                     let mut engine = self.engine.lock().await;
-                    if !engine.relay.configured() {
+                    let rx = engine.queue_enter_uboot();
+                    if let Err(e) = engine.do_relay_reset_and_flood().await {
                         return serde_json::json!({
-                            "content": [{"type": "text", "text": "{\"success\": false, \"error\": \"No relay configured\"}"}]
+                            "content": [{"type": "text", "text": serde_json::to_string(&serde_json::json!({"success": false, "error": e})).unwrap_or_default()}]
                         });
                     }
-                    let rx = engine.queue_enter_uboot();
-                    engine.do_relay_reset_and_flood().await;
                     rx
                 };
 
@@ -560,7 +687,9 @@ impl McpServer {
                     engine.detector.remove_watcher_by_pattern(pattern);
                     match matched {
                         Some(Ok(_m)) => {
-                            engine.state.transition(crate::state_manager::TargetState::UBoot);
+                            engine
+                                .state
+                                .transition(crate::state_manager::TargetState::UBoot);
                             serde_json::json!({"success": true, "state_after": "uboot", "attempts": attempt})
                         }
                         _ => {
@@ -580,7 +709,8 @@ impl McpServer {
                     });
                 }
                 if attempt < failure_retry {
-                    tokio::time::sleep(std::time::Duration::from_secs_f64(failure_retry_interval)).await;
+                    tokio::time::sleep(std::time::Duration::from_secs_f64(failure_retry_interval))
+                        .await;
                 }
             }
             let result = serde_json::json!({
@@ -600,18 +730,27 @@ impl McpServer {
         // Same flood strategy as serial_enter_uboot: release lock between
         // Ctrl-C bursts so read loop can process banners.
         if name == "serial_reboot_uboot" {
-            let failure_retry = args.get("failure_retry").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
-            let failure_retry_interval =
-                args.get("failure_retry_interval").and_then(|v| v.as_f64()).unwrap_or(1.0);
-            let flood_interval_ms =
-                args.get("flood_interval_ms").and_then(|v| v.as_u64()).unwrap_or(100);
+            let failure_retry = args
+                .get("failure_retry")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(3) as usize;
+            let failure_retry_interval = args
+                .get("failure_retry_interval")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0);
+            let flood_interval_ms = args
+                .get("flood_interval_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(100);
 
             let mut last_error = String::new();
             for attempt in 1..=failure_retry {
                 // Phase 1: send reboot + set up SPL watcher, release lock.
                 let mut spl_rx = {
                     let mut engine = self.engine.lock().await;
-                    engine.state.transition(crate::state_manager::TargetState::Booting);
+                    engine
+                        .state
+                        .transition(crate::state_manager::TargetState::Booting);
                     engine.console.sendline("reboot");
                     engine.console.drain_writes().await;
                     engine.logs.flush_boot_log();
@@ -622,7 +761,8 @@ impl McpServer {
                     rx
                 };
                 // Phase 2: wait for SPL without lock.
-                let _spl_ok = tokio::time::timeout(std::time::Duration::from_secs(30), spl_rx.recv()).await;
+                let _spl_ok =
+                    tokio::time::timeout(std::time::Duration::from_secs(30), spl_rx.recv()).await;
                 // Phase 3: SPL detected → arm U-Boot watcher + start flood.
                 let mut uboot_rx = {
                     let mut engine = self.engine.lock().await;
@@ -654,7 +794,9 @@ impl McpServer {
                 }
 
                 if matched.is_none() {
-                    match tokio::time::timeout(std::time::Duration::from_secs(3), uboot_rx.recv()).await {
+                    match tokio::time::timeout(std::time::Duration::from_secs(3), uboot_rx.recv())
+                        .await
+                    {
                         Ok(Some(m)) => matched = Some(Ok(m)),
                         _ => matched = Some(Err(())),
                     }
@@ -666,7 +808,9 @@ impl McpServer {
                     engine.detector.remove_watcher_by_pattern(pattern);
                     match matched {
                         Some(Ok(_m)) => {
-                            engine.state.transition(crate::state_manager::TargetState::UBoot);
+                            engine
+                                .state
+                                .transition(crate::state_manager::TargetState::UBoot);
                             serde_json::json!({"success": true, "state_after": "uboot", "attempts": attempt})
                         }
                         _ => {
@@ -686,7 +830,8 @@ impl McpServer {
                     });
                 }
                 if attempt < failure_retry {
-                    tokio::time::sleep(std::time::Duration::from_secs_f64(failure_retry_interval)).await;
+                    tokio::time::sleep(std::time::Duration::from_secs_f64(failure_retry_interval))
+                        .await;
                 }
             }
             let result = serde_json::json!({
@@ -705,21 +850,53 @@ impl McpServer {
         // on timeout, send a newline to provoke a prompt and retry up to 6
         // times at `timeout/10` each.
         if name == "serial_wait_pattern" {
-            let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let pattern = args
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let timeout = args.get("timeout").and_then(|v| v.as_f64()).unwrap_or(60.0);
-            let send_ctrl_c = args.get("action").and_then(|v| v.as_str()).is_some_and(|a| a == "send_ctrl_c");
+            let send_ctrl_c = args
+                .get("action")
+                .and_then(|v| v.as_str())
+                .is_some_and(|a| a == "send_ctrl_c");
             // Auto-enable probe for prompt-like patterns (cheap heuristic).
             let probe_on_timeout = pattern.contains("login")
                 || pattern.contains("prompt")
                 || pattern.contains("=>")
                 || pattern.contains(r"\$")
                 || pattern.contains("#");
-            let result = {
+
+            // Phase 1: acquire lock briefly to set up the watcher, then
+            // release. The read loop feeds watchers — no lock needed to await.
+            let console_tx = {
+                let engine = self.engine.lock().await;
+                engine.console.write_sender()
+            };
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            {
                 let mut engine = self.engine.lock().await;
                 engine
-                    .wait_pattern_internal_opts(&pattern, timeout, probe_on_timeout)
-                    .await
-            };
+                    .detector
+                    .add_watcher(&pattern, tx.clone());
+            }
+
+            // Phase 2: await outside the lock — read loop can still process
+            // serial data and feed watchers.
+            let result = crate::serial_engine::wait_pattern_with_probe(
+                &mut rx,
+                timeout,
+                probe_on_timeout,
+                &console_tx,
+            )
+            .await;
+
+            // Phase 3: cleanup — remove the watcher (brief lock).
+            {
+                let mut engine = self.engine.lock().await;
+                engine.detector.remove_watcher_by_pattern(&pattern);
+            }
+
             let result = if send_ctrl_c && result["matched"].as_bool().unwrap_or(false) {
                 let engine = self.engine.lock().await;
                 engine.console.sendcontrol('c');
@@ -751,7 +928,9 @@ impl McpServer {
                 engine.queue_command(command, timeout)
             };
             let result = match rx.await {
-                Ok(r) => serde_json::json!({"output": r.output, "exit_code": r.exit_code, "timed_out": r.timed_out}),
+                Ok(r) => {
+                    serde_json::json!({"output": r.output, "exit_code": r.exit_code, "timed_out": r.timed_out})
+                }
                 Err(_) => serde_json::json!({"error": "Command cancelled"}),
             };
             return serde_json::json!({
@@ -800,7 +979,9 @@ impl McpServer {
                     .get("failure_retry_interval")
                     .and_then(|v| v.as_f64())
                     .unwrap_or(1.0);
-                engine.reset_target(wait_boot, failure_retry, failure_retry_interval).await
+                engine
+                    .reset_target(wait_boot, failure_retry, failure_retry_interval)
+                    .await
             }
             "serial_enter_maskrom" => engine.enter_maskrom().await,
             // serial_wait_pattern moved to handle_call_tool (lock release)
@@ -814,7 +995,10 @@ impl McpServer {
             "serial_get_config" => engine.get_config(),
             "serial_claim" => engine.claim_serial().await,
             "serial_load_reference" => {
-                let path_str = args.get("reference_log_path").and_then(|v| v.as_str()).unwrap_or("");
+                let path_str = args
+                    .get("reference_log_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 if path_str.is_empty() {
                     serde_json::json!({"success": false, "error": "reference_log_path required"})
                 } else {
@@ -828,7 +1012,16 @@ impl McpServer {
                         Err(e) => serde_json::json!({"success": false, "error": e}),
                     }
                 }
-            },
+            }
+            "serial_get_unclassified" => engine.get_unclassified(),
+            "serial_append_reference" => {
+                let lines = args.get("lines").and_then(|v| v.as_str()).unwrap_or("");
+                if lines.is_empty() {
+                    serde_json::json!({"success": false, "error": "lines parameter required"})
+                } else {
+                    engine.append_reference(lines)
+                }
+            }
             "serial_get_stages" => {
                 match &engine.detector.learner {
                     Some(learner) => {
@@ -837,10 +1030,81 @@ impl McpServer {
                             .map(|(stage, anchor)| serde_json::json!({"stage": stage, "anchor": anchor}))
                             .collect();
                         serde_json::json!({"fingerprints": fps, "count": fps.len()})
-                    },
-                    None => serde_json::json!({"fingerprints": [], "count": 0, "message": "No reference loaded. Use serial_load_reference first."}),
+                    }
+                    None => {
+                        serde_json::json!({"fingerprints": [], "count": 0, "message": "No reference loaded. Use serial_load_reference first."})
+                    }
                 }
-            },
+            }
+            "serial_learn_connection" => {
+                let method = args
+                    .get("method")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("hardware");
+                match method {
+                    "software" | "reboot" => engine.learn_connection_software().await,
+                    "auto" => {
+                        let result = engine.learn_connection_hardware().await;
+                        if result["success"].as_bool().unwrap_or(false) {
+                            result
+                        } else {
+                            let sw_result = engine.learn_connection_software().await;
+                            serde_json::json!({
+                                "hardware_result": result,
+                                "software_result": sw_result,
+                                "success": sw_result["success"],
+                                "method_used": "software_reboot",
+                            })
+                        }
+                    }
+                    _ => engine.learn_connection_hardware().await,
+                }
+            }
+            "serial_verify_relay" => engine.verify_relay().await,
+            "serial_pause" => engine.pause(),
+            "serial_resume" => engine.resume(),
+            "serial_send_raw" => {
+                let data = args.get("data").and_then(|v| v.as_str()).unwrap_or("");
+                engine.send_raw(data)
+            }
+            "serial_button" => {
+                let button = args.get("button").and_then(|v| v.as_str()).unwrap_or("");
+                let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                let delay_ms = args.get("delay_ms").and_then(|v| v.as_u64());
+                engine.control_button(button, action, delay_ms).await
+            }
+            "serial_flash_plan" => {
+                let image_path = args
+                    .get("image_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let image_type = args
+                    .get("image_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("full");
+                if image_path.is_empty() {
+                    serde_json::json!({"success": false, "error": "image_path required"})
+                } else {
+                    Self::build_flash_plan(&engine.config, image_path, image_type)
+                }
+            }
+            "serial_flash" => {
+                let image_path = args
+                    .get("image_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if image_path.is_empty() {
+                    serde_json::json!({"success": false, "error": "image_path required"})
+                } else {
+                    // Flash execution requires releasing lock — done inline for now
+                    serde_json::json!({
+                        "success": false,
+                        "error": "Flash execution requires dev host SSH access. Use dutabo CLI: dutabo uf <image>",
+                        "hint": "The MCP server connects to serial, not SSH. Flash is executed via CLI.",
+                        "flash_plan": Self::build_flash_plan(&engine.config, image_path, "full"),
+                    })
+                }
+            }
             _ => serde_json::json!({"error": format!("Unknown tool: {name}")}),
         }
     }
@@ -872,10 +1136,7 @@ impl McpServer {
         serde_json::json!({"resources": resources})
     }
 
-    fn build_resource_content(
-        engine: &crate::serial_engine::SerialEngine,
-        uri: &str,
-    ) -> Value {
+    fn build_resource_content(engine: &crate::serial_engine::SerialEngine, uri: &str) -> Value {
         if uri == "state://target" {
             let state = engine.get_state_dict();
             return serde_json::json!({
@@ -994,6 +1255,76 @@ impl McpServer {
         }
     }
 
+    /// Build a flash plan from config + local image path.
+    fn build_flash_plan(
+        config: &crate::config::Config,
+        image_path: &str,
+        image_type: &str,
+    ) -> serde_json::Value {
+        use crate::flash::{FlashConfig, ImageType};
+        let flash_cfg = FlashConfig::from_config(&config.values);
+
+        if !flash_cfg.is_configured() {
+            return serde_json::json!({
+                "success": false,
+                "error": "Flash not configured. Add [flash] section to .target.toml.",
+            });
+        }
+
+        let local_path = std::path::PathBuf::from(image_path);
+        let real_path = FlashConfig::resolve_symlink(&local_path);
+        let fname = real_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("firmware.img");
+
+        let upload_dir = if flash_cfg.upload_dir.is_empty() {
+            "/tmp".to_string()
+        } else {
+            flash_cfg.upload_dir.clone()
+        };
+        let remote_path = format!("{upload_dir}/{fname}");
+
+        let dev_host = config.dev_host_ip();
+        let dev_user = config.get_str_or("DEV_HOST_USER", "linaro");
+        let parsed_image_type = ImageType::from_str(image_type).unwrap_or(ImageType::Full);
+        let selected_flash_cmd = match parsed_image_type {
+            ImageType::Full => flash_cfg.full_image_command(&remote_path),
+            ImageType::Kernel => flash_cfg.kernel_image_command(&remote_path),
+        };
+        let loader_cmd = if flash_cfg.loader_bin.is_empty() {
+            String::new()
+        } else {
+            flash_cfg.loader_command()
+        };
+        let list_devices_cmd = flash_cfg.list_devices_command();
+
+        serde_json::json!({
+            "success": true,
+            "tool": flash_cfg.tool,
+            "local_image": real_path.to_string_lossy(),
+            "remote_path": remote_path,
+            "dev_host": dev_host,
+            "dev_user": dev_user,
+            "upload_dir": upload_dir,
+            "image_type": match parsed_image_type {
+                ImageType::Full => "full",
+                ImageType::Kernel => "kernel",
+            },
+            "full_image_cmd": flash_cfg.full_image_command(&remote_path),
+            "kernel_image_cmd": flash_cfg.kernel_image_command(&remote_path),
+            "selected_flash_cmd": selected_flash_cmd,
+            "loader_bin": flash_cfg.loader_bin,
+            "loader_cmd": loader_cmd,
+            "list_devices_cmd": list_devices_cmd,
+            "steps": [
+                format!("scp {image_path} {dev_user}@{dev_host}:{remote_path}"),
+                format!("ssh {dev_user}@{dev_host} 'sha256sum {remote_path}'"),
+                format!("ssh {dev_user}@{dev_host} '{tool} {cmd}'", tool = flash_cfg.tool, cmd = selected_flash_cmd),
+            ],
+        })
+    }
+
     fn error_response(id: Option<Value>, code: i32, message: &str) -> JsonRpcResponse {
         JsonRpcResponse {
             jsonrpc: "2.0".into(),
@@ -1093,13 +1424,10 @@ mod tests {
 
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 16, "Expected 16 MCP tools");
+        assert_eq!(tools.len(), 26, "Expected 26 MCP tools");
 
         // Check some tool names
-        let tool_names: Vec<&str> = tools
-            .iter()
-            .filter_map(|t| t["name"].as_str())
-            .collect();
+        let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(tool_names.contains(&"serial_send_command"));
         assert!(tool_names.contains(&"serial_get_state"));
         assert!(tool_names.contains(&"serial_get_logs"));

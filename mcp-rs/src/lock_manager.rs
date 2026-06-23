@@ -77,11 +77,7 @@ fn check_existing_lock(lock_path: &Path) -> Option<u32> {
     let content = std::fs::read_to_string(lock_path).ok()?;
     let pid_str = content.lines().next()?;
     let pid: u32 = pid_str.trim().parse().ok()?;
-    if process_alive(pid) {
-        Some(pid)
-    } else {
-        None
-    }
+    if process_alive(pid) { Some(pid) } else { None }
 }
 
 // Minimal libc bindings — avoid a `nix`/`libc` dependency for two syscalls.
@@ -154,9 +150,8 @@ mod tests {
 
     fn temp_lock_dir() -> PathBuf {
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "embedded-debug-test-{}-{}", std::process::id(), id
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("embedded-debug-test-{}-{}", std::process::id(), id));
         // Clean up any old directory.
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
@@ -299,7 +294,10 @@ mod tests {
         // The lock file must be in `dir`, not in /tmp/embedded-debug/locks.
         let lock_key = format!("{:x}", fnv1a_hash("10.0.0.5:7000"))[..8].to_string();
         let lock_path = dir.join(format!("{lock_key}.lock"));
-        assert!(lock_path.exists(), "lock should be in custom dir, not default");
+        assert!(
+            lock_path.exists(),
+            "lock should be in custom dir, not default"
+        );
 
         release_lock("10.0.0.5", "7000", dir_str);
         std::fs::remove_dir_all(&dir).ok();

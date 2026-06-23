@@ -9,5 +9,6 @@ uv.lock
 /.target.conf
 /.target.toml
 /.mcp.json
+/mcp-rs/Cargo.lock
 .target.conf
 .target.toml

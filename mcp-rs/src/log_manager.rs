@@ -12,10 +12,22 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
+/// Message sent to the background writer thread.
+enum WriterMsg {
+    /// Data to append to both log files.
+    Data(Vec<u8>),
+    /// Rotate: close current files and reopen (follows the LogManager's
+    /// current_path changes from `start_new_cycle`).
+    Rotate(PathBuf, PathBuf),
+    /// Flush + respond via the oneshot (used by `flush_sync()` and shutdown).
+    Flush(std::sync::mpsc::Sender<()>),
+}
+
 pub struct LogManager {
     log_dir: PathBuf,
     dut_dir: PathBuf,
     max_logs: usize,
+    #[allow(dead_code)]
     max_file_size: u64,
     current_file: Option<fs::File>,
     current_path: Option<PathBuf>,
@@ -29,6 +41,11 @@ pub struct LogManager {
     boot_start_pos: usize,
     /// Ring buffer max capacity (default 2 MB).
     max_buffer_size: usize,
+    /// Send end of the writer channel. `write()` pushes data here; a single
+    /// background thread drains it and does all file I/O sequentially.
+    writer_tx: Option<std::sync::mpsc::Sender<WriterMsg>>,
+    /// Handle to the writer thread (joined on close / rotation).
+    writer_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl LogManager {
@@ -48,6 +65,8 @@ impl LogManager {
             ring_buffer: Vec::new(),
             boot_start_pos: 0,
             max_buffer_size: 2 * 1024 * 1024, // 2 MB
+            writer_tx: None,
+            writer_thread: None,
         }
     }
 
@@ -65,7 +84,8 @@ impl LogManager {
         let n = fs::read_to_string(&count_file)
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok())
-            .unwrap_or(0) + 1;
+            .unwrap_or(0)
+            + 1;
         fs::write(&count_file, n.to_string()).ok();
         self.boot_number = n;
         n
@@ -105,43 +125,118 @@ impl LogManager {
 
     /// Append raw serial data: writes to `serial.current.log` +
     /// `serial.full.log` + the in-memory ring buffer.
+    ///
+    /// Ring buffer is updated synchronously (instant, needed by boot detection).
+    /// File I/O is pushed to a **single background writer thread** via channel
+    /// — no per-write thread spawn, no `open()` per chunk. The writer thread
+    /// keeps file handles open and does sequential `write_all`.
     pub fn write(&mut self, data: &[u8]) {
         if self.current_file.is_none() {
             self.ensure_current_file();
         }
         let clean = strip_ansi_and_null(data);
-        // serial.current.log (current boot cycle)
-        if let Some(ref mut file) = self.current_file {
-            if !clean.is_empty() {
-                file.write_all(&clean).ok();
-            }
-        }
-        // serial.full.log (continuous, never truncated)
-        if let Some(ref mut file) = self.full_file {
-            if !clean.is_empty() {
-                file.write_all(&clean).ok();
-            }
-        }
-        // In-memory ring buffer
+
+        // ── Ring buffer (synchronous, instant) ──────────────────────────
         self.ring_buffer.extend_from_slice(&clean);
         if self.ring_buffer.len() > self.max_buffer_size {
             let drain = self.ring_buffer.len() - self.max_buffer_size / 2;
             self.ring_buffer.drain(..drain);
             self.boot_start_pos = self.boot_start_pos.saturating_sub(drain);
         }
-        // File size limit check → rotate if exceeded
-        if self.max_file_size > 0 {
-            if let Some(ref file) = self.current_file {
-                if let Ok(meta) = file.metadata() {
-                    if meta.len() > self.max_file_size {
-                        self.rotate();
-                        // Write current data into the new file (rotate already created it)
-                        if let Some(ref mut f) = self.current_file {
-                            f.write_all(&clean).ok();
+
+        // ── File I/O → background writer thread ─────────────────────────
+        if !clean.is_empty() {
+            self.ensure_writer();
+            if let Some(ref tx) = self.writer_tx {
+                let _ = tx.send(WriterMsg::Data(clean));
+            }
+        }
+    }
+
+    /// Start the background writer thread (lazy, on first `write()`).
+    fn ensure_writer(&mut self) {
+        if self.writer_tx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<WriterMsg>();
+        let current_path = self.current_path.clone().unwrap_or_else(|| self.log_dir.join("serial.current.log"));
+        let full_path = self.log_dir.join("serial.full.log");
+
+        let handle = std::thread::spawn(move || {
+            // Keep file handles open for the lifetime of the writer thread.
+            let mut current_file: Option<std::fs::File> = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&current_path)
+                .ok();
+            let mut full_file: Option<std::fs::File> = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&full_path)
+                .ok();
+
+            for msg in rx {
+                match msg {
+                    WriterMsg::Data(data) => {
+                        if let Some(ref mut f) = current_file {
+                            let _ = f.write_all(&data);
                         }
+                        if let Some(ref mut f) = full_file {
+                            let _ = f.write_all(&data);
+                        }
+                    }
+                    WriterMsg::Rotate(new_current, new_full) => {
+                        // Close old handles, open new ones.
+                        current_file = std::fs::OpenOptions::new()
+                            .append(true)
+                            .create(true)
+                            .open(&new_current)
+                            .ok();
+                        full_file = std::fs::OpenOptions::new()
+                            .append(true)
+                            .create(true)
+                            .open(&new_full)
+                            .ok();
+                    }
+                    WriterMsg::Flush(reply) => {
+                        // Flush file handles to disk.
+                        if let Some(ref mut f) = current_file {
+                            let _ = f.flush();
+                        }
+                        if let Some(ref mut f) = full_file {
+                            let _ = f.flush();
+                        }
+                        let _ = reply.send(());
                     }
                 }
             }
+            // Channel closed — final flush.
+            if let Some(ref mut f) = current_file {
+                let _ = f.flush();
+            }
+            if let Some(ref mut f) = full_file {
+                let _ = f.flush();
+            }
+        });
+
+        self.writer_tx = Some(tx);
+        self.writer_thread = Some(handle);
+    }
+
+    /// Wait for all pending file writes to land on disk (test determinism +
+    /// `flush_boot_log`/`rotate` synchronization).
+    pub fn flush_sync(&mut self) {
+        if let Some(ref tx) = self.writer_tx {
+            let (reply, rx) = std::sync::mpsc::channel();
+            let _ = tx.send(WriterMsg::Flush(reply));
+            let _ = rx.recv();
+        }
+    }
+
+    /// Tell the writer thread to rotate files (used by `start_new_cycle`).
+    fn writer_rotate(&mut self, current_path: PathBuf, full_path: PathBuf) {
+        if let Some(ref tx) = self.writer_tx {
+            let _ = tx.send(WriterMsg::Rotate(current_path, full_path));
         }
     }
 
@@ -162,7 +257,10 @@ impl LogManager {
                 fs::remove_file(&path).ok();
             }
             match fs::OpenOptions::new().create(true).append(true).open(&path) {
-                Ok(file) => { self.current_file = Some(file); self.current_path = Some(path); }
+                Ok(file) => {
+                    self.current_file = Some(file);
+                    self.current_path = Some(path);
+                }
                 Err(e) => tracing::error!("Failed to open serial.current.log: {e}"),
             }
         }
@@ -170,7 +268,9 @@ impl LogManager {
         if self.full_file.is_none() {
             let full = self.log_dir.join("serial.full.log");
             match fs::OpenOptions::new().create(true).append(true).open(&full) {
-                Ok(file) => { self.full_file = Some(file); }
+                Ok(file) => {
+                    self.full_file = Some(file);
+                }
                 Err(e) => tracing::error!("Failed to open serial.full.log: {e}"),
             }
         }
@@ -200,9 +300,12 @@ impl LogManager {
             .truncate(true)
             .open(&path)
             .ok();
-        self.current_path = Some(path);
+        self.current_path = Some(path.clone());
         self.cleanup_old_logs();
         self.boot_start_pos = self.ring_buffer.len();
+        // Notify writer thread: close old handles, reopen on the new log file.
+        let full_path = self.log_dir.join("serial.full.log");
+        self.writer_rotate(path, full_path);
     }
 
     /// Flush the ring buffer contents to a new numbered boot log file.
@@ -245,14 +348,56 @@ impl LogManager {
             let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
             let fname = format!("boot-{:03}_{ts}.log", n);
             let path = self.log_dir.join(&fname);
-            fs::OpenOptions::new().create(true).append(true).open(&path).ok();
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .ok();
         }
         self.start_new_cycle();
     }
 
     pub fn close(&mut self) {
+        // Flush + join writer thread before dropping file handles.
+        self.flush_sync();
+        self.writer_tx.take(); // close channel → writer thread exits loop
+        if let Some(handle) = self.writer_thread.take() {
+            let _ = handle.join();
+        }
         self.current_file.take();
         self.full_file.take();
+    }
+
+    /// Append unclassified lines to `.dut-serial/unclassified.log`
+    /// (for Agent auto-learning analysis).
+    pub fn append_unclassified(&mut self, lines: &[String]) -> Result<(), String> {
+        let path = self.dut_dir.join("unclassified.log");
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| format!("Cannot open unclassified.log: {e}"))?;
+        for line in lines {
+            writeln!(file, "{line}").map_err(|e| format!("Write error: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Read all unclassified lines from `.dut-serial/unclassified.log`.
+    pub fn read_unclassified(&self) -> Vec<String> {
+        let path = self.dut_dir.join("unclassified.log");
+        match fs::read_to_string(&path) {
+            Ok(content) => content.lines().map(|s| s.to_string()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Truncate the unclassified log (called on new boot cycle).
+    pub fn truncate_unclassified(&self) {
+        let path = self.dut_dir.join("unclassified.log");
+        if path.exists() {
+            fs::remove_file(&path).ok();
+        }
     }
 
     /// List all archived boot logs (newest first).
@@ -271,7 +416,12 @@ impl LogManager {
 
     /// Read a specified archive log. Streams via `BufReader` to avoid loading
     /// the entire file into memory at once (prevents OOM on large logs).
-    pub fn read_log(&self, archive_index: usize, lines: usize, pattern: Option<&str>) -> LogContent {
+    pub fn read_log(
+        &self,
+        archive_index: usize,
+        lines: usize,
+        pattern: Option<&str>,
+    ) -> LogContent {
         let logs = self.list_log_files_sorted();
         if archive_index >= logs.len() {
             return LogContent {
@@ -285,18 +435,23 @@ impl LogManager {
         let filename = target.name.clone();
 
         let re = pattern.and_then(|pat| {
-            regex::RegexBuilder::new(pat).case_insensitive(true).build().ok()
+            regex::RegexBuilder::new(pat)
+                .case_insensitive(true)
+                .build()
+                .ok()
         });
 
         // Stream the file line by line to avoid OOM on large files.
         let file = match fs::File::open(&target.path) {
             Ok(f) => f,
-            Err(_) => return LogContent {
-                content: String::new(),
-                filename,
-                total_lines: 0,
-                filtered_lines: 0,
-            },
+            Err(_) => {
+                return LogContent {
+                    content: String::new(),
+                    filename,
+                    total_lines: 0,
+                    filtered_lines: 0,
+                };
+            }
         };
         let reader = BufReader::new(file);
 
@@ -351,7 +506,10 @@ impl LogManager {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) == Some("log")
-                    && !path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n == "serial.current.log" || n == "serial.full.log")
+                    && !path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n == "serial.current.log" || n == "serial.full.log")
                 {
                     let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                     result.push(LogFileInfo {
@@ -376,7 +534,8 @@ impl LogManager {
 /// The regex is compiled once and cached via `LazyLock`.
 fn strip_ansi_and_null(data: &[u8]) -> Vec<u8> {
     static RE_ANSI: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
-        regex::bytes::Regex::new(r"(\x1b\[|\x9b)[0-?]*[ -/]*[@-~]|\x1b[>=]|\x1b[()][A-Z0-9]").unwrap()
+        regex::bytes::Regex::new(r"(\x1b\[|\x9b)[0-?]*[ -/]*[@-~]|\x1b[>=]|\x1b[()][A-Z0-9]")
+            .unwrap()
     });
     let mut result = Vec::with_capacity(data.len());
     let mut i = 0;
@@ -466,8 +625,11 @@ mod tests {
         lm.open_current();
 
         lm.write(b"line 1\n");
+        lm.flush_sync();
         lm.write(b"line 2\n");
+        lm.flush_sync();
         lm.write(b"line 3\n");
+        lm.flush_sync();
 
         let content = fs::read_to_string(lm.current_path().unwrap()).unwrap();
         assert!(content.contains("line 1"));
@@ -491,6 +653,7 @@ mod tests {
         assert!(path1.exists());
         assert!(path2.exists());
 
+        lm.flush_sync();
         let content1 = fs::read_to_string(&path1).unwrap();
         let content2 = fs::read_to_string(&path2).unwrap();
         assert!(content1.contains("boot 1 data"));
@@ -513,7 +676,11 @@ mod tests {
 
         // Should keep at most max_logs
         let archives = lm.list_archives();
-        assert!(archives.len() <= 3, "Expected <= 3 logs, got {}", archives.len());
+        assert!(
+            archives.len() <= 3,
+            "Expected <= 3 logs, got {}",
+            archives.len()
+        );
     }
 
     #[test]
@@ -544,6 +711,7 @@ mod tests {
         for i in 1..=10 {
             lm.write(format!("line {i}\n").as_bytes());
         }
+        lm.flush_sync();
 
         let result = lm.read_log(0, 5, None);
         // Total lines includes header
@@ -703,7 +871,11 @@ mod tests {
                     .is_some_and(|n| n.starts_with("boot-") && n.ends_with(".log"))
             })
             .collect();
-        assert_eq!(numbered.len(), 1, "mark_boot_start should create exactly 1 boot log");
+        assert_eq!(
+            numbered.len(),
+            1,
+            "mark_boot_start should create exactly 1 boot log"
+        );
         // serial.current.log is a regular file (not a symlink)
         assert!(!log_dir.join("serial.current.log").is_symlink());
     }
@@ -755,6 +927,7 @@ mod tests {
         assert_eq!(lm.boot_number(), boot1 + 1); // incremented
 
         lm.write(b"boot 2 data\n");
+        lm.flush_sync();
 
         // boot 1 data should be in the archived file, not current
         let current = std::fs::read_to_string(log_dir.join("serial.current.log")).unwrap();
@@ -785,6 +958,10 @@ mod tests {
                     .is_some_and(|n| n.starts_with("boot-") && n.ends_with(".log"))
             })
             .collect();
-        assert_eq!(numbered.len(), 1, "double mark with no data should NOT create empty logs");
+        assert_eq!(
+            numbered.len(),
+            1,
+            "double mark with no data should NOT create empty logs"
+        );
     }
 }

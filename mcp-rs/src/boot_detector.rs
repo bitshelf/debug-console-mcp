@@ -22,27 +22,99 @@ struct BootStage {
 static BOOT_STAGES: Lazy<Vec<BootStage>> = Lazy::new(|| {
     vec![
         // Bootloader stages
-        BootStage { name: "spl",      pattern: &SPL_RE,      action: Some("rotate_log") },
-        BootStage { name: "tpl",      pattern: &TPL_RE,      action: None },
-        BootStage { name: "bl31",     pattern: &BL31_RE,     action: None },
-        BootStage { name: "optee",    pattern: &OPTEE_RE,    action: None },
-        BootStage { name: "ddr",      pattern: &DDR_RE,      action: None },
-        BootStage { name: "uboot",    pattern: &UBOOT_RE,    action: None },
-        BootStage { name: "autoboot", pattern: &AUTOBOOT_RE, action: Some("send_ctrl_c") },
+        BootStage {
+            name: "spl",
+            pattern: &SPL_RE,
+            action: Some("rotate_log"),
+        },
+        BootStage {
+            name: "tpl",
+            pattern: &TPL_RE,
+            action: None,
+        },
+        BootStage {
+            name: "bl31",
+            pattern: &BL31_RE,
+            action: None,
+        },
+        BootStage {
+            name: "optee",
+            pattern: &OPTEE_RE,
+            action: None,
+        },
+        BootStage {
+            name: "ddr",
+            pattern: &DDR_RE,
+            action: Some("rotate_log"),
+        },
+        BootStage {
+            name: "uboot",
+            pattern: &UBOOT_RE,
+            action: None,
+        },
+        BootStage {
+            name: "autoboot",
+            pattern: &AUTOBOOT_RE,
+            action: Some("send_ctrl_c"),
+        },
         // Kernel
-        BootStage { name: "kernel",   pattern: &KERNEL_RE,   action: None },
-        BootStage { name: "start",    pattern: &START_RE,    action: None },
+        BootStage {
+            name: "kernel",
+            pattern: &KERNEL_RE,
+            action: None,
+        },
+        BootStage {
+            name: "start",
+            pattern: &START_RE,
+            action: None,
+        },
         // Linux login/shell (Debian/Ubuntu)
-        BootStage { name: "login",    pattern: &LOGIN_RE,    action: Some("send_login") },
-        BootStage { name: "password", pattern: &PASSWD_RE,   action: Some("send_password") },
-        BootStage { name: "shell",    pattern: &SHELL_RE,    action: None },
+        BootStage {
+            name: "login",
+            pattern: &LOGIN_RE,
+            action: Some("send_login"),
+        },
+        BootStage {
+            name: "password",
+            pattern: &PASSWD_RE,
+            action: Some("send_password"),
+        },
+        BootStage {
+            name: "shell",
+            pattern: &SHELL_RE,
+            action: None,
+        },
         // Android boot completion signals
-        BootStage { name: "android_shell",    pattern: &ANDROID_SHELL_RE,    action: None },
-        BootStage { name: "android_init",     pattern: &ANDROID_INIT_RE,     action: None },
-        BootStage { name: "android_adbd",     pattern: &ANDROID_ADBD_RE,     action: None },
-        BootStage { name: "android_bootanim", pattern: &ANDROID_BOOTANIM_RE, action: None },
-        BootStage { name: "android_surfaceflinger", pattern: &ANDROID_SF_RE, action: None },
-        BootStage { name: "android_boot_completed", pattern: &ANDROID_BOOTED_RE, action: None },
+        BootStage {
+            name: "android_shell",
+            pattern: &ANDROID_SHELL_RE,
+            action: None,
+        },
+        BootStage {
+            name: "android_init",
+            pattern: &ANDROID_INIT_RE,
+            action: None,
+        },
+        BootStage {
+            name: "android_adbd",
+            pattern: &ANDROID_ADBD_RE,
+            action: None,
+        },
+        BootStage {
+            name: "android_bootanim",
+            pattern: &ANDROID_BOOTANIM_RE,
+            action: None,
+        },
+        BootStage {
+            name: "android_surfaceflinger",
+            pattern: &ANDROID_SF_RE,
+            action: None,
+        },
+        BootStage {
+            name: "android_boot_completed",
+            pattern: &ANDROID_BOOTED_RE,
+            action: None,
+        },
     ]
 });
 
@@ -53,44 +125,75 @@ struct CrashPattern {
 
 static CRASH_PATTERNS: Lazy<Vec<CrashPattern>> = Lazy::new(|| {
     vec![
-        CrashPattern { pattern: &PANIC_RE,      ctype: "panic" },
-        CrashPattern { pattern: &BUG_RE,        ctype: "BUG" },
-        CrashPattern { pattern: &OOPS_RE,       ctype: "Oops" },
-        CrashPattern { pattern: &UNABLE_RE,     ctype: "kernel-fault" },
-        CrashPattern { pattern: &BUG_HANDLE_RE, ctype: "BUG" },
-        CrashPattern { pattern: &SEGFAULT_RE,   ctype: "segfault" },
-        CrashPattern { pattern: &END_TRACE_RE,  ctype: "end-trace" },
+        CrashPattern {
+            pattern: &PANIC_RE,
+            ctype: "panic",
+        },
+        CrashPattern {
+            pattern: &BUG_RE,
+            ctype: "BUG",
+        },
+        CrashPattern {
+            pattern: &OOPS_RE,
+            ctype: "Oops",
+        },
+        CrashPattern {
+            pattern: &UNABLE_RE,
+            ctype: "kernel-fault",
+        },
+        CrashPattern {
+            pattern: &BUG_HANDLE_RE,
+            ctype: "BUG",
+        },
+        CrashPattern {
+            pattern: &SEGFAULT_RE,
+            ctype: "segfault",
+        },
+        CrashPattern {
+            pattern: &END_TRACE_RE,
+            ctype: "end-trace",
+        },
     ]
 });
 
 // ── 预编译 Regex ──
-static SPL_RE: Lazy<Regex>      = Lazy::new(|| Regex::new(r"U-Boot\s+SPL").unwrap());
-static TPL_RE: Lazy<Regex>      = Lazy::new(|| Regex::new(r"TL[123]\s").unwrap());
-static BL31_RE: Lazy<Regex>     = Lazy::new(|| Regex::new(r"BL31:").unwrap());
-static OPTEE_RE: Lazy<Regex>    = Lazy::new(|| Regex::new(r"OP-TEE").unwrap());
-static DDR_RE: Lazy<Regex>      = Lazy::new(|| Regex::new(r"DDR\s+Version").unwrap());
-static UBOOT_RE: Lazy<Regex>    = Lazy::new(|| Regex::new(r"(?:U-Boot\s+20\d{2}|^=>\s)").unwrap());
-static AUTOBOOT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"Hit\s+(?:any\s+)?key\s+to\s+stop\s+autoboot").unwrap());
-static KERNEL_RE: Lazy<Regex>   = Lazy::new(|| Regex::new(r"Linux\s+version").unwrap());
-static START_RE: Lazy<Regex>    = Lazy::new(|| Regex::new(r"Starting\s+kernel").unwrap());
-static LOGIN_RE: Lazy<Regex>    = Lazy::new(|| Regex::new(r"(?:.*\s)?login:\s*$").unwrap());
-static PASSWD_RE: Lazy<Regex>   = Lazy::new(|| Regex::new(r"Password:\s*$").unwrap());
-static SHELL_RE: Lazy<Regex>    = Lazy::new(|| Regex::new(r"(?:[#\$]\s*$|^\S+@\S+:\S*[#\$]\s)").unwrap());
+static SPL_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"U-Boot\s+SPL").unwrap());
+static TPL_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"TL[123]\s").unwrap());
+static BL31_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"BL31:").unwrap());
+static OPTEE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"OP-TEE").unwrap());
+static DDR_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"DDR\s+(?:Version|f[0-9a-f]{8}|Init)").unwrap());
+static UBOOT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?:U-Boot\s+20\d{2}|^=>\s)").unwrap());
+static AUTOBOOT_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"Hit\s+(?:any\s+)?key\s+to\s+stop\s+autoboot").unwrap());
+static KERNEL_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"Linux\s+version").unwrap());
+static START_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"Starting\s+kernel").unwrap());
+static LOGIN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?:.*\s)?login:\s*$").unwrap());
+static PASSWD_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"Password:\s*$").unwrap());
+static SHELL_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?:[#\$]\s*$|^\S+@\S+:\S*[#\$]\s)").unwrap());
 // Android boot detection — 不要求行末，因为 Android 串口 shell prompt 与 kernel log 混排
 static ANDROID_SHELL_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"console:/\s*[#\$]").unwrap());
-static ANDROID_INIT_RE: Lazy<Regex>  = Lazy::new(|| Regex::new(r"init:\s*(?:started service|starting service)").unwrap());
-static ANDROID_ADBD_RE: Lazy<Regex>  = Lazy::new(|| Regex::new(r"adbd?\s+(?:.*?\s)?(?:starting|started|ready)").unwrap());
-static ANDROID_BOOTANIM_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"bootanim\s+(?:service\s+)?(?:started|stopped|done)").unwrap());
-static ANDROID_SF_RE: Lazy<Regex>    = Lazy::new(|| Regex::new(r"surfaceflinger\s+.*?(?:started|ready)").unwrap());
-static ANDROID_BOOTED_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?:sys\.)?boot_completed\s*[=:]\s*(?:1|true|done)").unwrap());
+static ANDROID_INIT_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"init:\s*(?:started service|starting service)").unwrap());
+static ANDROID_ADBD_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"adbd?\s+(?:.*?\s)?(?:starting|started|ready)").unwrap());
+static ANDROID_BOOTANIM_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"bootanim\s+(?:service\s+)?(?:started|stopped|done)").unwrap());
+static ANDROID_SF_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"surfaceflinger\s+.*?(?:started|ready)").unwrap());
+static ANDROID_BOOTED_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?:sys\.)?boot_completed\s*[=:]\s*(?:1|true|done)").unwrap());
 
-static PANIC_RE: Lazy<Regex>    = Lazy::new(|| Regex::new(r"Kernel\s+panic\s*[-:]").unwrap());
-static BUG_RE: Lazy<Regex>      = Lazy::new(|| Regex::new(r"BUG:\s").unwrap());
-static OOPS_RE: Lazy<Regex>     = Lazy::new(|| Regex::new(r"Oops:\s").unwrap());
-static UNABLE_RE: Lazy<Regex>   = Lazy::new(|| Regex::new(r"Unable\s+to\s+handle\s+kernel").unwrap());
-static BUG_HANDLE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"BUG:\s+unable\s+to\s+handle").unwrap());
+static PANIC_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"Kernel\s+panic\s*[-:]").unwrap());
+static BUG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"BUG:\s").unwrap());
+static OOPS_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"Oops:\s").unwrap());
+static UNABLE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"Unable\s+to\s+handle\s+kernel").unwrap());
+static BUG_HANDLE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"BUG:\s+unable\s+to\s+handle").unwrap());
 static SEGFAULT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"Segmentation\s+fault").unwrap());
-static END_TRACE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"---\[\s*end\s+trace\s+[0-9a-f]+\s*\]---").unwrap());
+static END_TRACE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"---\[\s*end\s+trace\s+[0-9a-f]+\s*\]---").unwrap());
 
 /// 检测到的启动事件
 #[derive(Debug)]
@@ -107,6 +210,8 @@ pub enum BootEvent {
     Crash(String, String),
     /// 阶段变更 → stage_name
     Stage(String),
+    /// StageLearner 未分类行（批量收集，供 Agent 自学习）
+    Unclassified(Vec<String>),
 }
 
 /// Temporary watcher (for `serial_wait_pattern`). Carries an optional
@@ -146,7 +251,7 @@ pub struct StageFingerprint {
 /// 对新日志的每一行, 计算与所有指纹的相似度, 选出最佳匹配阶段。
 ///
 /// # Example
-/// ```
+/// ```ignore
 /// let learner = StageLearner::from_reference("ref-soc-boot.log");
 /// learner.classify("U-Boot 2024.01 (Jan 01 2025)"); // → "uboot"
 /// ```
@@ -174,27 +279,37 @@ impl StageLearner {
 
     /// 从参考日志文本构建学习器
     pub fn from_reference_text(text: &str) -> Result<Self, String> {
-        let lines: Vec<&str> = text.lines().collect();
+        // Strip ANSI escape sequences and bracketed paste markers before learning
+        let cleaned = strip_ansi_escapes(text);
+        let lines: Vec<&str> = cleaned.lines().collect();
         if lines.len() < 10 {
             return Err("Too few lines for learning".into());
         }
 
         // 阶段定义: (stage_name, [anchor_patterns])
         let stage_defs: Vec<(&str, Vec<&str>)> = vec![
-            ("ddr",    vec!["DDR ", "DDR Version", "DDR Init"]),
-            ("spl",    vec!["U-Boot SPL", "SPL board init"]),
-            ("bl31",   vec!["BL31:", "ARM Trusted Firmware"]),
-            ("optee",  vec!["OP-TEE", "I/TC:"]),
-            ("uboot",  vec!["U-Boot 20", "U-Boot 202"]),
-            ("kernel", vec!["Linux version", "Booting Linux", "Starting kernel"]),
-            ("init",   vec!["init: ", "init:]"]),
-            ("shell",  vec!["console:/", "login:", "# $", "$ $"]),
+            ("ddr", vec!["DDR ", "DDR Version", "DDR Init"]),
+            ("spl", vec!["U-Boot SPL", "SPL board init"]),
+            ("bl31", vec!["BL31:", "ARM Trusted Firmware"]),
+            ("optee", vec!["OP-TEE", "I/TC:"]),
+            ("uboot", vec!["U-Boot 20", "U-Boot 202"]),
+            (
+                "kernel",
+                vec!["Linux version", "Booting Linux", "Starting kernel"],
+            ),
+            ("init", vec!["init: ", "init:]"]),
+            ("shell", vec!["console:/", "login:", "# $", "$ $"]),
             ("booted", vec!["boot_completed", "Boot completed"]),
         ];
 
         let crash_patterns = [
-            "Kernel panic", "BUG:", "Oops:", "Unable to handle kernel",
-            "Segmentation fault", "---[ end trace", "panic - not syncing",
+            "Kernel panic",
+            "BUG:",
+            "Oops:",
+            "Unable to handle kernel",
+            "Segmentation fault",
+            "---[ end trace",
+            "panic - not syncing",
         ];
         let mut fingerprints = Vec::new();
         let mut thresholds = HashMap::new();
@@ -206,11 +321,21 @@ impl StageLearner {
 
             for i in 0..lines.len() {
                 let line = lines[i].trim();
-                if line.is_empty() { continue; }
+                if line.is_empty() {
+                    continue;
+                }
                 for pat in patterns {
                     if line.contains(pat) {
-                        let prefix = if i > 0 { lines[i-1].trim().to_string() } else { String::new() };
-                        let suffix = if i + 1 < lines.len() { lines[i+1].trim().to_string() } else { String::new() };
+                        let prefix = if i > 0 {
+                            lines[i - 1].trim().to_string()
+                        } else {
+                            String::new()
+                        };
+                        let suffix = if i + 1 < lines.len() {
+                            lines[i + 1].trim().to_string()
+                        } else {
+                            String::new()
+                        };
                         fingerprints.push(StageFingerprint {
                             stage: stage.to_string(),
                             anchor: line.to_string(),
@@ -230,11 +355,21 @@ impl StageLearner {
 
         for i in 0..lines.len() {
             let line = lines[i].trim();
-            if line.is_empty() { continue; }
+            if line.is_empty() {
+                continue;
+            }
             for pat in &crash_patterns {
                 if line.contains(pat) {
-                    let prefix = if i > 0 { lines[i-1].trim().to_string() } else { String::new() };
-                    let suffix = if i + 1 < lines.len() { lines[i+1].trim().to_string() } else { String::new() };
+                    let prefix = if i > 0 {
+                        lines[i - 1].trim().to_string()
+                    } else {
+                        String::new()
+                    };
+                    let suffix = if i + 1 < lines.len() {
+                        lines[i + 1].trim().to_string()
+                    } else {
+                        String::new()
+                    };
                     fingerprints.push(StageFingerprint {
                         stage: "crash".to_string(),
                         anchor: line.to_string(),
@@ -251,7 +386,7 @@ impl StageLearner {
             return Err("No stage fingerprints extracted from reference".into());
         }
 
-        let reference_text = text.to_string();
+        let reference_text = cleaned;
         Ok(Self {
             fingerprints,
             reference_text,
@@ -263,18 +398,21 @@ impl StageLearner {
     }
 
     /// 分类一行文本 -> 阶段名, 或 None (不明确)
+    /// 使用组合分数: 3-gram Jaccard (0.6) + Jaro-Winkler (0.4)
     pub fn classify_line(&mut self, line: &str) -> Option<String> {
         let line = line.trim();
-        if line.is_empty() { return None; }
+        if line.is_empty() {
+            return None;
+        }
 
         let mut best_stage: Option<String> = None;
         let mut best_score = 0.0;
 
         let line_grams = compute_3gram_hashes(line);
         for fp in &self.fingerprints {
-            // 使用预计算 3-gram 加速 anchor 相似度
-            let anchor_sim = jaccard_similarity(&line_grams, &fp.anchor_grams);
-            let score = anchor_sim;
+            let jaccard = jaccard_similarity(&line_grams, &fp.anchor_grams);
+            let jaro = strsim::jaro_winkler(line, &fp.anchor);
+            let score = jaccard * 0.6 + jaro * 0.4;
 
             if score > best_score {
                 best_score = score;
@@ -283,7 +421,11 @@ impl StageLearner {
         }
 
         // 阈值过滤
-        let threshold = self.thresholds.get(best_stage.as_deref().unwrap_or("")).copied().unwrap_or(0.4);
+        let threshold = self
+            .thresholds
+            .get(best_stage.as_deref().unwrap_or(""))
+            .copied()
+            .unwrap_or(0.4);
         if best_score < threshold {
             return None;
         }
@@ -330,25 +472,60 @@ impl StageLearner {
 
     /// 导出指纹 (供调试/审查)
     pub fn export_fingerprints(&self) -> Vec<(String, String)> {
-        self.fingerprints.iter().map(|fp| (fp.stage.clone(), fp.anchor.clone())).collect()
+        self.fingerprints
+            .iter()
+            .map(|fp| (fp.stage.clone(), fp.anchor.clone()))
+            .collect()
     }
+}
+
+/// 去除 ANSI 转义序列和 bracketed paste 标记
+fn strip_ansi_escapes(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Consume CSI sequence: ESC [ ... <letter>  or  ESC [ ... ~
+            if let Some(&'[') = chars.peek() {
+                chars.next();
+                while let Some(&nc) = chars.peek() {
+                    if nc.is_ascii_alphabetic() || nc == '~' {
+                        chars.next();
+                        break;
+                    }
+                    chars.next();
+                }
+                continue;
+            }
+            // Consume lone ESC + following char
+            chars.next();
+            continue;
+        }
+        result.push(c);
+    }
+    result
 }
 
 /// 预计算字符串的 3-gram 哈希值 (用于高效 Jaccard 比较)
 fn compute_3gram_hashes(s: &str) -> Vec<u64> {
-    s.as_bytes().windows(3).map(|w| {
-        ((w[0] as u64) << 16) | ((w[1] as u64) << 8) | (w[2] as u64)
-    }).collect()
+    s.as_bytes()
+        .windows(3)
+        .map(|w| ((w[0] as u64) << 16) | ((w[1] as u64) << 8) | (w[2] as u64))
+        .collect()
 }
 
 /// 使用预计算 3-gram 计算 Jaccard 相似度
 fn jaccard_similarity(a_grams: &[u64], b_grams: &[u64]) -> f64 {
-    if a_grams.is_empty() || b_grams.is_empty() { return 0.0; }
+    if a_grams.is_empty() || b_grams.is_empty() {
+        return 0.0;
+    }
     let a_set: std::collections::HashSet<u64> = a_grams.iter().copied().collect();
     let b_set: std::collections::HashSet<u64> = b_grams.iter().copied().collect();
     let intersection = a_set.intersection(&b_set).count();
     let union = a_set.len() + b_set.len() - intersection;
-    if union == 0 { return 0.0; }
+    if union == 0 {
+        return 0.0;
+    }
     intersection as f64 / union as f64
 }
 
@@ -361,6 +538,8 @@ pub struct BootStageDetector {
     watchers: Vec<Watcher>,
     /// 可选: 文本相似度学习器，用于未知 SOC 自适应
     pub learner: Option<StageLearner>,
+    /// StageLearner 未分类行收集（供 Agent 自学习）
+    pub unclassified_lines: Vec<String>,
 }
 
 impl BootStageDetector {
@@ -373,23 +552,47 @@ impl BootStageDetector {
             last_crash_time: std::time::Instant::now() - std::time::Duration::from_secs(10),
             watchers: Vec::new(),
             learner: None,
+            unclassified_lines: Vec::new(),
         }
     }
 
     /// 加载参考日志, 启用自适应阶段检测 (用于新 SOC)
+    /// Hot-reload safe: preserves last_stage/crashed state from previous learner
     pub fn load_reference(&mut self, path: &std::path::Path) -> Result<(), String> {
-        let learner = StageLearner::from_reference(path)?;
-        tracing::info!("StageLearner loaded: {} fingerprints from {}", learner.fingerprints.len(), path.display());
+        let prev_last_stage = self.learner.as_ref().and_then(|l| l.last_stage.clone());
+        let prev_crashed = self.learner.as_ref().map(|l| l.crashed).unwrap_or(false);
+        let prev_unclassified = std::mem::take(&mut self.unclassified_lines);
+
+        let mut learner = StageLearner::from_reference(path)?;
+        tracing::info!(
+            "StageLearner loaded: {} fingerprints from {}",
+            learner.fingerprints.len(),
+            path.display()
+        );
+
+        // Preserve runtime state on hot-reload
+        learner.last_stage = prev_last_stage;
+        learner.crashed = prev_crashed;
         self.learner = Some(learner);
+        self.unclassified_lines = prev_unclassified;
+
         Ok(())
     }
 
     /// Add a temporary watcher (for `serial_wait_pattern`). Single pattern;
     /// `pattern_index` is 0. Use `add_watcher_multi` to wait on several
     /// patterns at once and learn which one matched.
-    pub fn add_watcher(&mut self, pattern: &str, sender: tokio::sync::mpsc::UnboundedSender<WatcherMatch>) {
+    pub fn add_watcher(
+        &mut self,
+        pattern: &str,
+        sender: tokio::sync::mpsc::UnboundedSender<WatcherMatch>,
+    ) {
         if let Ok(re) = Regex::new(pattern) {
-            self.watchers.push(Watcher { pattern: re, pattern_index: 0, sender });
+            self.watchers.push(Watcher {
+                pattern: re,
+                pattern_index: 0,
+                sender,
+            });
         }
     }
 
@@ -434,7 +637,10 @@ impl BootStageDetector {
     /// Remove all watchers sharing the same sender (identified by the
     /// sender's `same_channel` identity). Used to clean up a
     /// multi-pattern watcher group in one call.
-    pub fn remove_watcher_group(&mut self, sample: &tokio::sync::mpsc::UnboundedSender<WatcherMatch>) {
+    pub fn remove_watcher_group(
+        &mut self,
+        sample: &tokio::sync::mpsc::UnboundedSender<WatcherMatch>,
+    ) {
         self.watchers.retain(|w| !w.sender.same_channel(sample));
     }
 
@@ -485,7 +691,9 @@ impl BootStageDetector {
         if line.iter().all(|&b| b.is_ascii_whitespace()) {
             return events;
         }
-        let trimmed: Vec<u8> = line.iter().copied()
+        let trimmed: Vec<u8> = line
+            .iter()
+            .copied()
             .skip_while(|b| b.is_ascii_whitespace())
             .collect();
         let line_str = String::from_utf8_lossy(&trimmed).to_string();
@@ -502,6 +710,7 @@ impl BootStageDetector {
         self.boot_detected = false;
         self.login_sent = false;
         self.password_sent = false;
+        self.unclassified_lines.clear();
         if let Some(ref mut learner) = self.learner {
             learner.reset();
         }
@@ -541,51 +750,91 @@ impl BootStageDetector {
 
     fn check_stages(&mut self, line: &[u8]) -> Vec<BootEvent> {
         let mut events = Vec::new();
+        let text = String::from_utf8_lossy(line);
+        let trimmed = text.trim().to_string();
+        if trimmed.is_empty() {
+            return events;
+        }
 
-        // 1. Regex 精确匹配 (已知 SOC)
-        for stage in BOOT_STAGES.iter() {
-            if stage.pattern.is_match(line) {
-                if let Some(ev) = self.handle_stage(stage, line) {
-                    events.push(ev);
+        // ── 1. StageLearner 优先 (自适应, 已加载参考日志时) ──
+        let mut learner_matched = false;
+        if let Some(ref mut learner) = self.learner {
+            if let Some(stage_name) = learner.classify_line(&trimmed) {
+                learner_matched = true;
+                match stage_name.as_str() {
+                    "ddr" | "spl" => {
+                        if !self.boot_detected {
+                            self.boot_detected = true;
+                            self.login_sent = false;
+                            self.password_sent = false;
+                            events.push(BootEvent::BootStart);
+                        }
+                    }
+                    "uboot" => {
+                        if !self.boot_detected {
+                            self.boot_detected = true;
+                            self.login_sent = false;
+                            self.password_sent = false;
+                            events.push(BootEvent::BootStart);
+                        }
+                    }
+                    _ => {}
+                }
+                events.push(BootEvent::Stage(stage_name));
+            }
+        }
+
+        // ── 2. login/password regex (始终执行 — 需要触发 action) ──
+        if LOGIN_RE.is_match(line) {
+            if !self.login_sent {
+                self.login_sent = true;
+                events.push(BootEvent::LoginPrompt);
+            }
+        }
+        if PASSWD_RE.is_match(line) {
+            if !self.password_sent {
+                self.password_sent = true;
+                events.push(BootEvent::PasswordPrompt);
+            }
+        }
+
+        // ── 3. Regex 回退 (仅当 learner 未匹配时) ──
+        if !learner_matched {
+            for stage in BOOT_STAGES.iter() {
+                // login/password 已在步骤 2 处理
+                if stage.name == "login" || stage.name == "password" {
+                    continue;
+                }
+                if stage.pattern.is_match(line) {
+                    if let Some(ev) = self.handle_stage(stage, line) {
+                        events.push(ev);
+                    }
                 }
             }
         }
 
-        // 2. StageLearner 自适应回退 (未知 SOC, 有参考日志时)
+        // ── 4. 未分类行收集 ──
         if events.is_empty() {
-            if let Some(ref mut learner) = self.learner {
-                let text = String::from_utf8_lossy(line);
-                if let Some(stage_name) = learner.classify_line(&text) {
-                    // 检查是否与已检测阶段重复 (SPL 去重逻辑)
-                    if stage_name == "spl" && self.boot_detected {
-                        return events;
-                    }
-                    if stage_name == "spl" {
-                        self.boot_detected = true;
-                        self.login_sent = false;
-                        self.password_sent = false;
-                        events.push(BootEvent::BootStart);
-                    } else if stage_name == "uboot" && !self.boot_detected {
-                        // U-Boot 出现但 SPL 没被检测到 → 也触发 BootStart
-                        self.boot_detected = true;
-                        self.login_sent = false;
-                        self.password_sent = false;
-                        events.push(BootEvent::BootStart);
-                    }
-                    events.push(BootEvent::Stage(stage_name));
-                }
+            self.unclassified_lines.push(trimmed);
+            if self.unclassified_lines.len() >= 20 {
+                let drained: Vec<String> = self.unclassified_lines.drain(..).collect();
+                events.push(BootEvent::Unclassified(drained));
             }
+        } else if !self.unclassified_lines.is_empty() {
+            // 阶段边界 → 刷新积压的未分类行
+            let drained: Vec<String> = self.unclassified_lines.drain(..).collect();
+            events.push(BootEvent::Unclassified(drained));
         }
 
         events
     }
 
     fn handle_stage(&mut self, stage: &BootStage, _line: &[u8]) -> Option<BootEvent> {
-        // SPL 去重: 同一个 boot cycle 只触发一次
-        if stage.name == "spl" && self.boot_detected {
+        // SPL/DDR 去重: 同一个 boot cycle 只触发一次 BootStart
+        if (stage.name == "spl" || stage.name == "ddr") && self.boot_detected {
             return None;
         }
-        if stage.name == "spl" {
+        if stage.name == "spl" || stage.name == "ddr" {
             self.boot_detected = true;
             self.login_sent = false;
             self.password_sent = false;
@@ -661,6 +910,7 @@ mod tests {
             (BootEvent::PasswordPrompt, "PasswordPrompt") => true,
             (BootEvent::Crash(_, _), "Crash") => true,
             (BootEvent::Stage(_), "Stage") => true,
+            (BootEvent::Unclassified(_), "Unclassified") => true,
             _ => false,
         })
     }
@@ -686,7 +936,11 @@ mod tests {
         let mut detector = BootStageDetector::new();
         let events = detector.feed(b"DDR Version 1.08\n");
 
-        assert_eq!(get_stage_name(&events), Some("ddr"));
+        // DDR now triggers BootStart (rotate_log action) — verify via BootStart
+        assert!(
+            has_event(&events, "BootStart"),
+            "DDR should trigger BootStart"
+        );
     }
 
     #[test]
@@ -896,10 +1150,8 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
         // Register three patterns; the second should match.
-        let registered = detector.add_watcher_multi(
-            &["never_matches_xyz", "login:", "panic"],
-            tx.clone(),
-        );
+        let registered =
+            detector.add_watcher_multi(&["never_matches_xyz", "login:", "panic"], tx.clone());
         assert_eq!(registered, vec![0, 1, 2]);
 
         detector.feed(b"some login: prompt\n");
@@ -918,7 +1170,10 @@ mod tests {
         detector.remove_watcher_group(&tx);
 
         detector.feed(b"aaa\nbbb\n");
-        assert!(rx.try_recv().is_err(), "group cleanup should remove all watchers sharing the sender");
+        assert!(
+            rx.try_recv().is_err(),
+            "group cleanup should remove all watchers sharing the sender"
+        );
     }
 
     #[test]
@@ -952,6 +1207,10 @@ root@debian:~#\r\n\
         assert!(has_event(&events, "Autoboot"));
         assert!(has_event(&events, "LoginPrompt"));
         // Check that shell stage was detected (may not be the first Stage event)
-        assert!(events.iter().any(|e| matches!(e, BootEvent::Stage(s) if s == "shell")));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, BootEvent::Stage(s) if s == "shell"))
+        );
     }
 }

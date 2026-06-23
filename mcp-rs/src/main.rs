@@ -6,18 +6,8 @@
 //! Protocol: MCP (Model Context Protocol) 2024-11-05
 //! Transport: stdio (newline-delimited JSON-RPC 2.0)
 
-mod boot_detector;
-mod command_queue;
-mod config;
-mod console;
-mod lock_manager;
-mod log_manager;
-mod marker;
-mod mcp;
-mod mcp_http;
-mod relay_manager;
-mod serial_engine;
-mod state_manager;
+// All modules are in lib.rs — use the library crate.
+use embedded_debug_mcp as lib;
 
 const HELP: &str = "\
 embedded-debug-mcp — MCP serial console debugger for embedded Linux targets
@@ -148,15 +138,13 @@ async fn main() {
             .with_ansi(true)
             .with_env_filter(
                 tracing_subscriber::EnvFilter::from_default_env()
-                    .add_directive(
-                        format!("embedded_debug_mcp={log_level}").parse().unwrap(),
-                    ),
+                    .add_directive(format!("embedded_debug_mcp={log_level}").parse().unwrap()),
             )
             .init();
     } else {
         // 日志写到文件 (stdout 留给 JSON-RPC)
         let log_dir = std::path::PathBuf::from(
-            config::load_config()
+            lib::config::load_config()
                 .project_dir
                 .as_ref()
                 .map(|p| p.to_string_lossy().to_string())
@@ -177,9 +165,7 @@ async fn main() {
             .with_ansi(false)
             .with_env_filter(
                 tracing_subscriber::EnvFilter::from_default_env()
-                    .add_directive(
-                        format!("embedded_debug_mcp={log_level}").parse().unwrap(),
-                    ),
+                    .add_directive(format!("embedded_debug_mcp={log_level}").parse().unwrap()),
             )
             .init();
     }
@@ -187,7 +173,7 @@ async fn main() {
     tracing::info!("embedded-debug-mcp v{} starting", env!("CARGO_PKG_VERSION"));
 
     // ── 加载配置 ──
-    let cfg = config::load_config();
+    let cfg = lib::config::load_config();
     if cfg.config_path.is_none() {
         tracing::error!(
             "No .target.conf found. cwd={}, TARGET_CONF={:?}",
@@ -197,7 +183,7 @@ async fn main() {
     }
 
     // ── 创建并启动 engine（带超时防护）──
-    let engine = serial_engine::new_shared_engine(cfg.clone());
+    let engine = lib::serial_engine::new_shared_engine(cfg.clone());
 
     {
         let mut eng = engine.lock().await;
@@ -227,12 +213,12 @@ async fn main() {
             ("127.0.0.1".to_string(), 3000u16)
         };
         tracing::info!("Starting Streamable HTTP on {host}:{port}");
-        if let Err(e) = mcp_http::run_http(engine.clone(), &host, port).await {
+        if let Err(e) = lib::mcp_http::run_http(engine.clone(), &host, port).await {
             tracing::error!("HTTP server error: {e}");
         }
     } else {
         // Stdio transport (default)
-        let mut server = mcp::McpServer::new(engine.clone());
+        let mut server = lib::mcp::McpServer::new(engine.clone());
         if let Err(e) = server.run().await {
             tracing::error!("MCP server error: {e}");
         }

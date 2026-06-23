@@ -167,14 +167,20 @@ def _get_git_branch() -> str:
 
 # ── Serial state (read from MCP-written cache) ──────────────────────────────
 
-def _read_serial_text(project_dir: str) -> str:
-    """Read ANSI-formatted serial state from MCP's cache file.
+def _dut_serial_dir(project_dir: Path) -> Path:
+    """Find per-DUT directory, falling back to .dut-serial/."""
+    base = project_dir / ".dut-serial"
+    if base.is_dir():
+        for child in sorted(base.iterdir()):
+            if child.is_dir() and (child / "target-state").exists():
+                return child
+    return base
 
-    The MCP writes .dut-serial/statusline-cache on every state transition.
-    Falls back to reading target-state + formatting if cache is missing.
-    """
-    # Primary: read MCP's pre-formatted cache
-    cache = Path(project_dir) / ".dut-serial" / "statusline-cache"
+
+def _read_serial_text(project_dir: str) -> str:
+    """Read ANSI-formatted serial state from MCP's cache file."""
+    dut = _dut_serial_dir(Path(project_dir))
+    cache = dut / "statusline-cache"
     if cache.exists():
         try:
             text = cache.read_text().strip()
@@ -182,9 +188,7 @@ def _read_serial_text(project_dir: str) -> str:
                 return text
         except OSError:
             pass
-
-    # Fallback: read target-state and format locally
-    state_file = Path(project_dir) / ".dut-serial" / "target-state"
+    state_file = dut / "target-state"
     if state_file.exists():
         try:
             state = state_file.read_text().strip()
@@ -199,7 +203,6 @@ def _read_serial_text(project_dir: str) -> str:
                     return f"{code}{display_text}{reset}"
         except OSError:
             pass
-
     return ""
 
 

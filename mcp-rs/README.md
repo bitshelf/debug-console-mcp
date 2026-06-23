@@ -30,21 +30,41 @@ cargo build --release
 
 ## 配置
 
-在项目根目录创建 `.target.conf`:
+在项目根目录创建 `.target.toml` (推荐) 或 `.target.conf` (向后兼容):
+
+**.target.toml (推荐):**
+
+```toml
+[dev_host]
+ip = "192.168.1.xxx"
+
+[serial]
+port = 2000
+
+[target]
+login_user = "root"
+login_pass = ""
+
+[relay]
+# port = 2001          # 注释 = 不启用
+# reset_channel = 1
+# maskrom_channel = 2
+
+# StageLearner 参考日志 (启动时自动加载，顶层键必须在 [monitor] 之前)
+reference_log = ".dut-serial/reference-boot.log"
+
+[monitor]
+hang_timeout = 60
+max_archived_logs = 10
+```
+
+**.target.conf (向后兼容):**
 
 ```bash
-# 必填: 串口连接
 DEV_HOST_IP=192.168.1.xxx
 SERIAL_PORT=2000
-
-# 可选: 自动登录
 LOGIN_USER=root
 LOGIN_PASS=mypassword
-
-# 可选: 继电器复位
-RELAY_PORT=2001
-RESET_CHANNEL=2
-MASKROM_CHANNEL=1
 ```
 
 ## MCP Tools
@@ -67,6 +87,8 @@ MASKROM_CHANNEL=1
 | `serial_claim` | 夺取串口所有权 |
 | `serial_load_reference` | 加载参考启动日志启用自适应阶段检测 |
 | `serial_get_stages` | 查看已学习的启动阶段指纹 |
+| `serial_get_unclassified` | 获取 StageLearner 未能分类的行（供 Agent 自学习） |
+| `serial_append_reference` | 追加锚点行到参考日志 + 热重载 StageLearner |
 
 ## 模块结构
 
@@ -83,7 +105,7 @@ src/
 ├── command_queue.rs     # 命令队列: marker echo 串行化 + 响应路由
 ├── relay_manager.rs     # 继电器控制: 4 字节协议 over TCP
 ├── lock_manager.rs      # 互斥锁: O_EXCL 原子创建 + 僵尸清理
-├── config.rs            # 配置解析: shell 风格 .target.conf
+├── config.rs            # 配置解析: TOML .target.toml + shell .target.conf fallback
 └── marker.rs            # 标记符生成: 10 字符随机大写字母
 ```
 
@@ -113,15 +135,30 @@ serial_get_stages
 # StageLearner 使用 3-gram Jaccard 相似度 + 顺序约束
 ```
 
-### 算法
+### 检测流程 (v0.2.0+)
 
 ```
 对于每一行串口输出:
-  1. 计算与所有参考指纹的 3-gram Jaccard 相似度
-  2. 选择得分最高的阶段 (及其上下文锚定行)
-  3. 阈值过滤 (< 0.45 不匹配)
-  4. 顺序约束 (不允许阶段倒退 > 1)
-  5. 崩溃检测不受顺序约束 (任意位置均可触发)
+  1. 崩溃检测 (regex, 始终执行)
+  2. StageLearner 优先 (如果已加载参考日志):
+     a. 组合分数: 3-gram Jaccard * 0.6 + Jaro-Winkler * 0.4
+     b. 阈值过滤 (默认 0.45, 低于此值不匹配)
+     c. 顺序约束 (不允许阶段倒退 > 1)
+     d. DDR/SPL 匹配 → 触发 BootStart (日志分割)
+     e. 未匹配行 → 收集到 unclassified.log
+  3. login/password regex (始终执行, 触发自动登录)
+  4. Regex 回退 (仅当 StageLearner 未匹配时)
+```
+
+### Auto-Learning 闭环
+
+```
+StageLearner 未分类行
+  → serial_get_unclassified (Agent 获取)
+  → Agent 分析 + 裁剪关键锚点行
+  → serial_append_reference (追加 + 热重载)
+  → 下次 boot cycle 使用新指纹
+  → StageLearner 越用越准
 ```
 
 ### 跨 SOC 验证
@@ -148,7 +185,7 @@ serial_get_stages
 | `tracing` | 0.1 | 结构化日志 |
 | `tracing-subscriber` | 0.3 | 日志格式化 + env-filter |
 | `once_cell` | 1 | static lazy init (regex cache) |
-| `strsim` | 0.11 | StageLearner 文本相似度 (Sorensen-Dice) |
+| `strsim` | 0.11 | StageLearner: Jaccard + Jaro-Winkler + Sorensen-Dice |
 | `axum` | 0.8 | Streamable HTTP transport |
 | `tower-http` | 0.6 | CORS middleware (HTTP transport) |
 

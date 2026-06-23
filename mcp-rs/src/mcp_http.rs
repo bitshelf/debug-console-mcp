@@ -10,13 +10,13 @@
 //! `tower-http` so browser-based MCP clients can connect. No authentication
 //! is provided — rely on network-layer isolation (loopback/firewall).
 
-use std::sync::Arc;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 
@@ -94,25 +94,23 @@ async fn handle_mcp_post(
     let mut srv = server.lock().await;
 
     match srv.handle_raw_message(request).await {
-        Some(response) => {
-            match serde_json::to_string(&response) {
-                Ok(body) => Response::builder()
-                    .status(StatusCode::OK)
+        Some(response) => match serde_json::to_string(&response) {
+            Ok(body) => Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+            Err(e) => {
+                tracing::error!("HTTP: failed to serialize response: {e}");
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
                     .header("Content-Type", "application/json")
-                    .body(Body::from(body))
-                    .unwrap(),
-                Err(e) => {
-                    tracing::error!("HTTP: failed to serialize response: {e}");
-                    Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .header("Content-Type", "application/json")
-                        .body(Body::from(
-                            r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"Internal error"}}"#
-                        ))
-                        .unwrap()
-                }
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"Internal error"}}"#,
+                    ))
+                    .unwrap()
             }
-        }
+        },
         None => {
             // Notification → 202 Accepted, no body
             Response::builder()
