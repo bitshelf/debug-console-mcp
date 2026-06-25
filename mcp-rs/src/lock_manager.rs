@@ -125,6 +125,17 @@ fn try_create_lock(lock_path: &Path, host: &str, target: &str) -> Result<(), ()>
     use std::io::Write;
     let mut file = file;
     file.write_all(content.as_bytes()).map_err(|_| ())?;
+    // Restrict lock file permissions to owner-only (0600).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(lock_path)
+            .ok()
+            .map(|m| m.permissions())
+            .unwrap_or_else(|| std::fs::Permissions::from_mode(0o600));
+        perms.set_mode(0o600);
+        let _ = std::fs::set_permissions(lock_path, perms);
+    }
     Ok(())
 }
 

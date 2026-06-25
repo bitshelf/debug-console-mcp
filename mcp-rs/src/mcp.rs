@@ -938,8 +938,11 @@ impl McpServer {
                 let mut engine = self.engine.lock().await;
                 engine.queue_command(command, timeout)
             };
-            let result = match rx.await {
-                Ok(r) => {
+            let result = match tokio::time::timeout(
+                std::time::Duration::from_secs_f64(timeout),
+                rx
+            ).await {
+                Ok(Ok(r)) => {
                     let mut res = serde_json::json!({"output": r.output, "exit_code": r.exit_code, "timed_out": r.timed_out, "truncated": r.truncated});
                     span.record("result.output", &r.output);
                     span.record("result.exit_code", r.exit_code);
@@ -956,7 +959,18 @@ impl McpServer {
                     }
                     res
                 }
-                Err(_) => serde_json::json!({"error": "Command cancelled"}),
+                Ok(Err(_)) => serde_json::json!({"error": "Command cancelled"}),
+                Err(_elapsed) => {
+                    let mut res = serde_json::json!({
+                        "output": "(timeout — engine did not respond)",
+                        "exit_code": null,
+                        "timed_out": true
+                    });
+                    res["hint"] = serde_json::json!(
+                        "Engine timeout — MCP may be stuck. Try serial_get_state to check, or restart MCP."
+                    );
+                    res
+                }
             };
             return serde_json::json!({
                 "content": [{"type": "text", "text": serde_json::to_string(&result).unwrap_or_default()}]

@@ -73,6 +73,22 @@ impl TargetState {
     }
 }
 
+/// Write a file with restricted permissions (0600) to prevent other users
+/// from reading potentially sensitive target information.
+fn write_secure(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    std::fs::write(path, content)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path)?.permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(path, perms)?;
+    }
+    Ok(())
+}
+
+/// Manages target device state with hysteresis debounce, atomic file writes,
+/// hang/heartbeat detection, and three-tier state visibility (internal, MCP-API, statusline).
 pub struct StateManager {
     current: TargetState,
     state_file: PathBuf,
@@ -97,6 +113,12 @@ pub struct StateManager {
     dut_alias: String,
     /// Project root directory (for constructing alias-specific state paths).
     project_dir: PathBuf,
+    /// Metrics: total commands successfully executed.
+    command_count: u64,
+    /// Metrics: total command errors (timeout, disconnection).
+    error_count: u64,
+    /// Metrics: engine start timestamp.
+    start_time: Instant,
 }
 
 impl StateManager {
@@ -134,6 +156,9 @@ impl StateManager {
             heartbeat_missed: 0,
             dut_alias: dut_alias.to_string(),
             project_dir: project_dir.to_path_buf(),
+            command_count: 0,
+            error_count: 0,
+            start_time: Instant::now(),
         }
     }
 
@@ -150,12 +175,14 @@ impl StateManager {
         format!("{:08x}", digest).chars().take(8).collect()
     }
 
-    /// Write PID file — call only after lock is acquired.
+    /// Write PID file with restricted permissions (0600).
+    /// Call only after the project-level lock is acquired.
     pub fn write_pid(&self, project_dir: &Path, dut_dir: &str) {
         let pid_file = project_dir.join(dut_dir).join("mcp.pid");
-        std::fs::write(&pid_file, std::process::id().to_string()).ok();
+        let _ = write_secure(&pid_file, &std::process::id().to_string());
     }
 
+    /// Return the current internal target state.
     pub fn current(&self) -> TargetState {
         self.current
     }
@@ -169,6 +196,34 @@ impl StateManager {
         }
     }
 
+    /// Increment the successful command counter.
+    pub fn inc_command(&mut self) {
+        self.command_count += 1;
+    }
+
+    /// Increment the command error counter.
+    pub fn inc_error(&mut self) {
+        self.error_count += 1;
+    }
+
+    /// Engine uptime in seconds since start.
+    pub fn uptime_secs(&self) -> f64 {
+        self.start_time.elapsed().as_secs_f64()
+    }
+
+    /// Number of commands successfully executed.
+    pub fn command_count(&self) -> u64 {
+        self.command_count
+    }
+
+    /// Number of command errors (timeout, disconnection).
+    pub fn error_count(&self) -> u64 {
+        self.error_count
+    }
+
+    /// Transition to a new target state. No-op if `new` is the same as current.
+    /// Writes state files atomically for external states; deletes files on Stopped;
+    /// skips file writes for Connecting (avoiding statusline flicker).
     pub fn transition(&mut self, new: TargetState) {
         if new == self.current {
             return;
@@ -217,7 +272,8 @@ impl StateManager {
         }
     }
 
-    /// ANSI-formatted statusline text for a given state.
+    /// Produce an ANSI-formatted statusline string for a given target state.
+    /// Returns empty string for Stopped and Connecting (no display).
     pub(crate) fn format_statusline(state: TargetState) -> String {
         let text: &str = match state {
             TargetState::Active => "\x1b[32m● serial:active\x1b[0m",
@@ -336,9 +392,9 @@ impl StateManager {
             _ => return,
         };
 
-        if let Err(e) = std::fs::write(
+        if let Err(e) = write_secure(
             &path,
-            serde_json::to_string_pretty(&alert).unwrap_or_default(),
+            &serde_json::to_string_pretty(&alert).unwrap_or_default(),
         ) {
             tracing::error!("Failed to write notification {path:?}: {e}");
         } else {
@@ -364,7 +420,7 @@ impl StateManager {
 
     fn atomic_write(&self, path: &Path, content: &str) {
         let tmp = path.with_extension("tmp");
-        if let Err(e) = std::fs::write(&tmp, content) {
+        if let Err(e) = write_secure(&tmp, content) {
             tracing::error!("StateManager: write failed: {e}");
             return;
         }

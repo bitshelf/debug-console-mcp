@@ -120,6 +120,10 @@ pub struct CommandQueue {
     buffer_cap: usize,
     /// Bytes to keep when trimming (default: TRIM_KEEP).
     trim_keep: usize,
+    /// Counter: successfully completed commands (timed_out=false).
+    pub completed_count: u64,
+    /// Counter: failed commands (timed_out=true).
+    pub error_count: u64,
 }
 
 impl CommandQueue {
@@ -130,6 +134,8 @@ impl CommandQueue {
             write_fn: None,
             buffer_cap: BUFFER_CAP,
             trim_keep: TRIM_KEEP,
+            completed_count: 0,
+            error_count: 0,
         }
     }
 
@@ -185,6 +191,7 @@ impl CommandQueue {
                         format!("(timeout — partial output)\n{}", partial.trim())
                     };
                     pc.resolve(output, true, None);
+                    self.error_count += 1;
                 }
                 self.dequeue_next();
             }
@@ -276,6 +283,7 @@ impl CommandQueue {
             let rest = pc.buffer[idx + marker.len()..].to_vec();
             if let Some(pc) = self.current.take() {
                 pc.resolve(clean_output, false, exit_code);
+                self.completed_count += 1;
             }
             self.dequeue_next();
             if !rest.is_empty() {
@@ -297,6 +305,7 @@ impl CommandQueue {
                         format!("(timeout — partial output)\n{}", partial.trim())
                     };
                     pc.resolve(output, true, None);
+                    self.error_count += 1;
                     self.dequeue_next();
                 }
             }

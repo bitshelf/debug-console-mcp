@@ -553,6 +553,18 @@ impl SerialEngine {
                 self.handle_read_error(e).await;
             }
         }
+
+        // Drain command metrics from CommandQueue → StateManager
+        let completed = self.commands.completed_count;
+        let errors = self.commands.error_count;
+        for _ in 0..completed {
+            self.state.inc_command();
+        }
+        for _ in 0..errors {
+            self.state.inc_error();
+        }
+        self.commands.completed_count = 0;
+        self.commands.error_count = 0;
     }
 
     async fn handle_read_error(&mut self, e: std::io::Error) {

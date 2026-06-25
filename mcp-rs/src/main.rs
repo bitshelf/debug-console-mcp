@@ -78,6 +78,26 @@ Files:
   {project}/.dut-serial/mcp.log   Server log
   /tmp/debug-console/locks/      Per host:port mutual exclusion
 
+Quick Start:
+  # Start in stdio mode (Claude Code spawns automatically):
+  debug-console-mcp
+
+  # Start in HTTP mode for dutabo CLI access:
+  debug-console-mcp --http
+
+  # Debug with verbose logging:
+  debug-console-mcp --log-to-stderr --verbose
+
+Troubleshooting:
+  # Check hardware connectivity:
+  bash scripts/diagnose.sh
+
+  # Kill all MCP processes and restart:
+  pkill debug-console-mcp; debug-console-mcp --log-to-stderr
+
+  # Build and deploy:
+  bash deploy-all.sh
+
 Version: debug-console-mcp v{}\n";
 
 fn print_help() {
