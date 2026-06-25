@@ -826,6 +826,10 @@ impl SerialEngine {
             "log_path": self.logs.current_path().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
             "relay_configured": self.relay.configured(),
             "login_configured": !self.login_user.is_empty(),
+            "uptime_secs": self.state.uptime_secs(),
+            "command_count": self.state.command_count(),
+            "error_count": self.state.error_count(),
+            "pending_commands": self.commands.pending_len(),
         })
     }
 

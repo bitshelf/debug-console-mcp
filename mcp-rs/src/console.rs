@@ -61,6 +61,27 @@ impl SerialConsoleDriver {
                     std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout")
                 })??;
         stream.set_nodelay(true).ok();
+        #[cfg(target_os = "linux")]
+        {
+            let socket = socket2::SockRef::from(&stream);
+            socket.set_keepalive(true)?;
+            let keepalive = socket2::TcpKeepalive::new()
+                .with_time(std::time::Duration::from_secs(30))
+                .with_interval(std::time::Duration::from_secs(5));
+            socket.set_tcp_keepalive(&keepalive)?;
+            // TCP_KEEPCNT not in socket2 0.5 TcpKeepalive; set via libc
+            let fd = std::os::fd::AsRawFd::as_raw_fd(&stream);
+            let cnt: libc::c_int = 3;
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_TCP,
+                    libc::TCP_KEEPCNT,
+                    &cnt as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
         self.stream = Some(stream);
         self.connected = true;
         Ok(())

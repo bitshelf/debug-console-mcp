@@ -356,6 +356,23 @@ pub fn parse_dut_configs(toml_path: &Path) -> Result<Vec<DutConfig>, String> {
             .into_iter()
             .map(|d| dut_toml_to_config(d, &global, &dev_hosts))
             .collect();
+
+        // Check for port conflicts between DUTs
+        let mut ports_seen: std::collections::HashMap<String, Vec<String>> = HashMap::new();
+        for dut in &configs {
+            let key = format!("{}:{}", dut.dev_host_ip, dut.serial_port);
+            ports_seen.entry(key).or_default().push(dut.alias.clone());
+        }
+        for (key, aliases) in &ports_seen {
+            if aliases.len() > 1 {
+                tracing::warn!(
+                    "[AGENT-NOTIFY] Port conflict: {} shared by DUTs: {:?}. \
+                     Each DUT needs a unique ser2net port.",
+                    key, aliases
+                );
+            }
+        }
+
         Ok(configs)
     } else {
         Ok(vec![default_dut_config(&global, &dev_hosts)])

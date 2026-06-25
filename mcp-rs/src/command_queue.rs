@@ -148,6 +148,11 @@ impl CommandQueue {
         self.write_fn = Some(f);
     }
 
+    /// Number of commands waiting in the pending queue.
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
     /// Submit a command and return a receiver to await the result.
     #[tracing::instrument(skip(self), fields(cmd = %command, timeout = timeout_secs))]
     pub fn execute(

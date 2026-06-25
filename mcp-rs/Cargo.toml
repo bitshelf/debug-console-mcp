@@ -27,6 +27,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 once_cell = "1"
 strsim = "0.11"
 libc = "0.2"
+socket2 = "0.5"
 dut-ctrl = { path = "dut-ctrl" }
 axum = { version = "0.8", features = ["json"] }
 tower-http = { version = "0.6", features = ["cors"] }

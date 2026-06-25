@@ -146,6 +146,11 @@ fn tool_definitions() -> Vec<ToolDef> {
             input_schema: serde_json::json!({"type": "object", "properties": {}}),
         },
         ToolDef {
+            name: "serial_get_metrics",
+            description: "Get engine metrics: uptime, command count, error count, pending commands.",
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+        },
+        ToolDef {
             name: "serial_claim",
             description: "Claim serial ownership for this session. Releases the lock from any other session and reconnects the serial. Only works if no other session is actively using the serial.",
             input_schema: serde_json::json!({"type": "object", "properties": {}}),
@@ -1038,6 +1043,14 @@ impl McpServer {
             "serial_new_log" => engine.rotate_log(),
             "serial_poll_logs" => engine.poll_logs(),
             "serial_get_config" => engine.get_config(),
+            "serial_get_metrics" => serde_json::json!({
+                "uptime_secs": engine.state.uptime_secs(),
+                "command_count": engine.state.command_count(),
+                "error_count": engine.state.error_count(),
+                "pending_commands": engine.commands.pending_len(),
+                "completed": engine.commands.completed_count,
+                "cmd_errors": engine.commands.error_count,
+            }),
             "serial_claim" => engine.claim_serial().await,
             "serial_load_reference" => {
                 let path_str = args
@@ -1514,7 +1527,7 @@ mod tests {
 
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 26, "Expected 26 MCP tools");
+        assert_eq!(tools.len(), 27, "Expected 27 MCP tools");
 
         // Check some tool names
         let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
