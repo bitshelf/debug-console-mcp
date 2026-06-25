@@ -1695,6 +1695,33 @@ mod tests {
         assert!(text.contains("DEV_HOST_IP"));
     }
 
+    #[test]
+    fn test_prompts_include_v03_tools() {
+        let prompts = McpServer::build_prompts();
+        let names: Vec<&str> = prompts["prompts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"boot-capture"), "Should have boot-capture prompt");
+        assert!(names.contains(&"crash-diagnose"), "Should have crash-diagnose prompt");
+        assert!(names.contains(&"uboot-recovery"), "Should have uboot-recovery prompt");
+    }
+
+    #[test]
+    fn test_prompt_content_not_empty() {
+        let boot = McpServer::build_prompt_content("boot-capture");
+        assert!(boot["messages"].as_array().map_or(false, |a| !a.is_empty()),
+            "boot-capture prompt should have messages");
+        let crash = McpServer::build_prompt_content("crash-diagnose");
+        assert!(crash["messages"].as_array().map_or(false, |a| !a.is_empty()),
+            "crash-diagnose prompt should have messages");
+        let uboot = McpServer::build_prompt_content("uboot-recovery");
+        assert!(uboot["messages"].as_array().map_or(false, |a| !a.is_empty()),
+            "uboot-recovery prompt should have messages");
+    }
+
     #[tokio::test]
     async fn test_error_response_format() {
         let resp = McpServer::error_response(Some(Value::Number(1.into())), -32600, "test error");

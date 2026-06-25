@@ -13,14 +13,12 @@ power control, multi-DUT support, exponential backoff reconnect.
 # 1. Build & deploy
 cd mcp-rs && cargo build --release && ./deploy.sh
 
-# 2. Create config from template
+# 2. Create config + per-DUT directory
 cp references/.target.toml.example .target.toml
-vi .target.toml    # set dev_host.ip, serial.port, dut.alias
-
-# 3. Create .dut-serial directory
+vi .target.toml                            # set dev_host.ip, serial.port, dut.alias
 mkdir -p .dut-serial/$(grep alias .target.toml | head -1 | cut -d'"' -f2)/logs
 
-# 4. Restart Claude Code → SessionStart hook auto-starts MCP
+# 3. Restart Claude Code → SessionStart hook auto-starts MCP
 ```
 
 ## Hardware Setup — Dev Host
@@ -143,7 +141,7 @@ login_user = "root"
 reference_log = ".dut-serial/rk3576-yt9215/reference-boot.log"
 ```
 
-## MCP Tools
+## MCP Tools (27 total)
 
 | Tool | Description |
 |------|-------------|
@@ -153,19 +151,27 @@ reference_log = ".dut-serial/rk3576-yt9215/reference-boot.log"
 | `serial_list_logs` | List archived boot logs |
 | `serial_reset` | Hardware reset + log rotation |
 | `serial_enter_uboot` | Enter U-Boot (Ctrl-C flood, bootdelay=0 compatible) |
-| `serial_reboot_uboot` | Soft reboot + Ctrl-C flood → U-Boot |
+| `serial_reboot_uboot` | Soft reboot + Ctrl-C flood -> U-Boot |
 | `serial_enter_maskrom` | Enter MASKROM mode (if relay configured) |
 | `serial_wait_pattern` | Wait for pattern (probe on timeout) |
 | `serial_uboot_command` | Send command at U-Boot `=>` prompt |
 | `serial_new_log` | Manually rotate log |
 | `serial_poll_logs` | Incremental output (file position tracking) |
 | `serial_get_config` | View current config (read-only) |
-| `serial_claim` | Claim serial ownership |
+| `serial_get_metrics` | Engine metrics: uptime, command/error count, pending |
+| `serial_claim` | Claim serial ownership for this session |
 | `serial_button` | Press/release/pulse reset/maskrom/recovery buttons |
+| `serial_pause` | Pause serial engine for dutabo takeover |
+| `serial_resume` | Resume after pause |
+| `serial_send_raw` | Send raw bytes (no markers, no wrapping) |
 | `serial_load_reference` | Load reference log for StageLearner |
-| `serial_get_stages` | View learned fingerprints |
+| `serial_get_stages` | View learned stage fingerprints |
 | `serial_get_unclassified` | Get unclassified lines (self-learning) |
 | `serial_append_reference` | Append anchor lines + hot-reload StageLearner |
+| `serial_learn_connection` | Auto-learn connection (3x reset, similarity check) |
+| `serial_verify_relay` | Verify CH340 relay control (ON/OFF read-back) |
+| `serial_flash_plan` | Generate flash plan from .target.toml [flash] config |
+| `serial_flash` | Execute firmware flash via dev host SSH |
 
 ## Target States
 

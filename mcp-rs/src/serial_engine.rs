@@ -1930,6 +1930,7 @@ pub fn new_shared_engine(config: Config) -> SharedEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ConfigFormat;
     use std::collections::HashMap;
     use tempfile::TempDir;
 
@@ -2200,6 +2201,29 @@ mod tests {
     }
 
     // ── state transition tests (no hardware) ─────────────────────────────
+
+    #[tokio::test]
+    async fn test_get_state_dict_fields() {
+        let mut values = std::collections::HashMap::new();
+        values.insert("DEV_HOST_IP".into(), "127.0.0.1".into());
+        values.insert("SERIAL_PORT".into(), "2000".into());
+        values.insert("LOGIN_USER".into(), "test".into());
+        values.insert("DUT_ALIAS".into(), "test-dut".into());
+        values.insert("LOCK_DIR".into(), "/tmp/test-locks".into());
+        let cfg = Config {
+            values,
+            config_path: None,
+            project_dir: Some(std::env::temp_dir()),
+            format: ConfigFormat::None,
+        };
+        let engine = new_shared_engine(cfg);
+        let eng = engine.lock().await;
+        let state = eng.get_state_dict();
+        assert!(state.get("state").is_some());
+        assert!(state.get("login_configured").is_some());
+        assert!(state.get("relay_configured").is_some());
+        assert!(state.get("boot_number").is_some());
+    }
 
     #[tokio::test]
     async fn test_engine_new_and_stop() {

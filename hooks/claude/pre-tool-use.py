@@ -21,36 +21,51 @@ from lib import find_project_dir
 
 
 def _read_dev_host() -> str:
-    """Read DEV_HOST_IP from .target.toml or .target.conf.
+    """Read DEV_HOST_IP from project .target.toml, NOT CWD.
+    Falls back to global lock files, then CWD walk-up."""
+    # Use find_project_dir which checks lock files first (session-stable)
+    proj = find_project_dir()
+    search_dirs = [Path(proj)] if proj else [Path.cwd()]
 
-    Tries TOML first (preferred), falls back to shell format.
-    Returns empty string if not found.
-    """
-    cwd = Path.cwd()
+    for base in search_dirs:
+        toml_conf = base / ".target.toml"
+        if toml_conf.exists():
+            try:
+                import tomllib
+                with open(toml_conf, "rb") as f:
+                    data = tomllib.load(f)
+                # Check [[dut]] first, then [dev_host]
+                for dut in data.get("dut", []):
+                    dh = dut.get("dev_host", "")
+                    if dh:
+                        # resolve alias from [[dev_hosts]]
+                        for host in data.get("dev_hosts", []):
+                            if host.get("alias") == dh:
+                                ip = host.get("ip", "")
+                                if ip:
+                                    return str(ip)
+                # Check top-level [dev_host] and [[dev_hosts]]
+                for hosts_key in ("dev_hosts",):
+                    for host in data.get(hosts_key, []):
+                        ip = host.get("ip", "")
+                        if ip:
+                            return str(ip)
+                dh = data.get("dev_host", {})
+                ip = dh.get("ip", "")
+                if ip:
+                    return str(ip)
+            except (OSError, KeyError, ValueError, ImportError):
+                pass
 
-    # Try TOML first
-    toml_conf = cwd / ".target.toml"
-    if toml_conf.exists():
-        try:
-            import tomllib
-            with open(toml_conf, "rb") as f:
-                data = tomllib.load(f)
-            ip = data.get("dev_host", {}).get("ip", "")
-            if ip:
-                return str(ip)
-        except (OSError, KeyError, ValueError, ImportError):
-            pass
-
-    # Fall back to shell format
-    conf = cwd / ".target.conf"
-    if conf.exists():
-        try:
-            for line in conf.read_text().splitlines():
-                line = line.strip()
-                if line.startswith("DEV_HOST_IP="):
-                    return line.split("=", 1)[1].strip().strip('"').strip("'")
-        except OSError:
-            pass
+        conf = base / ".target.conf"
+        if conf.exists():
+            try:
+                for line in conf.read_text().splitlines():
+                    line = line.strip()
+                    if line.startswith("DEV_HOST_IP="):
+                        return line.split("=", 1)[1].strip().strip('"').strip("'")
+            except OSError:
+                pass
     return ""
 
 
@@ -111,9 +126,37 @@ def main():
 
     project_dir = find_project_dir()
     if not project_dir:
-        # No .target.conf found — not an embedded debug project
         print(json.dumps({"continue": True}))
         sys.exit(0)
+
+    # ── CRITICAL: Block dangerous commands targeting the Dev Host ──
+    # The Dev Host is a PRODUCTION machine (MYD-LR3576). It bridges serial
+    # and runs upgrade_tool to flash the TARGET board via USB OTG.
+    # NEVER reboot, flash, dd, rm -rf, or modify the Dev Host itself.
+    dev_host = _read_dev_host()
+    if dev_host:
+        dev_host_pattern = re.escape(dev_host)
+        dangerous = [
+            (rf"ssh\s+.*{dev_host_pattern}.*(?:reboot|shutdown|poweroff)", "reboot/shutdown"),
+            (rf"ssh\s+.*{dev_host_pattern}.*(?:dd\s+if=|dd\s+of=/dev)", "dd disk write"),
+            (rf"ssh\s+.*{dev_host_pattern}.*(?:mkfs\.|mke2fs|mkfs)", "mkfs format"),
+            (rf"ssh\s+.*{dev_host_pattern}.*rm\s+-rf\s+/", "rm -rf /"),
+            (rf"ssh\s+.*{dev_host_pattern}.*(?:apt\s+install|apt\s+remove|dpkg)", "apt/pkg modify"),
+            (rf"ssh\s+.*{dev_host_pattern}.*(?:upgrade_tool\s+uf|upgrade_tool\s+db)(?!.*\.img)", "upgrade_tool without image"),
+        ]
+        for pattern, label in dangerous:
+            if re.search(pattern, command):
+                print(json.dumps({
+                    "continue": False,
+                    "systemMessage": (
+                        f"[CRITICAL] BLOCKED: dangerous operation ({label}) targeting Dev Host ({dev_host}). "
+                        "The Dev Host is a PRODUCTION machine — NEVER modify it. "
+                        "To flash a target board: the image must be UPLOADED to the Dev Host, "
+                        "then upgrade_tool flashes the TARGET via USB OTG. "
+                        "Use serial_flash_plan + serial_flash MCP tools, or rk-build skill scripts."
+                    )
+                }))
+                sys.exit(0)
 
     serial_patterns = _build_serial_patterns()
     relay_patterns = _build_relay_patterns()
