@@ -34,10 +34,6 @@ Rust 实现 (mcp-rs/), 零框架 MCP (纯 JSON-RPC 2.0)。strsim 文本相似度
 cp ~/.local/share/debug-console-mcp/references/.target.toml.example .target.toml
 # 编辑 [dev_host], [serial], [target] 等配置段
 
-# 或使用旧格式（向后兼容）
-cp ~/.local/share/debug-console-mcp/references/.target.conf.example .target.conf
-# 编辑 DEV_HOST_IP, SERIAL_PORT 等配置
-
 # 2. 确保 MCP binary 已安装
 ls ~/.local/bin/debug-console-mcp
 
@@ -45,7 +41,7 @@ ls ~/.local/bin/debug-console-mcp
 # 无需手动操作 — SessionStart hook 处理一切
 ```
 
-配置文件仅在 CWD 查找：优先 `.target.toml`（TOML），回退 `.target.conf`（Shell）。可用 `TARGET_CONF` 环境变量覆盖路径。
+配置文件仅在 CWD 向上查找 `.target.toml`。可用 `TARGET_CONF` 环境变量覆盖路径。
 
 ## Quick Reference
 
@@ -138,15 +134,6 @@ max_archived_logs = 10
 
 # StageLearner: 参考启动日志（启用文本相似度阶段检测 + 日志分割）
 reference_log = ".dut-serial/reference-boot.log"
-```
-
-也支持旧 Shell 格式 `.target.conf`（向后兼容）。
-
-```bash
-DEV_HOST_IP=192.168.1.xxx
-SERIAL_PORT=2000
-LOGIN_USER=root
-# REFERENCE_LOG=/path/to/reference-boot.log
 ```
 
 ## Common Workflows

@@ -38,15 +38,15 @@ Options:
       --dry-run          Validate config and exit without connecting.
 
 Environment:
-  TARGET_CONF        Path to .target.conf file (alternative to CWD search).
+  TARGET_CONF        Path to .target.toml file (alternative to CWD search).
   RUST_LOG           tracing filter (e.g. RUST_LOG=debug).
                      Overridden by --verbose.
 
 Configuration:
-  The server searches recursively upward from CWD for .target.conf.
+  The server searches recursively upward from CWD for .target.toml.
   See README.md for the full configuration reference.
 
-  Example .target.conf:
+  Example .target.toml:
     DEV_HOST_IP=192.168.1.189
     SERIAL_PORT=2000
     LOGIN_USER=root
@@ -73,7 +73,7 @@ MCP Tools:
   serial_get_stages    - Show learned stage fingerprints
 
 Files:
-  {project}/.target.conf          Target configuration
+  {project}/.target.toml          Target configuration
   {project}/.dut-serial/logs/     Boot log archives
   {project}/.dut-serial/target-state   Current state file
   {project}/.dut-serial/mcp.log   Server log
@@ -224,7 +224,7 @@ async fn main() {
     let cfg = lib::config::load_config();
     if cfg.config_path.is_none() {
         tracing::error!(
-            "No .target.conf found. cwd={}, TARGET_CONF={:?}",
+            "No .target.toml found. cwd={}, TARGET_CONF={:?}",
             std::env::current_dir().unwrap_or_default().display(),
             std::env::var("TARGET_CONF").ok()
         );
@@ -283,7 +283,7 @@ async fn main() {
             Err(_) => tracing::error!("Engine start timed out after 5s"),
         }
 
-        // 自动加载参考日志 (RK_REFERENCE_LOG in .target.conf)
+        // 自动加载参考日志 (RK_REFERENCE_LOG in .target.toml)
         let ref_log = cfg.reference_log();
         if !ref_log.is_empty() {
             let path = std::path::PathBuf::from(&ref_log);
