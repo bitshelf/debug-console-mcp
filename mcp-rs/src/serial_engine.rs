@@ -44,8 +44,6 @@ pub struct SerialEngine {
     paused: bool,
     /// Reconnection manager with exponential backoff.
     reconnect: ReconnectManager,
-    /// Periodic statusline cache refresh timer (debounce: write at most every 5s).
-    statusline_last_refresh: Option<std::time::Instant>,
 }
 
 impl SerialEngine {
@@ -106,7 +104,6 @@ impl SerialEngine {
             poll_position: 0,
             paused: false,
             reconnect: ReconnectManager::new(),
-            statusline_last_refresh: None,
         }
     }
 
@@ -478,8 +475,6 @@ impl SerialEngine {
         self.console.drain_writes().await;
 
         // Periodic statusline cache refresh (every 5s) — keeps timestamps fresh
-        // and shows "last seen N seconds ago" info even when state is stable.
-        self.refresh_statusline_cache();
 
         // Handle resume from dutabo: reconnect with backoff, then go active
         if !self.paused && self.state.current() == TargetState::Dutabo {
@@ -686,33 +681,6 @@ impl SerialEngine {
                         tracing::info!("Text similarity: reboot detected → log rotated + booting");
                     }
                 }
-            }
-        }
-    }
-
-    /// Periodic statusline cache refresh — debounced to at most once every 5 seconds.
-    /// Called from `read_loop_iter` on every iteration so timestamps stay fresh even
-    /// when the target is stable in a single state (no transitions).
-    fn refresh_statusline_cache(&mut self) {
-        let now = std::time::Instant::now();
-        let need_refresh = match self.statusline_last_refresh {
-            Some(last) => (now - last).as_secs() >= 5,
-            None => true,
-        };
-        if !need_refresh {
-            return;
-        }
-        self.statusline_last_refresh = Some(now);
-        let alias = self.config.get_str_or("DUT_ALIAS", "default");
-        if let Some(ref proj) = self.config.project_dir {
-            let cache = proj
-                .join(&self.config.dut_dir())
-                .join(&alias)
-                .join("statusline-cache");
-            let state = self.state.current();
-            let text = self.state.format_statusline(state);
-            if !text.is_empty() {
-                let _ = std::fs::write(&cache, &text);
             }
         }
     }

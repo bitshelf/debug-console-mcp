@@ -52,8 +52,8 @@ def find_project_dir() -> Optional[str]:
     """Find project root — per-hash lock prevents cross-project interference.
 
     1. TARGET_CONF env var (explicit override)
-    2. Scan /dev/shm/claude-serial-*.lock for valid projects
-    3. Walk-up from CWD (fallback)
+    2. Walk-up from CWD (current working directory)
+    3. Scan /dev/shm/claude-serial-*.lock for valid projects (fallback)
     """
     if env := os.environ.get("TARGET_CONF"):
         p = Path(env)
@@ -61,13 +61,7 @@ def find_project_dir() -> Optional[str]:
             d = p.resolve().parent
             if _is_valid_project_dir(d):
                 return str(d)
-    # Scan ALL per-hash locks — return first valid one found
-    import glob
-    for lock_path in sorted(glob.glob("/dev/shm/claude-serial-*.lock")):
-        cached = _read_lock(lock_path)
-        if cached and _is_valid_project_dir(Path(cached)):
-            return cached
-    # Fallback: walk up from CWD
+    # Walk up from CWD first — the user's current intent
     d = Path.cwd()
     while True:
         for name in (".target.toml", ".target.conf"):
@@ -77,6 +71,12 @@ def find_project_dir() -> Optional[str]:
         if parent == d:
             break
         d = parent
+    # Fallback: scan per-hash locks for any valid project
+    import glob
+    for lock_path in sorted(glob.glob("/dev/shm/claude-serial-*.lock")):
+        cached = _read_lock(lock_path)
+        if cached and _is_valid_project_dir(Path(cached)):
+            return cached
     return None
 
 

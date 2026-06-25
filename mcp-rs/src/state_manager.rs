@@ -713,4 +713,37 @@ mod tests {
         assert_eq!(sm.current(), TargetState::Disconnected);
         assert_eq!(sm.external_state(), Some(TargetState::Disconnected));
     }
+
+    #[test]
+    fn test_format_statusline_has_ansi_colors() {
+        let sm = StateManager::new(
+            &std::env::temp_dir(), 60, 3, ".dut-serial", "test-board"
+        );
+        let text = sm.format_statusline(TargetState::Active);
+        assert!(text.contains("\x1b[32m"), "Active state must have green ANSI code, got: {:?}", text);
+        assert!(text.contains("\x1b[0m"), "Must have ANSI reset code");
+        assert!(text.contains("test-board"), "Must use DUT alias 'test-board'");
+
+        let crash = sm.format_statusline(TargetState::Crashed);
+        assert!(crash.contains("\x1b[31m"), "Crashed state must have red ANSI code");
+        assert!(crash.contains("\x1b[0m"), "Must have ANSI reset code");
+
+        let dutoff = sm.format_statusline(TargetState::DutOff);
+        assert!(dutoff.contains("\x1b[31m"), "DUT-off state must have red ANSI code");
+        assert!(dutoff.contains("\x1b[0m"), "Must have ANSI reset code");
+
+        // "default" alias should use "serial" as label (backward compat)
+        let sm_default = StateManager::new(
+            &std::env::temp_dir(), 60, 3, ".dut-serial", "default"
+        );
+        let text2 = sm_default.format_statusline(TargetState::Active);
+        assert!(text2.contains("serial"), "Default alias must use 'serial' label");
+
+        // Empty alias should also use "serial"
+        let sm_empty = StateManager::new(
+            &std::env::temp_dir(), 60, 3, ".dut-serial", ""
+        );
+        let text3 = sm_empty.format_statusline(TargetState::Active);
+        assert!(text3.contains("serial"), "Empty alias must use 'serial' label");
+    }
 }
