@@ -12,10 +12,10 @@ pub fn check_project_singleton(project_dir: &Path, dut_dir: &str) -> Option<u32>
     let content = std::fs::read_to_string(&pid_file).ok()?;
     let pid: u32 = content.trim().parse().ok()?;
     if process_alive(pid) {
-        // Verify it's actually an embedded-debug-mcp process (not some other
+        // Verify it's actually an debug-console-mcp process (not some other
         // process that reused the PID).
         if let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
-            if comm.contains("embedded-debug") {
+            if comm.contains("debug-console") {
                 return Some(pid);
             }
         }
@@ -291,7 +291,7 @@ mod tests {
         let dir_str = dir.to_str().unwrap();
         assert!(acquire_lock("10.0.0.5", "7000", dir_str).is_none());
 
-        // The lock file must be in `dir`, not in /tmp/embedded-debug/locks.
+        // The lock file must be in `dir`, not in /tmp/debug-console/locks.
         let lock_key = format!("{:x}", fnv1a_hash("10.0.0.5:7000"))[..8].to_string();
         let lock_path = dir.join(format!("{lock_key}.lock"));
         assert!(

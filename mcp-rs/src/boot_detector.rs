@@ -538,6 +538,9 @@ pub struct BootStageDetector {
     watchers: Vec<Watcher>,
     /// 可选: 文本相似度学习器，用于未知 SOC 自适应
     pub learner: Option<StageLearner>,
+    /// Custom login prompt regex (from `.target.toml` `[dut.target]` `login_prompt`).
+    /// `None` → use the built-in default `LOGIN_RE`.
+    custom_login_re: Option<Regex>,
     /// StageLearner 未分类行收集（供 Agent 自学习）
     pub unclassified_lines: Vec<String>,
 }
@@ -552,7 +555,27 @@ impl BootStageDetector {
             last_crash_time: std::time::Instant::now() - std::time::Duration::from_secs(10),
             watchers: Vec::new(),
             learner: None,
+            custom_login_re: None,
             unclassified_lines: Vec::new(),
+        }
+    }
+
+    /// Set a custom login prompt regex (from `.target.toml` `[dut.target]`
+    /// `login_prompt`). If unset or empty, the built-in default is used.
+    pub fn set_login_regex(&mut self, pattern: &str) {
+        if pattern.is_empty() {
+            self.custom_login_re = None;
+        } else {
+            match Regex::new(pattern) {
+                Ok(re) => {
+                    tracing::info!("Custom login prompt regex set: {pattern}");
+                    self.custom_login_re = Some(re);
+                }
+                Err(e) => {
+                    tracing::warn!("Invalid login prompt regex '{pattern}': {e}. Using default.");
+                    self.custom_login_re = None;
+                }
+            }
         }
     }
 
@@ -785,7 +808,8 @@ impl BootStageDetector {
         }
 
         // ── 2. login/password regex (始终执行 — 需要触发 action) ──
-        if LOGIN_RE.is_match(line) {
+        let login_re = self.custom_login_re.as_ref().unwrap_or(&LOGIN_RE);
+        if login_re.is_match(line) {
             if !self.login_sent {
                 self.login_sent = true;
                 events.push(BootEvent::LoginPrompt);

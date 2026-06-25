@@ -1,14 +1,14 @@
 #!/bin/bash
-# embedded-debug-mcp (Rust) deployment script
+# debug-console-mcp (Rust) deployment script
 # Build + install to ~/.local/bin/
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="${HOME}/.local/bin"
-BINARY_NAME="embedded-debug-mcp"
+BINARY_NAME="debug-console-mcp"
 
-echo "=== embedded-debug-mcp Rust deployment ==="
+echo "=== debug-console-mcp Rust deployment ==="
 echo ""
 
 # 1. Build (use --locked for reproducible builds from committed Cargo.lock)
@@ -31,7 +31,7 @@ echo ""
 echo "=== Deployment complete ==="
 echo ""
 echo "Use in project .mcp.json:"
-echo '  "embedded-debug": {'
+echo '  "debug-console": {'
 echo '    "command": "'"${INSTALL_DIR}/${BINARY_NAME}"'",'
 echo '    "cwd": "'"$(pwd)"'",'
 echo '    "env": { "RUST_LOG": "info" }'

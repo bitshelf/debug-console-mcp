@@ -5,19 +5,19 @@
 ### 1. 部署
 ```bash
 cd mcp-rs && cargo build --release
-cp target/release/embedded-debug-mcp ~/.local/bin/
+cp target/release/debug-console-mcp ~/.local/bin/
 ```
 
 ### 2. 启动
 ```bash
 cd ~/project-with-target-conf
-nohup ~/.local/bin/embedded-debug-mcp --http > /dev/null 2>&1 &
+nohup ~/.local/bin/debug-console-mcp --http > /dev/null 2>&1 &
 ```
 
 ### 3. 冒烟检查 (每次修改代码后必做)
 ```bash
 # 3a. 进程存活
-pgrep embedded-debug-mcp
+pgrep debug-console-mcp
 
 # 3b. 健康检查
 curl -s http://localhost:3000/health  # → OK

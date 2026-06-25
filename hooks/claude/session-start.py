@@ -44,7 +44,7 @@ def read_mcp_port(project_dir):
         return None
     try:
         cfg = json.loads(mcp_json.read_text())
-        url = cfg.get("mcpServers", {}).get("embedded-debug", {}).get("url", "")
+        url = cfg.get("mcpServers", {}).get("debug-console", {}).get("url", "")
         # "http://localhost:3000/mcp" → 3000
         if ":" in url:
             return int(url.rsplit(":", 1)[-1].split("/")[0])
@@ -65,7 +65,7 @@ def is_port_in_use(port):
 
 
 def mcp_running(project_dir):
-    """Check if an embedded-debug-mcp process is already serving this project."""
+    """Check if a debug-console-mcp process is already serving this project."""
     try:
         for entry in Path("/proc").iterdir():
             if not entry.name.isdigit():
@@ -87,9 +87,9 @@ def mcp_running(project_dir):
 
 
 def _kill_stale_mcp_on_port(port):
-    """Kill an embedded-debug-mcp process listening on the given port.
+    """Kill a debug-console-mcp process listening on the given port.
 
-    Validates the PID is actually an embedded-debug-mcp process (via /proc/comm)
+    Validates the PID is actually a debug-console-mcp process (via /proc/comm)
     before killing — never kills an unrelated process that happens to hold the
     port.
     """
@@ -116,7 +116,7 @@ def _kill_stale_mcp_on_port(port):
 
 
 def start_mcp(project_dir, port):
-    """Start embedded-debug-mcp in HTTP mode for a project."""
+    """Start debug-console-mcp in HTTP mode for a project."""
     if mcp_running(project_dir):
         return
     if is_port_in_use(port):
@@ -124,7 +124,7 @@ def start_mcp(project_dir, port):
         if is_port_in_use(port):
             return
 
-    binary = os.path.expanduser("~/.local/bin/embedded-debug-mcp")
+    binary = os.path.expanduser("~/.local/bin/debug-console-mcp")
     if not os.path.isfile(binary):
         return
 

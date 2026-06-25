@@ -7,3 +7,9 @@ description = "DUT hardware button control — reset, recovery, maskrom via CH34
 [dependencies]
 tokio = { version = "1", features = ["net", "time", "io-util", "process"] }
 tracing = "0.1"
+
+[build-dependencies]
+toml = "0.8"
+
+[package.metadata.learn]
+min_reset_ms = 3000

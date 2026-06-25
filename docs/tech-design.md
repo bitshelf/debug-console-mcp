@@ -6,7 +6,7 @@
 
 ## 1. 目标
 
-本设计将 `serial-debug-mcp` 扩展为一套可被 Agent 和人工 CLI 同时使用的 DUT 控制与调试系统：
+本设计将 `debug-console-mcp` 扩展为一套可被 Agent 和人工 CLI 同时使用的 DUT 控制与调试系统：
 
 - 自动学习启动日志分割参考，判断串口连接是否真实建立。
 - 将 reset、recovery、maskrom 抽象为“按下/松开”的按钮控制，不绑定 CH340。

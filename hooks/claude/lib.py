@@ -55,6 +55,55 @@ def find_project_dir() -> Optional[str]:
     return None
 
 
+def read_dut_configs(project_dir: str) -> dict:
+    """Parse .target.toml for [[dut]] entries. Returns {alias: {serial_port, login_user}}.
+    Falls back to single-DUT .target.conf shell format if .target.toml missing."""
+    import re
+    duts = {}
+    toml_path = Path(project_dir) / ".target.toml"
+    if not toml_path.exists():
+        # Fallback: single DUT from shell-format .target.conf
+        conf = _read_shell_config(project_dir)
+        if conf.get("host"):
+            duts["default"] = {"serial_port": conf.get("port", "?"), "login_user": ""}
+        return duts
+    try:
+        with open(toml_path) as f:
+            content = f.read()
+        # Split on [[dut]] sections (skip content before first [[dut]])
+        blocks = re.split(r'\n\s*\[\[dut\]\]', content)
+        for block in blocks[1:]:
+            alias = re.search(r'alias\s*=\s*"([^"]+)"', block)
+            port = re.search(r'port\s*=\s*(\d+)', block)
+            login = re.search(r'login_user\s*=\s*"([^"]+)"', block)
+            if alias:
+                duts[alias.group(1)] = {
+                    "serial_port": port.group(1) if port else "?",
+                    "login_user": login.group(1) if login else "",
+                }
+    except Exception:
+        pass
+    return duts
+
+
+def _read_shell_config(project_dir: str) -> dict:
+    """Read legacy .target.conf shell format. Returns {host, port} dict."""
+    conf = Path(project_dir) / ".target.conf"
+    result = {}
+    if not conf.exists():
+        return result
+    try:
+        for line in conf.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("DEV_HOST_IP="):
+                result["host"] = line.split("=", 1)[1].strip().strip('"').strip("'")
+            elif line.startswith("SERIAL_PORT="):
+                result["port"] = line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return result
+
+
 def format_serial_state(state: str) -> Optional[tuple[str, str]]:
     """Format state string for statusline. Returns (display_text, color) or None."""
     mapping = {
@@ -69,13 +118,13 @@ def format_serial_state(state: str) -> Optional[tuple[str, str]]:
 
 
 def _is_embedded_server(pid: int) -> bool:
-    """Check if a PID belongs to an embedded-debug-mcp server process."""
+    """Check if a PID belongs to a debug-console-mcp server process."""
     try:
         comm = (Path("/proc") / str(pid) / "comm").read_text().strip()
-        if "embedded" in comm:
+        if "debug-console" in comm:
             return True
         cmdline = (Path("/proc") / str(pid) / "cmdline").read_text()
-        if "embedded-debug" in cmdline or "server.py" in cmdline:
+        if "debug-console" in cmdline or "server.py" in cmdline:
             return True
     except (FileNotFoundError, OSError):
         pass

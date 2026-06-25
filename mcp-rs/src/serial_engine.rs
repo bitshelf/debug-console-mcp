@@ -41,6 +41,10 @@ pub struct SerialEngine {
     /// When paused, the engine skips sending data (heartbeat, login, etc.)
     /// Used by dutabo serial to take over the serial port without Agent interference.
     paused: bool,
+    /// Exponential backoff: current delay in seconds for reconnect attempts.
+    reconnect_backoff: f64,
+    /// Timestamp of last disconnect for backoff calculation.
+    last_disconnect: Option<std::time::Instant>,
 }
 
 impl SerialEngine {
@@ -56,16 +60,23 @@ impl SerialEngine {
         // 提取所有需要的配置值（在 config 被 move 之前）
         let login_user = config.login_user();
         let login_pass = config.login_pass();
+        let login_prompt = config.login_prompt();
         let interrupt_char = config.uboot_interrupt_char();
+
+        let mut detector = BootStageDetector::new();
+        if !login_prompt.is_empty() {
+            detector.set_login_regex(&login_prompt);
+        }
 
         Self {
             console: SerialConsoleDriver::new(host.clone(), serial_target.clone()),
-            detector: BootStageDetector::new(),
+            detector,
             state: StateManager::new(
                 &project_dir,
                 config.hang_timeout(),
                 config.hang_hysteresis(),
                 &dut_dir,
+                config.get("DUT_ALIAS"),
             ),
             logs: LogManager::new(
                 &project_dir,
@@ -93,11 +104,32 @@ impl SerialEngine {
             interrupt_char,
             poll_position: 0,
             paused: false,
+            reconnect_backoff: 1.0,
+            last_disconnect: None,
         }
     }
 
+    /// Return the next reconnect delay using exponential backoff.
+    /// Sequence: 1s → 2s → 4s → 8s → 16s → cap at 30s.
+    /// Resets to 1s if last disconnect was > 60s ago.
+    fn next_reconnect_delay(&mut self) -> Duration {
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last_disconnect {
+            if (now - last).as_secs() > 60 {
+                self.reconnect_backoff = 1.0;
+            }
+        }
+        let delay = self.reconnect_backoff;
+        self.reconnect_backoff = (delay * 2.0).min(30.0);
+        self.last_disconnect = Some(now);
+        Duration::from_secs_f64(delay)
+    }
+
     /// 启动引擎: 项目单例检查 → 获取串口锁 → 打开串口 → 启动后台任务
+    #[tracing::instrument(skip(self), fields(host, target))]
     pub async fn start(&mut self) -> Result<(), String> {
+        tracing::Span::current().record("host", &self.host);
+        tracing::Span::current().record("target", &self.serial_target);
         let project_dir = self
             .config
             .project_dir
@@ -139,10 +171,23 @@ impl SerialEngine {
         // 5. 确保日志文件已打开 (不切割 — 板子可能早已在运行)
         self.logs.ensure_current_file();
 
-        // 6. 连接串口 + 探测初始状态
+        // Auto-create per-DUT directory structure if missing
+        let auto_dut_alias = self.config.get_str_or("DUT_ALIAS", "default");
+        let alias_dir = project_dir.join(&dut_dir).join(&auto_dut_alias).join("logs");
+        if let Err(e) = std::fs::create_dir_all(&alias_dir) {
+            tracing::warn!("Cannot create DUT log dir {}: {e}", alias_dir.display());
+        } else if !alias_dir.exists() {
+            // create_dir_all reports Ok even if dir already exists; check it's there
+            tracing::debug!("DUT log dir ready: {}", alias_dir.display());
+        }
+
+        // 6. 连接串口 + stty -echo + 探测初始状态
         match self.console.connect().await {
             Ok(()) => {
                 tracing::info!("Serial connected to {}:{}", self.host, self.serial_target);
+                // Disable echo before any command — avoids marker-in-echo garbling.
+                self.console.sendline("stty -echo");
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 self.probe_initial_state().await;
             }
             Err(e) => {
@@ -165,7 +210,12 @@ impl SerialEngine {
                     }
                 }
             } else {
-                tracing::warn!("Reference log configured but not found: {}", ref_log);
+                tracing::warn!(
+                    "[AGENT-NOTIFY] Reference boot log missing: {}. \
+                     The StageLearner needs a reference boot log for accurate stage detection. \
+                     Run: serial_reset(wait_boot=true) to auto-capture one.",
+                    ref_log
+                );
             }
         }
 
@@ -214,6 +264,7 @@ impl SerialEngine {
     }
 
     /// 停止引擎
+    #[tracing::instrument(skip(self))]
     pub async fn stop(&mut self) {
         self.running = false;
         if let Some(h) = self.read_handle.take() {
@@ -221,6 +272,9 @@ impl SerialEngine {
         }
         if let Some(h) = self.watchdog_handle.take() {
             h.abort();
+        }
+        if self.console.is_open() {
+            self.console.sendline("stty echo");
         }
         self.console.close();
         self.relay.close();
@@ -259,7 +313,9 @@ impl SerialEngine {
     }
 
     /// 启动后探测串口当前状态
+    #[tracing::instrument(skip(self), fields(result))]
     async fn probe_initial_state(&mut self) {
+        let _start_state = self.state.current();
         match self
             .console
             .read_available(Duration::from_secs(1), 4096)
@@ -338,6 +394,9 @@ impl SerialEngine {
         }
         // Note: each probe path that transitions to Active already calls
         // flush_boot_log + mark_boot_start internally. Do NOT call again here.
+        tracing::Span::current().record("result", &tracing::field::display(
+            self.state.external_state().map(|s| s.as_str()).unwrap_or("unknown")
+        ));
     }
 
     /// Check if serial data contains a shutdown message → transition to DUT-off.
@@ -360,10 +419,20 @@ impl SerialEngine {
         // Always drain pending writes
         self.console.drain_writes().await;
 
-        // Handle resume from dutabo: reconnect silently, then go active
+        // Handle resume from dutabo: reconnect with backoff, then go active
         if !self.paused && self.state.current() == TargetState::Dutabo {
+            let delay = self.next_reconnect_delay();
+            tracing::info!(
+                "[AGENT-NOTIFY] Dutabo resume, reconnecting in {:.1}s (backoff {:.0})",
+                delay.as_secs_f64(),
+                self.reconnect_backoff
+            );
+            tokio::time::sleep(delay).await;
             if let Ok(()) = self.console.connect().await {
+                self.console.sendline("stty -echo");
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 self.probe_initial_state().await;
+                self.reconnect_backoff = 1.0; // reset on success
                 tracing::info!("Reconnected after dutabo session");
             }
             return;
@@ -394,15 +463,23 @@ impl SerialEngine {
             return;
         }
         self.console.drain_writes().await;
-        // disconnected 状态 → 主动尝试重连
+        // disconnected 状态 → 主动尝试重连 (exponential backoff)
         if self.state.current() == TargetState::Disconnected {
+            let delay = self.next_reconnect_delay();
+            tracing::info!(
+                "[AGENT-NOTIFY] Serial disconnected, reconnecting in {:.1}s (backoff {:.0})",
+                delay.as_secs_f64(),
+                self.reconnect_backoff
+            );
+            tokio::time::sleep(delay).await;
             if let Ok(()) = self.console.connect().await {
+                self.console.sendline("stty -echo");
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 self.probe_initial_state().await;
-                tracing::info!("Auto-reconnected from disconnected");
+                self.reconnect_backoff = 1.0; // reset on success
+                tracing::info!("Auto-reconnected after backoff");
             } else {
-                // 重连失败, 短暂等待后让 watchdog 再试
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                return;
+                return; // next iteration will try with increased backoff
             }
         }
         // 事件驱动等待数据 (100ms 超时, 快速释放锁给 HTTP)
@@ -532,13 +609,18 @@ impl SerialEngine {
                 }
                 BootEvent::LoginPrompt => {
                     if !self.login_user.is_empty() {
-                        tracing::info!("Sending username: {}", self.login_user);
+                        tracing::info!(
+                            "[AGENT-NOTIFY] Login prompt detected — auto-login as '{}'",
+                            self.login_user
+                        );
                         self.console.sendline(&self.login_user);
+                    } else {
+                        tracing::warn!("[AGENT-NOTIFY] Login prompt but no login_user set");
                     }
                 }
                 BootEvent::PasswordPrompt => {
                     if !self.login_pass.is_empty() {
-                        tracing::info!("Sending password");
+                        tracing::info!("[AGENT-NOTIFY] Password prompt — sending password");
                         self.console.sendline(&self.login_pass);
                     }
                 }
@@ -584,6 +666,7 @@ impl SerialEngine {
     // ── MCP Tool 接口 ──
 
     /// 提交命令并返回 receiver — 调用方必须在释放 engine lock 后 await
+    #[tracing::instrument(skip(self), fields(cmd = %command, timeout))]
     pub fn queue_command(
         &mut self,
         command: &str,

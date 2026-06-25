@@ -1,4 +1,4 @@
-# Embedded Debug — Serial MCP Server
+# Debug Console MCP Server
 
 Rust MCP server for embedded Linux DUT debugging. TCP direct to ser2net,
 strsim-based boot stage detection, self-learning reference log, relay/PDU
@@ -94,8 +94,8 @@ empty; Agent must not modify `.target.toml`.
 
 | Mode | Config | Use case |
 |------|--------|----------|
-| **stdio** (default) | `"command": "embedded-debug-mcp"` | Claude Code spawns directly, low latency |
-| **HTTP** | `embedded-debug-mcp --http 127.0.0.1:3000` | Independent process, `dutabo` CLI shares connection |
+| **stdio** (default) | `"command": "debug-console-mcp"` | Claude Code spawns directly, low latency |
+| **HTTP** | `debug-console-mcp --http 127.0.0.1:3000` | Independent process, `dutabo` CLI shares connection |
 
 ## Hooks
 

@@ -1,4 +1,4 @@
-//! embedded-debug-mcp — shared library for MCP server and dutabo CLI.
+//! debug-console-mcp — shared library for MCP server and dutabo CLI.
 //!
 //! Public API for use by binaries (`main.rs`, `bin/dutabo.rs`).
 

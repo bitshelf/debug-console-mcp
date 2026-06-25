@@ -47,7 +47,7 @@ pub struct WatchEvent {
     pub path: PathBuf,
 }
 
-/// inotify watcher for serial-debug-mcp project files.
+/// inotify watcher for debug-console-mcp project files.
 pub struct InotifyWatcher {
     inotify: Inotify,
     /// Buffer for reading events.

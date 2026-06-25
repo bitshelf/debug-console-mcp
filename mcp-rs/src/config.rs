@@ -16,6 +16,7 @@ pub fn defaults() -> HashMap<String, String> {
         ("SERIAL_BAUDRATE".into(), "1500000".into()),
         ("LOGIN_USER".into(), "root".into()),
         ("LOGIN_PASS".into(), String::new()),
+        ("LOGIN_PROMPT".into(), String::new()),
         ("RELAY_PORT".into(), "0".into()),
         ("RELAY_IP".into(), String::new()),
         ("RESET_CHANNEL".into(), "0".into()),
@@ -29,10 +30,11 @@ pub fn defaults() -> HashMap<String, String> {
         ("DUT_DIR".into(), ".dut-serial".into()),
         ("UBOOT_INTERRUPT_STRATEGY".into(), "lava".into()),
         ("UBOOT_INTERRUPT_CHAR".into(), "ctrl_c".into()),
-        ("LOCK_DIR".into(), "/tmp/embedded-debug/locks".into()),
+        ("LOCK_DIR".into(), "/tmp/debug-console/locks".into()),
         ("REFERENCE_LOG".into(), String::new()),
         ("FLASH_LOADER_CMD".into(), String::new()),
         ("FLASH_LIST_DEVICES_CMD".into(), String::new()),
+        ("RESET_TIME_MS".into(), String::new()),
     ])
 }
 
@@ -149,7 +151,7 @@ impl Config {
         }
     }
     pub fn lock_dir(&self) -> String {
-        self.get_str_or("LOCK_DIR", "/tmp/embedded-debug/locks")
+        self.get_str_or("LOCK_DIR", "/tmp/debug-console/locks")
     }
     pub fn login_user(&self) -> String {
         self.get_str_or("LOGIN_USER", "root")
@@ -157,9 +159,19 @@ impl Config {
     pub fn login_pass(&self) -> String {
         self.get("LOGIN_PASS").to_string()
     }
+    /// Custom login prompt regex. Empty string → use default `(?:.*\s)?login:\s*$`.
+    pub fn login_prompt(&self) -> String {
+        self.get("LOGIN_PROMPT").to_string()
+    }
     pub fn reference_log(&self) -> String {
         self.get("REFERENCE_LOG").to_string()
     }
+    /// Minimum USB relay reset pulse time in ms. Returns 0 if not
+    /// configured in `.target.toml` (→ use compile-time default, 3000).
+    pub fn reset_time_ms(&self) -> u64 {
+        self.get("RESET_TIME_MS").parse().unwrap_or(0)
+    }
+
     #[allow(dead_code)]
     pub fn dev_ctl(&self) -> String {
         self.get("DEV_CTL").to_string()
@@ -285,8 +297,8 @@ pub fn ensure_mcp_json(project_dir: &Path) -> Result<bool, String> {
 
     let config = serde_json::json!({
         "mcpServers": {
-            "embedded-debug": {
-                "command": "embedded-debug-mcp",
+            "debug-console": {
+                "command": "debug-console-mcp",
                 "args": ["--http"],
                 "env": {
                     "TARGET_CONF": target_toml.to_string_lossy()
@@ -580,6 +592,9 @@ struct SerialToml {
 struct TargetCredsToml {
     login_user: Option<String>,
     login_pass: Option<String>,
+    /// Custom login prompt regex. If not set, defaults to:
+    /// `(?m)(?:.*\\s)?login:\\s*$`
+    login_prompt: Option<String>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -600,6 +615,9 @@ struct RelayToml {
     reset_channel: Option<u8>,
     maskrom_channel: Option<u8>,
     recovery_channel: Option<u8>,
+    /// Minimum USB relay reset pulse time in ms. Overrides Cargo.toml
+    /// default (3000). 0 or missing → use compile-time default.
+    reset_time_ms: Option<u64>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -718,6 +736,9 @@ fn parse_toml_config(path: &Path) -> HashMap<String, String> {
         if let Some(v) = tg.login_pass {
             cfg.insert("LOGIN_PASS".into(), v);
         }
+        if let Some(v) = tg.login_prompt {
+            cfg.insert("LOGIN_PROMPT".into(), v);
+        }
     }
     // uboot
     if let Some(ub) = t.uboot {
@@ -747,6 +768,9 @@ fn parse_toml_config(path: &Path) -> HashMap<String, String> {
         }
         if let Some(v) = r.recovery_ch.or(r.recovery_channel) {
             cfg.insert("RECOVERY_CHANNEL".into(), v.to_string());
+        }
+        if let Some(v) = r.reset_time_ms {
+            cfg.insert("RESET_TIME_MS".into(), v.to_string());
         }
     }
     // monitor
@@ -850,6 +874,9 @@ fn merge_dut_config(cfg: &mut HashMap<String, String>, dut: DutToml) {
         if let Some(v) = tg.login_pass {
             cfg.insert("LOGIN_PASS".into(), v);
         }
+        if let Some(v) = tg.login_prompt {
+            cfg.insert("LOGIN_PROMPT".into(), v);
+        }
     }
     if let Some(r) = dut.relay {
         if let Some(v) = r.relay_type {
@@ -869,6 +896,9 @@ fn merge_dut_config(cfg: &mut HashMap<String, String>, dut: DutToml) {
         }
         if let Some(v) = r.recovery_ch.or(r.recovery_channel) {
             cfg.insert("RECOVERY_CHANNEL".into(), v.to_string());
+        }
+        if let Some(v) = r.reset_time_ms {
+            cfg.insert("RESET_TIME_MS".into(), v.to_string());
         }
     }
     if let Some(m) = dut.monitor {
@@ -1256,6 +1286,7 @@ port = 5000
                 reset_channel: None,
                 maskrom_channel: None,
                 recovery_channel: None,
+                reset_time_ms: None,
             }),
             target: None,
             monitor: None,

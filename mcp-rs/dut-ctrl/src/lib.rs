@@ -21,6 +21,14 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+/// Compile-time default for minimum USB relay reset pulse duration (ms).
+/// Set by build.rs from `[package.metadata.learn]` in Cargo.toml.
+fn default_min_reset_ms() -> u64 {
+    option_env!("DUT_CTRL_MIN_RESET_MS")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3000)
+}
+
 /// Physical buttons that can be pressed/released.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Button {
@@ -117,6 +125,9 @@ pub struct Ch340RelayControl {
     stream: Option<TcpStream>,
     /// If true, ON(0x01) and OFF(0x00) are swapped
     inverted: bool,
+    /// Minimum reset pulse duration in ms. Pulse calls for Reset button
+    /// are clamped to at least this value. Default: 3000 (3s) from Cargo.toml.
+    min_reset_ms: u64,
 }
 
 /// Mapping of buttons to relay channels (1-4). 0 = not configured.
@@ -148,12 +159,36 @@ impl Ch340RelayControl {
     const OP_STATUS: u8 = 0x05;
 
     pub fn new(host: String, port: u16, channels: ButtonChannels) -> Self {
-        Self { host, port, channels, stream: None, inverted: false }
+        Self {
+            host,
+            port,
+            channels,
+            stream: None,
+            inverted: false,
+            min_reset_ms: default_min_reset_ms(),
+        }
     }
 
     pub fn with_inverted(mut self, inverted: bool) -> Self {
         self.inverted = inverted;
         self
+    }
+
+    /// Override the minimum reset pulse duration (ms).
+    /// Use the value from `[dut.relay]` `reset_time_ms` in `.target.toml`
+    /// if specified, otherwise the Cargo.toml default (3000).
+    pub fn with_min_reset_ms(mut self, ms: u64) -> Self {
+        if ms > 0 {
+            self.min_reset_ms = ms;
+        }
+        self
+    }
+
+    /// Set minimum reset pulse duration at runtime.
+    pub fn set_min_reset_ms(&mut self, ms: u64) {
+        if ms > 0 {
+            self.min_reset_ms = ms;
+        }
     }
 
     pub fn is_configured(&self) -> bool {
@@ -257,6 +292,20 @@ impl PowerControl for Ch340RelayControl {
             return Err(PowerError::NotConfigured);
         }
         self.send_command(ch, Self::OP_OFF).await.map(|_| ())
+    }
+
+    /// Pulse with minimum reset time enforcement for Reset button.
+    /// USB relays require a minimum hold time (default 3s) to physically
+    /// toggle; shorter pulses are silently extended to the minimum.
+    async fn pulse(&mut self, button: Button, delay_ms: u64) -> Result<(), PowerError> {
+        let actual_delay = if button == Button::Reset {
+            delay_ms.max(self.min_reset_ms)
+        } else {
+            delay_ms
+        };
+        self.press(button).await?;
+        tokio::time::sleep(Duration::from_millis(actual_delay)).await;
+        self.release(button).await
     }
 
     async fn verify(&mut self) -> Result<bool, PowerError> {

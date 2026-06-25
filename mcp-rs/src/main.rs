@@ -7,15 +7,15 @@
 //! Transport: stdio (newline-delimited JSON-RPC 2.0)
 
 // All modules are in lib.rs — use the library crate.
-use embedded_debug_mcp as lib;
+use debug_console_mcp as lib;
 
 const HELP: &str = "\
-embedded-debug-mcp — MCP serial console debugger for embedded Linux targets
+debug-console-mcp — MCP serial console debugger for embedded Linux targets
 
 Usage:
-  embedded-debug-mcp [OPTIONS]
-  embedded-debug-mcp --help
-  embedded-debug-mcp --version
+  debug-console-mcp [OPTIONS]
+  debug-console-mcp --help
+  debug-console-mcp --version
 
 Description:
   An MCP (Model Context Protocol) server that connects to embedded Linux
@@ -76,9 +76,9 @@ Files:
   {project}/.dut-serial/logs/     Boot log archives
   {project}/.dut-serial/target-state   Current state file
   {project}/.dut-serial/mcp.log   Server log
-  /tmp/embedded-debug/locks/      Per host:port mutual exclusion
+  /tmp/debug-console/locks/      Per host:port mutual exclusion
 
-Version: embedded-debug-mcp v{}\n";
+Version: debug-console-mcp v{}\n";
 
 fn print_help() {
     let msg = HELP.replace("{}", env!("CARGO_PKG_VERSION"));
@@ -86,7 +86,7 @@ fn print_help() {
 }
 
 fn print_version() {
-    eprintln!("embedded-debug-mcp v{}", env!("CARGO_PKG_VERSION"));
+    eprintln!("debug-console-mcp v{}", env!("CARGO_PKG_VERSION"));
 }
 
 #[tokio::main]
@@ -131,18 +131,22 @@ async fn main() {
     // ── 初始化日志 ──
     let log_level = if verbose { "debug" } else { "info" };
 
+    use tracing_subscriber::fmt::format::FmtSpan;
+
     if log_to_stderr {
-        // 日志写到 stderr (调试用)
+        // 日志写到 stderr (调试用) — 打印 span 生命周期用于链路追踪
         tracing_subscriber::fmt()
             .with_writer(std::io::stderr)
             .with_ansi(true)
+            .with_target(true)
+            .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
             .with_env_filter(
                 tracing_subscriber::EnvFilter::from_default_env()
-                    .add_directive(format!("embedded_debug_mcp={log_level}").parse().unwrap()),
+                    .add_directive(format!("debug_console_mcp={log_level}").parse().unwrap()),
             )
             .init();
     } else {
-        // 日志写到文件 (stdout 留给 JSON-RPC)
+        // 日志写到文件 (stdout 留给 JSON-RPC) — JSON format for structured analysis
         let log_dir = std::path::PathBuf::from(
             lib::config::load_config()
                 .project_dir
@@ -163,14 +167,16 @@ async fn main() {
                     .unwrap_or_else(|_| panic!("Cannot open log file: {log_file:?}"))
             })
             .with_ansi(false)
+            .with_target(true)
+            .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
             .with_env_filter(
                 tracing_subscriber::EnvFilter::from_default_env()
-                    .add_directive(format!("embedded_debug_mcp={log_level}").parse().unwrap()),
+                    .add_directive(format!("debug_console_mcp={log_level}").parse().unwrap()),
             )
             .init();
     }
 
-    tracing::info!("embedded-debug-mcp v{} starting", env!("CARGO_PKG_VERSION"));
+    tracing::info!("debug-console-mcp v{} starting", env!("CARGO_PKG_VERSION"));
 
     // ── 加载配置 ──
     let cfg = lib::config::load_config();
@@ -230,5 +236,5 @@ async fn main() {
         eng.stop().await;
     }
 
-    tracing::info!("embedded-debug-mcp stopped");
+    tracing::info!("debug-console-mcp stopped");
 }

@@ -398,7 +398,7 @@ impl McpServer {
             eng.set_background_tasks(read_handle, watchdog_handle);
         }
 
-        tracing::info!("[embedded-debug-mcp] stdio transport ready");
+        tracing::info!("[debug-console-mcp] stdio transport ready");
 
         loop {
             line.clear();
@@ -488,7 +488,7 @@ impl McpServer {
                         "prompts": {"listChanged": false},
                     },
                     "serverInfo": {
-                        "name": "embedded-debug-mcp",
+                        "name": "debug-console-mcp",
                         "version": env!("CARGO_PKG_VERSION"),
                     },
                 });
@@ -913,12 +913,23 @@ impl McpServer {
         if name == "serial_send_command" {
             let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
             let timeout = args.get("timeout").and_then(|v| v.as_f64()).unwrap_or(90.0);
-            // fast-path: reboot/shutdown/poweroff 直接发送不等待
+            let span = tracing::info_span!(
+                "serial_send_command",
+                cmd = %command,
+                timeout,
+                result.output = tracing::field::Empty,
+                result.exit_code = tracing::field::Empty,
+                result.timed_out = tracing::field::Empty,
+            );
+            let _guard = span.enter();
             let cmd_trimmed = command.trim();
             if cmd_trimmed == "reboot" || cmd_trimmed == "poweroff" || cmd_trimmed == "shutdown" {
                 let mut engine = self.engine.lock().await;
                 engine.console.sendline(command);
                 engine.console.drain_writes().await;
+                span.record("result.output", format!("{cmd_trimmed} sent"));
+                span.record("result.exit_code", 0);
+                span.record("result.timed_out", false);
                 return serde_json::json!({
                     "content": [{"type": "text", "text": serde_json::to_string(&serde_json::json!({"output": format!("{cmd_trimmed} sent"), "exit_code": 0, "timed_out": false})).unwrap_or_default()}]
                 });
@@ -929,7 +940,16 @@ impl McpServer {
             };
             let result = match rx.await {
                 Ok(r) => {
-                    serde_json::json!({"output": r.output, "exit_code": r.exit_code, "timed_out": r.timed_out})
+                    let mut res = serde_json::json!({"output": r.output, "exit_code": r.exit_code, "timed_out": r.timed_out, "truncated": r.truncated});
+                    span.record("result.output", &r.output);
+                    span.record("result.exit_code", r.exit_code);
+                    span.record("result.timed_out", r.timed_out);
+                    if r.output.is_empty() && r.exit_code.is_none() && command.contains('|') {
+                        res["hint"] = serde_json::json!(
+                            "Empty output with pipe detected (BusyBox ash buffering). Retry: use printf instead of echo, or append '; true' after the pipe. See skill SKILL.md § Known Limitations."
+                        );
+                    }
+                    res
                 }
                 Err(_) => serde_json::json!({"error": "Command cancelled"}),
             };
@@ -1358,7 +1378,7 @@ mod tests {
         values.insert("MAX_ARCHIVED_LOGS".into(), "10".into());
         values.insert("MAX_LOG_FILE_SIZE".into(), "100".into());
         values.insert("DUT_DIR".into(), ".dut-serial".into());
-        values.insert("LOCK_DIR".into(), "/tmp/embedded-debug-test-locks".into());
+        values.insert("LOCK_DIR".into(), "/tmp/debug-console-test-locks".into());
         values.insert("LOGIN_USER".into(), "root".into());
         values.insert("LOGIN_PASS".into(), "".into());
         values.insert("UBOOT_INTERRUPT_STRATEGY".into(), "lava".into());
@@ -1395,7 +1415,7 @@ mod tests {
 
         let result = resp.result.unwrap();
         assert_eq!(result["protocolVersion"], MCP_PROTOCOL_VERSION);
-        assert_eq!(result["serverInfo"]["name"], "embedded-debug-mcp");
+        assert_eq!(result["serverInfo"]["name"], "debug-console-mcp");
     }
 
     #[tokio::test]

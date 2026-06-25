@@ -25,7 +25,7 @@ Build Machine                          Dev Host
 ```bash
 cd ~/.config/ai-dev/skills/embedded-debug/mcp-rs
 cargo build --release
-# Binary: target/release/embedded-debug-mcp (3.0MB stripped)
+# Binary: target/release/debug-console-mcp (3.0MB stripped)
 ```
 
 ## 配置
@@ -210,20 +210,20 @@ StageLearner 未分类行
 
 ```bash
 # 查看帮助
-embedded-debug-mcp --help
-embedded-debug-mcp -h
+debug-console-mcp --help
+debug-console-mcp -h
 
 # 查看版本
-embedded-debug-mcp --version
+debug-console-mcp --version
 
 # 启动 (默认: info 日志到文件)
-embedded-debug-mcp
+debug-console-mcp
 
 # 调试模式 (debug 日志)
-embedded-debug-mcp --verbose
+debug-console-mcp --verbose
 
 # 日志输出到 stderr (调试时方便查看)
-embedded-debug-mcp --log-to-stderr -v
+debug-console-mcp --log-to-stderr -v
 ```
 
 ## 部署到 Claude Code
@@ -235,8 +235,8 @@ embedded-debug-mcp --log-to-stderr -v
 ```json
 {
   "mcpServers": {
-    "embedded-debug": {
-      "command": "$HOME/.claude/skills/embedded-debug/mcp-rs/target/release/embedded-debug-mcp",
+    "debug-console": {
+      "command": "$HOME/.claude/skills/embedded-debug/mcp-rs/target/release/debug-console-mcp",
       "args": []
     }
   }
@@ -252,8 +252,8 @@ embedded-debug-mcp --log-to-stderr -v
 # Hook 会自动生成的 .mcp.json 示例:
 {
   "mcpServers": {
-    "embedded-debug": {
-      "command": "/home/user/.claude/skills/embedded-debug/mcp-rs/target/release/embedded-debug-mcp",
+    "debug-console": {
+      "command": "/home/user/.claude/skills/embedded-debug/mcp-rs/target/release/debug-console-mcp",
       "args": []
     }
   }
@@ -268,13 +268,13 @@ cd ~/.config/ai-dev/skills/embedded-debug/mcp-rs
 cargo build --release
 
 # 安装到 PATH
-sudo cp target/release/embedded-debug-mcp /usr/local/bin/
+sudo cp target/release/debug-console-mcp /usr/local/bin/
 
 # 然后在 .mcp.json 中使用:
 {
   "mcpServers": {
-    "embedded-debug": {
-      "command": "embedded-debug-mcp",
+    "debug-console": {
+      "command": "debug-console-mcp",
       "args": []
     }
   }
@@ -285,11 +285,11 @@ sudo cp target/release/embedded-debug-mcp /usr/local/bin/
 
 ```bash
 # 1. 确认二进制可执行
-file target/release/embedded-debug-mcp
+file target/release/debug-console-mcp
 # 应该输出: ELF 64-bit ... executable ...
 
 # 2. 确认帮助输出
-target/release/embedded-debug-mcp --help
+target/release/debug-console-mcp --help
 
 # 3. 确认项目有 .target.conf
 ls -la .target.conf
@@ -316,7 +316,7 @@ ls -la .target.conf
 | 状态栏不显示 | 无 `.target.conf` 或 Server 未启动 | 检查项目根目录; 运行 `--log-to-stderr -v` 调试 |
 | `disconnected` | 连不上 ser2net | 检查 IP/端口; `nc -zv host port` |
 | `DUT-off` | 目标无输出 | `serial_send_command "echo ping"`; `serial_reset` |
-| 二进制不启动 | 依赖库缺失 | 检查动态链接: `ldd target/release/embedded-debug-mcp` |
+| 二进制不启动 | 依赖库缺失 | 检查动态链接: `ldd target/release/debug-console-mcp` |
 | 第二个实例被拒 | 同 host:port 互斥 | 退出第一个实例或等它释放锁 |
 
 ### 测试

@@ -93,10 +93,14 @@ pub struct StateManager {
     last_probe_time: Instant,
     /// Number of consecutive probe misses (exceeds hysteresis → DUT-off).
     heartbeat_missed: u32,
+    /// DUT alias for per-DUT state file paths (empty = single DUT, uses root .dut-serial/).
+    dut_alias: String,
+    /// Project root directory (for constructing alias-specific state paths).
+    project_dir: PathBuf,
 }
 
 impl StateManager {
-    pub fn new(project_dir: &Path, hang_timeout: u64, hysteresis: u32, dut_dir: &str) -> Self {
+    pub fn new(project_dir: &Path, hang_timeout: u64, hysteresis: u32, dut_dir: &str, dut_alias: &str) -> Self {
         let dut_dir_path = project_dir.join(dut_dir);
         let state_file = dut_dir_path.join("target-state");
         let cache_file = dut_dir_path.join("statusline-cache");
@@ -128,6 +132,8 @@ impl StateManager {
             heartbeat_pending: false,
             last_probe_time: Instant::now(),
             heartbeat_missed: 0,
+            dut_alias: dut_alias.to_string(),
+            project_dir: project_dir.to_path_buf(),
         }
     }
 
@@ -188,6 +194,15 @@ impl StateManager {
             | TargetState::DutOff
             | TargetState::Dutabo => {
                 self.atomic_write(&self.state_file, new.as_str());
+                // Also write to per-DUT alias directory when alias is configured
+                if !self.dut_alias.is_empty() {
+                    let alias_state_file = self
+                        .project_dir
+                        .join(".dut-serial")
+                        .join(&self.dut_alias)
+                        .join("target-state");
+                    self.atomic_write(&alias_state_file, new.as_str());
+                }
                 let text = Self::format_statusline(new);
                 self.atomic_write(&self.cache_file, &text);
                 self.atomic_write(&self.shm_cache_file, &text);
@@ -378,7 +393,7 @@ mod tests {
 
     fn create_test_state_manager(hang_timeout: u64, hysteresis: u32) -> (StateManager, TempDir) {
         let tmp = TempDir::new().unwrap();
-        let sm = StateManager::new(tmp.path(), hang_timeout, hysteresis, ".dut-serial");
+        let sm = StateManager::new(tmp.path(), hang_timeout, hysteresis, ".dut-serial", "");
         (sm, tmp)
     }
 
@@ -494,7 +509,7 @@ mod tests {
     #[test]
     fn test_pid_file_write() {
         let tmp = TempDir::new().unwrap();
-        let sm = StateManager::new(tmp.path(), 60, 3, ".dut-serial");
+        let sm = StateManager::new(tmp.path(), 60, 3, ".dut-serial", "");
         // PID not written in new() anymore — only after lock
         let pid_file = tmp.path().join(".dut-serial/mcp.pid");
         assert!(!pid_file.exists());

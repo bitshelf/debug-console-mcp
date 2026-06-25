@@ -15,7 +15,7 @@ _HOOK_DIR = Path(__file__).resolve().parent
 if str(_HOOK_DIR) not in sys.path:
     sys.path.insert(0, str(_HOOK_DIR))
 
-from lib import find_project_dir, check_mcp_alive, _is_embedded_server
+from lib import find_project_dir, check_mcp_alive, read_dut_configs, _is_embedded_server
 
 
 def _read_target_conf(project_dir: str) -> dict:
@@ -43,7 +43,7 @@ def _read_mcp_port(project_dir: str) -> int:
         return 3000
     try:
         cfg = json.loads(mcp_json.read_text())
-        url = cfg.get("mcpServers", {}).get("embedded-debug", {}).get("url", "")
+        url = cfg.get("mcpServers", {}).get("debug-console", {}).get("url", "")
         if ":" in url:
             return int(url.rsplit(":", 1)[-1].split("/")[0])
     except (json.JSONDecodeError, ValueError, KeyError):
@@ -66,16 +66,16 @@ def _check_ser2net(host: str, port: str) -> bool:
 
 def _restart_mcp(project_dir: str) -> None:
     """Release the MCP HTTP port and restart the server.
-    Only kills processes verified to be embedded-debug-mcp."""
+    Only kills processes verified to be debug-console-mcp."""
     import subprocess
     import shutil
-    binary = shutil.which("embedded-debug-mcp") or os.path.expanduser("~/.local/bin/embedded-debug-mcp")
+    binary = shutil.which("debug-console-mcp") or os.path.expanduser("~/.local/bin/debug-console-mcp")
     if not Path(binary).exists():
         return
 
     mcp_port = _read_mcp_port(project_dir)
 
-    # Targeted kill: only kill embedded-debug processes on the MCP port.
+    # Targeted kill: only kill debug-console-mcp processes on the MCP port.
     try:
         result = subprocess.run(
             ["fuser", f"{mcp_port}/tcp"], capture_output=True, text=True, timeout=5
@@ -84,7 +84,7 @@ def _restart_mcp(project_dir: str) -> None:
             for pid_str in result.stdout.strip().split():
                 try:
                     pid = int(pid_str)
-                    # Verify the process is an embedded-debug server before killing.
+                    # Verify the process is a debug-console-mcp server before killing.
                     if _is_embedded_server(pid):
                         os.kill(pid, signal.SIGTERM)
                 except (ValueError, OSError, ProcessLookupError):
@@ -99,9 +99,10 @@ def _restart_mcp(project_dir: str) -> None:
     )
 
 
-def read_target_state(project_dir: str) -> str:
-    """Read current target state from .dut-serial/target-state."""
-    for subdir in [".dut-serial", "mcp-rs/.dut-serial"]:
+def read_target_state(project_dir: str, alias: str = None) -> str:
+    """Read current target state. If alias given, checks .dut-serial/<alias>/target-state."""
+    subdirs = [f".dut-serial/{alias}"] if alias else [".dut-serial", "mcp-rs/.dut-serial"]
+    for subdir in subdirs:
         sf = Path(project_dir) / subdir / "target-state"
         if sf.exists():
             try:
@@ -118,6 +119,30 @@ def main():
     if not project_dir:
         print(json.dumps({"continue": True}))
         sys.exit(0)
+
+    # ── Multi-DUT state collection ──────────────────────────────────────
+    duts = read_dut_configs(project_dir) if project_dir else {}
+
+    # Build multi-DUT status display
+    if len(duts) > 1:
+        parts = []
+        alerts = []
+        for alias, info in duts.items():
+            state = read_target_state(project_dir, alias)
+            if state and state != "stopped":
+                parts.append(f"● {alias}:{state}")
+            if state in ("crashed", "DUT-off", "disconnected"):
+                alerts.append(f"[TARGET-ALERT] {alias} is {state}")
+        if parts:
+            statusline = "  ".join(parts)
+            cache_path = Path(project_dir) / ".dut-serial" / "statusline-cache"
+            try:
+                cache_path.write_text(statusline)
+            except OSError:
+                pass
+        if alerts:
+            print(json.dumps({"systemMessage": " | ".join(alerts)}))
+            sys.exit(0)
 
     state = read_target_state(project_dir)
 

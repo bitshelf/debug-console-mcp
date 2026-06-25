@@ -1,11 +1,11 @@
 [package]
-name = "embedded-debug-mcp"
+name = "debug-console-mcp"
 version = "0.2.0"
 edition = "2024"
 description = "MCP server for embedded Linux serial console debugging via ser2net"
 
 [[bin]]
-name = "embedded-debug-mcp"
+name = "debug-console-mcp"
 path = "src/main.rs"
 
 [[bin]]

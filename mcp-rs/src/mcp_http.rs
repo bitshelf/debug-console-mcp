@@ -72,7 +72,7 @@ pub async fn run_http(
         .with_state(server);
 
     let addr = format!("{bind_host}:{bind_port}");
-    tracing::info!("[embedded-debug-mcp] Streamable HTTP listening on http://{addr}");
+    tracing::info!("[debug-console-mcp] Streamable HTTP listening on http://{addr}");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
@@ -147,7 +147,7 @@ mod tests {
         values.insert("MAX_ARCHIVED_LOGS".into(), "10".into());
         values.insert("MAX_LOG_FILE_SIZE".into(), "100".into());
         values.insert("DUT_DIR".into(), ".dut-serial".into());
-        values.insert("LOCK_DIR".into(), "/tmp/embedded-debug-test-locks".into());
+        values.insert("LOCK_DIR".into(), "/tmp/debug-console-test-locks".into());
         values.insert("LOGIN_USER".into(), "root".into());
         values.insert("LOGIN_PASS".into(), "".into());
         values.insert("UBOOT_INTERRUPT_STRATEGY".into(), "lava".into());

@@ -23,15 +23,15 @@ Rust 实现 (mcp-rs/), 零框架 MCP (纯 JSON-RPC 2.0)。strsim 文本相似度
 
 ```bash
 # 1. 在项目根目录创建 .target.toml (推荐)
-cp ~/.local/share/serial-debug-mcp/references/.target.toml.example .target.toml
+cp ~/.local/share/debug-console-mcp/references/.target.toml.example .target.toml
 # 编辑 [dev_host], [serial], [target] 等配置段
 
 # 或使用旧格式（向后兼容）
-cp ~/.local/share/serial-debug-mcp/references/.target.conf.example .target.conf
+cp ~/.local/share/debug-console-mcp/references/.target.conf.example .target.conf
 # 编辑 DEV_HOST_IP, SERIAL_PORT 等配置
 
 # 2. 确保 MCP binary 已安装
-ls ~/.local/bin/embedded-debug-mcp
+ls ~/.local/bin/debug-console-mcp
 
 # 3. 启动 session 后，MCP 和 statusline daemon 自动启动
 # 无需手动操作 — SessionStart hook 处理一切
@@ -227,12 +227,47 @@ serial_append_reference lines="DDR fdeec6f4fc typ 23/09/25..."
   └─ 4. 未分类行 → 每 20 行或阶段边界 → 写入 unclassified.log
 ```
 
+## Known Limitations & Fallbacks
+
+### BusyBox `ash` pipe buffering
+
+On Yocto/BusyBox targets, `echo ... | grep ...` often returns empty output
+because ash doesn't flush the pipe before the exit-code line runs.
+
+**When `serial_send_command` returns `"output":""` and `"exit_code":null`, retry
+with one of these fallbacks:**
+
+| Pattern | Replace with |
+|---------|-------------|
+| `echo <data> \| grep <pat>` | `printf '<data>\n' \| grep <pat>` |
+| `echo <data> \| head -N` | `printf '<data>\n' \| head -N` |
+| `dmesg \| head -N` | `dmesg \| head -N; true`（追加 `; true` 同步） |
+| `cat /proc/xxx \| head` | 直接用 `head -N /proc/xxx`（跳过 pipe） |
+
+```bash
+# ❌ 可能返回空
+serial_send_command("echo pipetest | grep pipe")
+
+# ✅ 回退方案
+serial_send_command("printf 'pipetest\n' | grep pipe")
+
+# ✅ 或追加 ; true
+serial_send_command("echo pipetest | grep pipe; true")
+```
+
+### First-command warmup
+
+The first `serial_send_command` after engine start may return empty.
+**Always run a warmup: `serial_send_command("echo warmup", timeout=3)` before
+any real work.** If the warmup fails, retry once — the second attempt always
+succeeds.
+
 ## Transport Modes
 
 | Mode | Config | Use Case |
 |------|--------|----------|
 | **stdio** (默认) | `"type":"stdio"` | Claude Code 直接 spawn，低延迟 |
-| **HTTP** (备用) | `embedded-debug-mcp --http` | 独立进程，端口 3000 |
+| **HTTP** (备用) | `debug-console-mcp --http` | 独立进程，端口 3000 |
 
 stdio 模式的 MCP Server 由 Claude Code SessionStart hook 自动启动。
 如果进程意外终止，重启会话即可恢复。

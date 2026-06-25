@@ -69,7 +69,7 @@ async fn main() {
 
     let toml_path = find_target_toml();
     let duts = match &toml_path {
-        Some(p) => match embedded_debug_mcp::config::parse_dut_configs(p) {
+        Some(p) => match debug_console_mcp::config::parse_dut_configs(p) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("{e}");
@@ -149,9 +149,9 @@ fn find_target_toml() -> Option<PathBuf> {
 }
 
 fn select_dut(
-    duts: &[embedded_debug_mcp::config::DutConfig],
+    duts: &[debug_console_mcp::config::DutConfig],
     alias: Option<String>,
-) -> Option<embedded_debug_mcp::config::DutConfig> {
+) -> Option<debug_console_mcp::config::DutConfig> {
     if duts.is_empty() {
         eprintln!("No DUTs.");
         return None;
@@ -178,7 +178,7 @@ fn select_dut(
     None
 }
 
-fn cmd_list(duts: &[embedded_debug_mcp::config::DutConfig]) {
+fn cmd_list(duts: &[debug_console_mcp::config::DutConfig]) {
     for d in duts {
         println!("DUT: {}", d.alias);
         println!(
@@ -197,7 +197,7 @@ fn cmd_list(duts: &[embedded_debug_mcp::config::DutConfig]) {
 }
 
 async fn mcp_call(
-    dut: &embedded_debug_mcp::config::DutConfig,
+    dut: &debug_console_mcp::config::DutConfig,
     method: &str,
     args: serde_json::Value,
     port: u16,
@@ -232,8 +232,8 @@ async fn mcp_call(
                 eprintln!("MCP server not running — starting...");
                 let bin = std::env::current_exe()
                     .ok()
-                    .and_then(|p| Some(p.parent()?.join("embedded-debug-mcp")))
-                    .unwrap_or_else(|| PathBuf::from("embedded-debug-mcp"));
+                    .and_then(|p| Some(p.parent()?.join("debug-console-mcp")))
+                    .unwrap_or_else(|| PathBuf::from("debug-console-mcp"));
                 let mut command = std::process::Command::new(&bin);
                 command.args(["--http", &format!("127.0.0.1:{port}")]);
                 command.env("TARGET_DUT_ALIAS", &dut.alias);
@@ -274,7 +274,7 @@ async fn mcp_call(
 
 // ── Subcommands ──────────────────────────────────────────────────────────
 
-async fn cmd_state(dut: &embedded_debug_mcp::config::DutConfig, port: u16) {
+async fn cmd_state(dut: &debug_console_mcp::config::DutConfig, port: u16) {
     let args = serde_json::json!({"name":"serial_get_state","arguments":{}});
     if let Some(r) = mcp_call(dut, "tools/call", args, port).await {
         if let Some(t) = r["content"][0]["text"].as_str() {
@@ -307,14 +307,14 @@ async fn cmd_state(dut: &embedded_debug_mcp::config::DutConfig, port: u16) {
     }
 }
 
-async fn cmd_reboot(dut: &embedded_debug_mcp::config::DutConfig, port: u16) {
+async fn cmd_reboot(dut: &debug_console_mcp::config::DutConfig, port: u16) {
     let args = serde_json::json!({"name":"serial_send_command","arguments":{"command":"reboot","timeout":5}});
     if let Some(r) = mcp_call(dut, "tools/call", args, port).await {
         println!("{r}");
     }
 }
 
-async fn cmd_uboot(dut: &embedded_debug_mcp::config::DutConfig, port: u16) {
+async fn cmd_uboot(dut: &debug_console_mcp::config::DutConfig, port: u16) {
     let args = serde_json::json!({"name":"serial_enter_uboot","arguments":{}});
     if let Some(r) = mcp_call(dut, "tools/call", args, port).await {
         let t = r["content"][0]["text"].as_str().unwrap_or("");
@@ -341,7 +341,7 @@ async fn cmd_uboot(dut: &embedded_debug_mcp::config::DutConfig, port: u16) {
     }
 }
 
-async fn cmd_maskrom(dut: &embedded_debug_mcp::config::DutConfig, port: u16) {
+async fn cmd_maskrom(dut: &debug_console_mcp::config::DutConfig, port: u16) {
     let args = serde_json::json!({"name":"serial_enter_maskrom","arguments":{}});
     if let Some(r) = mcp_call(dut, "tools/call", args, port).await {
         println!("{r}");
@@ -350,7 +350,7 @@ async fn cmd_maskrom(dut: &embedded_debug_mcp::config::DutConfig, port: u16) {
 
 // ── Serial (interactive) ─────────────────────────────────────────────────
 
-async fn cmd_serial(dut: &embedded_debug_mcp::config::DutConfig, mcp_port: u16) {
+async fn cmd_serial(dut: &debug_console_mcp::config::DutConfig, mcp_port: u16) {
     let host = if dut.serial_ip.is_empty() {
         &dut.dev_host_ip
     } else {
@@ -372,8 +372,8 @@ async fn cmd_serial(dut: &embedded_debug_mcp::config::DutConfig, mcp_port: u16) 
         eprintln!("Starting MCP server...");
         let bin = std::env::current_exe()
             .ok()
-            .and_then(|p| Some(p.parent()?.join("embedded-debug-mcp")))
-            .unwrap_or_else(|| PathBuf::from("embedded-debug-mcp"));
+            .and_then(|p| Some(p.parent()?.join("debug-console-mcp")))
+            .unwrap_or_else(|| PathBuf::from("debug-console-mcp"));
         let mut command = std::process::Command::new(&bin);
         command.args(["--http", &format!("127.0.0.1:{mcp_port}")]);
         command.env("TARGET_DUT_ALIAS", &dut.alias);
@@ -571,7 +571,7 @@ fn serial_tcp_relay(host: &str, port: &str) {
 }
 
 async fn cmd_flash(
-    dut: &embedded_debug_mcp::config::DutConfig,
+    dut: &debug_console_mcp::config::DutConfig,
     image_path: &str,
     image_type: &str,
     mcp_port: u16,
