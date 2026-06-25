@@ -2,61 +2,146 @@
 
 Rust MCP server for embedded Linux DUT debugging. TCP direct to ser2net,
 strsim-based boot stage detection, self-learning reference log, relay/PDU
-power control, multi-DUT support.
+power control, multi-DUT support, exponential backoff reconnect.
 
 > Design spec: [docs/DESIGN-v0.3.md](docs/DESIGN-v0.3.md)
+> Observability: `#[instrument]` tracing spans on all key async functions
 
-## Quick Start
+## Quick Start — New Project
 
 ```bash
-# 1. Build
-cd mcp-rs && cargo build --release
-./deploy.sh          # installs to ~/.local/bin/
+# 1. Build & deploy
+cd mcp-rs && cargo build --release && ./deploy.sh
 
-# 2. Configure
+# 2. Create config from template
 cp references/.target.toml.example .target.toml
-vi .target.toml      # set dev_host.ip, serial.port, relay channels
+vi .target.toml    # set dev_host.ip, serial.port, dut.alias
 
-# 3. Launch Claude Code in the project directory
-# SessionStart hook auto-detects .target.toml, generates .mcp.json,
-# and starts the MCP server.
+# 3. Create .dut-serial directory
+mkdir -p .dut-serial/$(grep alias .target.toml | head -1 | cut -d'"' -f2)/logs
+
+# 4. Restart Claude Code → SessionStart hook auto-starts MCP
 ```
 
-## Configuration (`.target.toml`)
+## Hardware Setup — Dev Host
+
+### udev Persistent Naming
+
+Prevent `/dev/ttyACM*` renumbering across replug/reboot cycles by mapping each board's
+USB serial number to a stable alias.
+
+```bash
+# On dev host, create /etc/udev/rules.d/99-rk3576-duts.rules:
+SUBSYSTEM=="tty", ATTRS{serial}=="<USB_SERIAL>", ATTRS{idProduct}=="55d2", \
+  KERNEL=="ttyACM0", SYMLINK+="serial/by-alias/<dut_alias>"
+
+# Apply:
+sudo udevadm control --reload-rules && sudo udevadm trigger
+
+# Verify:
+ls -la /dev/serial/by-alias/
+```
+
+**Finding a board's USB serial number:**
+```bash
+ssh <dev_host> "udevadm info --query=property --name=/dev/ttyACM0 | grep ID_SERIAL_SHORT"
+```
+
+### ser2net Configuration
+
+```yaml
+# /etc/ser2net.yaml — port → serial device mapping
+connection: &con2000
+    accepter: tcp,0.0.0.0,2000
+    enable: on
+    options:
+      kickolduser: true          # prevent zombie connections
+      telnet-brk-on-sync: true
+    connector: serialdev,
+              /dev/serial/by-alias/<dut_alias>,   # use udev symlink
+              115200n81,local                      # RK3576 default baud
+```
+
+### Board Mapping Reference
+
+| Alias | USB Serial | ser2net Port | OS |
+|-------|-----------|-------------|-----|
+| `rk3576-pdstars` | `5C2C244700` | 2000 | Yocto |
+| `rk3576-yt9215` | `56E6019372` | 2008 | Ubuntu |
+
+## Configuration Reference (`.target.toml`)
+
+### Single Board
 
 ```toml
-[dev_host]
+[[dev_hosts]]
+alias = "rk-board-pc"
 ip = "192.168.1.105"
 user = "linaro"
-# pass = ""          # commented = not set; "" = empty password
 
-[serial]
-port = 2004          # ser2net TCP port (ip defaults to dev_host.ip)
+[[dut]]
+alias = "rk3576-pdstars"
+dev_host = "rk-board-pc"
 
-[relay]
-port = 2004          # relay TCP port (ip defaults to dev_host.ip)
-reset_ch = 1         # RESET button channel
-# maskrom_ch = 2     # commented = not controlled
-# recovery_ch = 3    # commented = not controlled
+[dut.serial]
+port = 2000
 
-[target]
+[dut.target]
 login_user = "root"
-# login_pass = ""    # commented = not set
+login_prompt = ""         # custom login regex (empty = default: `login:\s*$`)
 
-[uboot]
-interrupt_char = "ctrl_c"       # "ctrl_c" Rockchip, "2" Allwinner
+[dut.uboot]
+interrupt_char = "ctrl_c"
 interrupt_strategy = "aggressive"
 
-[monitor]
+[dut.relay]
+type = "usb-relay"
+port = 2001
+reset_ch = 1
+# maskrom_ch = 2
+reset_time_ms = 3000      # minimum USB relay reset pulse (default: 3000)
+
+[dut.monitor]
 hang_timeout = 60
 max_archived_logs = 10
+reference_log = ".dut-serial/rk3576-pdstars/reference-boot.log"
 
-# StageLearner reference log (enables text-similarity boot detection + log split)
-reference_log = ".dut-serial/reference-boot.log"
+[dut.flash]
+tool = "upgrade_tool"
+upload_dir = "/tmp"
+full_image_cmd = "uf {image}"
+kernel_image_cmd = "di -k {image}"
+loader_bin = "/path/to/MiniLoaderAll.bin"
+loader_cmd = "db {loader}"
 ```
 
-**Config semantics**: commented (`#`) = not set; empty string (`""`) = explicitly
-empty; Agent must not modify `.target.toml`.
+### Multiple Boards
+
+Add additional `[[dut]]` blocks. Each DUT gets:
+- Independent `.dut-serial/<alias>/` directory
+- Independent `target-state`, `statusline-cache`, logs
+- Independent relay configuration
+
+```toml
+# ... same dev_hosts ...
+
+[[dut]]
+alias = "rk3576-pdstars"
+# ... config ...
+
+[[dut]]
+alias = "rk3576-yt9215"
+dev_host = "rk-board-pc"
+
+[dut.serial]
+port = 2008    # different port!
+
+[dut.target]
+login_user = "root"
+
+[dut.monitor]
+reference_log = ".dut-serial/rk3576-yt9215/reference-boot.log"
+```
 
 ## MCP Tools
 
@@ -66,8 +151,8 @@ empty; Agent must not modify `.target.toml`.
 | `serial_get_state` | Get state (active/booting/uboot/crashed/DUT-off/disconnected) |
 | `serial_get_logs` | Retrieve serial logs (regex filter, streaming) |
 | `serial_list_logs` | List archived boot logs |
-| `serial_reset` | Hardware reset + log rotation (retry, force_prompt_wait) |
-| `serial_enter_uboot` | Enter U-Boot (continuous Ctrl-C flood, bootdelay=0 compatible) |
+| `serial_reset` | Hardware reset + log rotation |
+| `serial_enter_uboot` | Enter U-Boot (Ctrl-C flood, bootdelay=0 compatible) |
 | `serial_reboot_uboot` | Soft reboot + Ctrl-C flood → U-Boot |
 | `serial_enter_maskrom` | Enter MASKROM mode (if relay configured) |
 | `serial_wait_pattern` | Wait for pattern (probe on timeout) |
@@ -76,56 +161,132 @@ empty; Agent must not modify `.target.toml`.
 | `serial_poll_logs` | Incremental output (file position tracking) |
 | `serial_get_config` | View current config (read-only) |
 | `serial_claim` | Claim serial ownership |
+| `serial_button` | Press/release/pulse reset/maskrom/recovery buttons |
 | `serial_load_reference` | Load reference log for StageLearner |
 | `serial_get_stages` | View learned fingerprints |
 | `serial_get_unclassified` | Get unclassified lines (self-learning) |
 | `serial_append_reference` | Append anchor lines + hot-reload StageLearner |
 
-## Self-Learning Workflow
+## Target States
 
 ```
-1. serial_get_unclassified()     → see lines StageLearner couldn't classify
-2. Agent identifies the stage    → "this is DDR init for RK3576"
-3. serial_append_reference(...)  → append anchor lines, hot-reload
-4. Next boot cycle               → DDR correctly detected, log split at right point
+● serial:active        — DUT ready, login configured
+◐ serial:booting       — U-Boot → kernel boot in progress
+● serial:uboot         — U-Boot interactive prompt
+✗ serial:crashed       — kernel panic / BUG / Oops detected
+✗ serial:DUT-off       — no response (hang timeout)
+✗ serial:disconnected  — ser2net unreachable
 ```
 
-## Transport Modes
+When `.target.toml` has multiple `[[dut]]` entries, statusline shows all:
+```
+● rk3576-pdstars:active  ● rk3576-yt9215:active
+```
 
-| Mode | Config | Use case |
-|------|--------|----------|
-| **stdio** (default) | `"command": "debug-console-mcp"` | Claude Code spawns directly, low latency |
-| **HTTP** | `debug-console-mcp --http 127.0.0.1:3000` | Independent process, `dutabo` CLI shares connection |
+## Known Limitations & Fallbacks
+
+### BusyBox ash Pipe Buffering
+
+On Yocto/BusyBox targets, `echo ... | grep ...` often returns empty output
+because ash's pipe buffering delays `grep` output past the exit-code marker.
+
+| Pattern | Fallback |
+|---------|----------|
+| `echo <data> \| grep <pat>` | `printf '<data>\n' \| grep <pat>` |
+| `echo <data> \| head -N` | 加 `; true` 同步: `echo <data> \| head -N; true` |
+| `dmesg \| grep <pat>` | `dmesg \| grep <pat>; true` |
+| Any pipe command | 加 `; true` 确保管道刷新完成 |
+
+**The MCP returns a `hint` field in the JSON response when it detects this pattern.**
+
+### First-Command Warmup
+
+The first `serial_send_command` after MCP startup may return empty.
+Always start with a warmup: `serial_send_command("echo warmup", timeout=3)`.
+
+### USB Relay Minimum Reset Time
+
+USB relays (CH340) require a minimum pulse duration to physically toggle.
+Default: **3000ms** (3 seconds). Override in `.target.toml` via
+`[dut.relay] reset_time_ms = 5000`.
+
+### Reconnect Behavior
+
+When the serial connection drops, the MCP uses exponential backoff:
+**1s → 2s → 4s → 8s → 16s → cap at 30s**, resetting to 1s after 60s of
+stable connection. The Agent is notified on each retry.
+
+## Observability
+
+All key async functions are instrumented with `#[tracing::instrument]`:
+
+```
+serial_send_command{cmd="uname -a", timeout=8}          ← MCP tool entry
+  queue_command{command="uname -a"}                      ← engine dispatch
+    execute{command="uname -a", timeout_secs=8}          ← command queue
+
+start{host="192.168.1.105", target="2000"}               ← engine lifecycle
+  probe_initial_state{result=active}                     ← initial probe
+
+stop                                                    ← engine shutdown
+```
+
+Each span records duration (`time.busy`, `time.idle`) and structured fields
+for querying by command text, exit code, timeout status.
+
+View spans in real-time:
+```bash
+debug-console-mcp --log-to-stderr --verbose
+```
 
 ## Hooks
 
 | Hook | Trigger | Purpose |
 |------|---------|---------|
 | `session-start.py` | Enter project | Detect `.target.toml`, start MCP (HTTP mode) |
-| `pre-tool-use.py` | Before Bash | Block raw `nc`/`tio`/`screen` serial access → use MCP |
-| `user-prompt-submit.py` | Before each prompt | Alert if DUT crashed/offline, auto-restart MCP |
-| `statusline.py` | ~1s refresh | Show DUT state + git branch in statusline |
+| `pre-tool-use.py` | Before Bash | Block raw `nc`/`tio`/`screen` serial access |
+| `user-prompt-submit.py` | Before each prompt | Multi-DUT state alert, auto-restart MCP |
+| `statusline.py` | ~1s refresh | Show DUT state(s) in statusline |
 
-## Statusline
+## Adding a New Board
 
-```
-● serial:active        — DUT ready
-◐ serial:booting       — booting (DDR → kernel)
-● serial:uboot         — U-Boot interactive
-✗ serial:crashed       — kernel panic/BUG/Oops
-✗ serial:DUT-off       — no response (hang timeout)
-✗ serial:disconnected  — ser2net unreachable
-```
+1. **Find USB serial number:**
+   ```bash
+   ssh <dev_host> "udevadm info --query=property --name=/dev/ttyACM0 | grep ID_SERIAL_SHORT"
+   ```
 
-## CLI (`dutabo`) — planned
+2. **Add udev rule** (on dev host, `/etc/udev/rules.d/99-rk3576-duts.rules`):
+   ```
+   SUBSYSTEM=="tty", ATTRS{serial}=="<serial>", ATTRS{idProduct}=="55d2", \
+     KERNEL=="ttyACM0", SYMLINK+="serial/by-alias/<new_alias>"
+   ```
+
+3. **Add ser2net port** (on dev host, `/etc/ser2net.yaml`):
+   ```yaml
+   connection: &con<port>
+       accepter: tcp,0.0.0.0,<port>
+       enable: on
+       options:
+         kickolduser: true
+       connector: serialdev,
+                 /dev/serial/by-alias/<new_alias>,
+                 115200n81,local
+   sudo systemctl restart ser2net
+   ```
+
+4. **Create project `.target.toml`** with matching `serial.port` and `dut.alias`
+
+5. **Create `.dut-serial/<alias>/logs/`** directory (or let MCP auto-create it)
+
+6. **Start Claude Code** in the project directory → MCP auto-starts
+
+## CLI (`dutabo`)
 
 ```bash
 dutabo list                    # list DUTs from .target.toml
-dutabo serial [--dut <alias>]  # serial console (doesn't kick Agent)
+dutabo serial [--dut <alias>]  # interactive serial console
 dutabo reset [--dut <alias>]   # hardware reset
 dutabo uf <image> [--dut]      # flash firmware
 dutabo uboot [--dut <alias>]   # enter U-Boot
 dutabo state [--dut <alias>]   # get DUT state
 ```
-
-See [docs/DESIGN-v0.3.md](docs/DESIGN-v0.3.md) for full design.
