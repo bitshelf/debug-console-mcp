@@ -109,6 +109,24 @@ fn print_version() {
     eprintln!("debug-console-mcp v{}", env!("CARGO_PKG_VERSION"));
 }
 
+/// Rotate mcp.log if it exceeds 10MB. Keeps at most 5 rotated files.
+fn rotate_mcp_log(log_dir: &std::path::Path) {
+    let log_path = log_dir.join("mcp.log");
+    let max_size = 10 * 1024 * 1024; // 10 MB
+    let max_files = 5;
+    if let Ok(meta) = std::fs::metadata(&log_path) {
+        if meta.len() > max_size {
+            // Rotate: mcp.log.4 → mcp.log.5, mcp.log.3 → mcp.log.4, etc.
+            for i in (1..max_files).rev() {
+                let old = log_dir.join(format!("mcp.log.{}", i));
+                let new = log_dir.join(format!("mcp.log.{}", i + 1));
+                let _ = std::fs::rename(&old, &new);
+            }
+            let _ = std::fs::rename(&log_path, log_dir.join("mcp.log.1"));
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // ── CLI 参数解析 ──
@@ -176,6 +194,7 @@ async fn main() {
         )
         .join(".dut-serial");
         std::fs::create_dir_all(&log_dir).ok();
+        rotate_mcp_log(&log_dir);
         let log_file = log_dir.join("mcp.log");
 
         tracing_subscriber::fmt()

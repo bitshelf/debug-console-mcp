@@ -11,6 +11,14 @@ description: >-
 Rust 实现 (mcp-rs/), 零框架 MCP (纯 JSON-RPC 2.0)。strsim 文本相似度阶段检测 + 自学习参考日志。
 支持 stdio + HTTP 双传输模式。设计文档: [docs/DESIGN-v0.3.md](docs/DESIGN-v0.3.md)。
 
+## New in v0.3
+
+- **Multi-DUT support**: per-DUT state files under `.dut-serial/<alias>/`, driven by `.target.toml` `[[dut]]` sections. Each DUT gets its own serial port, relay channel, and state tracking.
+- **Exponential backoff reconnect**: 1s initial delay, doubling to 30s max on repeated connection failures. Prevents log spam and CPU churn when the serial port is unavailable.
+- **Project-switch isolation**: per-hash lock directories (`/tmp/debug-console-<hash>.lock`) ensure multiple Claude sessions in different projects don't collide.
+- **New tools**: `serial_button` (relay/power button control), `serial_get_stages` (inspect StageLearner fingerprints), `serial_get_unclassified` (retrieve unclassified boot lines), `serial_append_reference` (Agent-assisted self-learning).
+- **Hardware Setup**: see [README.md](../README.md) for wiring diagrams, relay pinout, and ser2net configuration.
+
 ## CRITICAL: Dev Host vs Target Device
 
 - **Dev Host** (`dev_host.ip`): 运行 ser2net 的中转机器，串口线和继电器接在这台机器上
@@ -61,6 +69,7 @@ serial_reboot_uboot          # 软重启 + Ctrl-C flood 进入 U-Boot (bootdelay
 serial_uboot_command "boot"  # 从 U-Boot 继续启动
 serial_enter_maskrom         # 进入 Rockchip MASKROM 模式
 serial_new_log               # 手动切日志 (不复位)
+serial_button "reset"        # 继电器按钮控制 (reset/maskrom/recovery)
 
 # 跨 SOC 自适应 (StageLearner)
 serial_load_reference "/path/to/new-soc-boot.log"
@@ -215,7 +224,7 @@ serial_append_reference lines="DDR fdeec6f4fc typ 23/09/25..."
 # 指纹数增加 → serial_get_stages 可见
 ```
 
-**StageLearner 检测流程（v0.2.0+）：**
+**StageLearner 检测流程（v0.3.0+）：**
 
 ```
 串口数据 → strip banner + strip ANSI

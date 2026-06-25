@@ -126,21 +126,13 @@ def main():
     # Read state from per-DUT directories (includes single-DUT case).
     # Falls back to root .dut-serial/target-state only if no DUTs found in config.
     if duts:
-        parts = []
         alerts = []
         for alias, info in duts.items():
             state = read_target_state(project_dir, alias)
-            if state and state != "stopped":
-                parts.append(f"● {alias}:{state}")
             if state in ("crashed", "DUT-off", "disconnected"):
                 alerts.append(f"[TARGET-ALERT] {alias} is {state}")
-        if parts:
-            statusline = "  ".join(parts)
-            cache_path = Path(project_dir) / ".dut-serial" / "statusline-cache"
-            try:
-                cache_path.write_text(statusline)
-            except OSError:
-                pass
+        # NOTE: statusline-cache is written by StateManager::transition() with
+        # ANSI color codes — do NOT overwrite it here with plain text.
         if alerts:
             print(json.dumps({"systemMessage": " | ".join(alerts)}))
             sys.exit(0)

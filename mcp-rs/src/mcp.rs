@@ -349,8 +349,8 @@ pub struct JsonRpcError {
 
 pub struct McpServer {
     tools: Vec<ToolDef>,
-    initialized: bool,
-    engine: SharedEngine,
+    pub initialized: bool,
+    pub(crate) engine: SharedEngine,
 }
 
 impl McpServer {

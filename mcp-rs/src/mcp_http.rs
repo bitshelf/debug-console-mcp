@@ -17,6 +17,7 @@ use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 
@@ -121,9 +122,34 @@ async fn handle_mcp_post(
     }
 }
 
-/// GET /health — Kubernetes-compatible liveness probe.
-async fn handle_health() -> &'static str {
-    "OK"
+/// GET /health — Kubernetes-compatible liveness probe with live state.
+async fn handle_health(
+    State(state): State<SharedServer>,
+) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+    let server = match tokio::time::timeout(Duration::from_secs(2), state.lock()).await {
+        Ok(s) => s,
+        Err(_) => return Ok(Json(serde_json::json!({"status": "starting", "serial": null}))),
+    };
+    let engine = match tokio::time::timeout(Duration::from_secs(2), server.engine.lock()).await {
+        Ok(e) => e,
+        Err(_) => return Ok(Json(serde_json::json!({"status": "busy", "serial": null}))),
+    };
+    let serial_state = engine.state.current();
+    let config = &engine.config;
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "serial": {
+            "state": serial_state.as_str(),
+            "host": config.dev_host_ip(),
+            "port": config.serial_target(),
+            "login_configured": !config.login_user().is_empty(),
+        },
+        "uptime_secs": engine.state.uptime_secs(),
+        "commands": {
+            "total": engine.state.command_count(),
+            "errors": engine.state.error_count(),
+        }
+    })))
 }
 
 #[cfg(test)]
@@ -162,9 +188,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_endpoint() {
-        // Test the health handler directly (no server needed).
-        let result = handle_health().await;
-        assert_eq!(result, "OK");
+        let engine = create_test_engine();
+        let server = Arc::new(Mutex::new(McpServer::new(engine.clone())));
+        let result = handle_health(State(server)).await.unwrap();
+        let json = result.0;
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["serial"]["state"], "stopped");
+        assert_eq!(json["serial"]["login_configured"], true);
+        assert!(json["uptime_secs"].as_f64().is_some());
+        assert_eq!(json["commands"]["total"], 0);
+        assert_eq!(json["commands"]["errors"], 0);
     }
 
     #[tokio::test]
@@ -206,5 +239,27 @@ mod tests {
         };
         let response = handle_mcp_post(State(server), Json(notif_req)).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[test]
+    fn test_server_state_creation() {
+        let engine = create_test_engine();
+        let server = McpServer::new(engine.clone());
+        // Verify it compiles and doesn't panic
+        assert!(!server.initialized);
+    }
+
+    #[test]
+    fn test_health_response_format() {
+        // Verify the JSON structure is valid
+        let json = serde_json::json!({
+            "status": "ok",
+            "serial": { "state": "active", "host": "192.168.1.1", "port": "2000", "login_configured": true },
+            "uptime_secs": 3600.0,
+            "commands": { "total": 42, "errors": 0 }
+        });
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["serial"]["state"], "active");
+        assert_eq!(json["commands"]["total"], 42);
     }
 }

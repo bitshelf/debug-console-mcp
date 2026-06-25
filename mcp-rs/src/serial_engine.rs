@@ -216,13 +216,13 @@ impl SerialEngine {
                 tracing::info!("Serial connected to {}:{}", self.host, self.serial_target);
                 // Disable echo before any command — avoids marker-in-echo garbling.
                 self.console.sendline("stty -echo");
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
                 self.probe_initial_state().await;
                 // Warmup: prime the serial pipeline so the first real command
                 // doesn't return empty (BusyBox/ser2net buffering issue).
                 self.console.sendline("echo warmup");
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                let _ = self.console.read_available(Duration::from_millis(200), 256).await;
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                let _ = self.console.read_available(Duration::from_millis(100), 256).await;
             }
             Err(e) => {
                 tracing::warn!("Cannot open serial: {e}");

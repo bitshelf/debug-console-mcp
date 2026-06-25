@@ -219,8 +219,9 @@ impl CommandQueue {
             while !pc.found_begin {
                 if let Some(idx) = find_subsequence(&pc.search_buf, &marker) {
                     let pre = &pc.search_buf[..idx];
-                    let pre_str = String::from_utf8_lossy(pre);
-                    let is_echo = pre_str.contains("; echo") || pre_str.ends_with("echo '");
+                    // No-alloc echo detection: check if pre ends with "echo '" or contains "; echo"
+                    let is_echo = pre.ends_with(b"echo '")
+                        || pre.windows(6).any(|w| w == b"; echo");
                     if is_echo && pc.skip_count < 2 {
                         pc.skip_count += 1;
                         pc.search_buf.drain(..idx + marker.len());
