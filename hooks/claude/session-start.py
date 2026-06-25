@@ -137,9 +137,24 @@ def start_mcp(project_dir, port):
 
 
 def main():
+    import hashlib
+    from pathlib import Path
+
     for proj in find_projects():
         dut_dir = os.path.join(proj, ".dut-serial")
         os.makedirs(dut_dir, exist_ok=True)
+
+        # Per-project hash lock — prevents cross-project interference
+        # when multiple Claude Code windows target different projects
+        h = hashlib.md5(str(Path(proj).resolve()).encode()).hexdigest()[:8]
+        lock_file = f"/dev/shm/claude-serial-{h}.lock"
+        with open(lock_file, "w") as f:
+            f.write(proj)
+
+        # Session PID + lock path — session-stop reads these for cleanup
+        pid_file = os.path.join(dut_dir, ".session-pid")
+        with open(pid_file, "w") as f:
+            f.write(f"{os.getpid()}\n{lock_file}")
 
         port = read_mcp_port(proj)
         if port is None:

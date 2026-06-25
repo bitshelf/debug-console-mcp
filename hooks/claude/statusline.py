@@ -12,13 +12,12 @@ import sys
 import json
 import time
 from pathlib import Path
-from subprocess import Popen, DEVNULL
 
 _HOOK_DIR = Path(__file__).resolve().parent
 if str(_HOOK_DIR) not in sys.path:
     sys.path.insert(0, str(_HOOK_DIR))
 
-from lib import find_project_dir, format_serial_state, _is_valid_project_dir
+from lib import find_project_dir, format_serial_state
 
 # ── Config ──────────────────────────────────────────────────────────────────
 TMP_ROOT = os.environ.get("TMPDIR", os.environ.get("TMP", "/tmp"))
@@ -29,16 +28,10 @@ CACHE_TTL = 10
 # ── Git branch (cached, async refresh) ─────────────────────────────────────
 
 def _project_root() -> str:
-    d = Path.cwd()
-    while True:
-        for name in (".target.toml", ".target.conf"):
-            if (d / name).exists() and _is_valid_project_dir(d):
-                return str(d)
-        parent = d.parent
-        if parent == d:
-            break
-        d = parent
-    return str(Path.cwd())
+    """Return the project root via per-hash lock (never changes with CWD)."""
+    from lib import find_project_dir
+    proj = find_project_dir()
+    return proj if proj else str(Path.cwd())
 
 
 def _cache_key(suffix: str) -> str:

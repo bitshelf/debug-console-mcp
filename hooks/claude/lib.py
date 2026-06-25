@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 from pathlib import Path
 from typing import Optional
 
@@ -14,6 +15,24 @@ _FORBIDDEN_ROOTS = {"/tmp", "/var/tmp", "/dev/shm", "/run", "/proc", "/sys", "/d
 # Companion files/dirs that must exist alongside .target.conf to validate
 # it's a real project directory, not a stale file in a temp dir.
 _PROJECT_MARKERS = [".dut-serial", ".claude", "build/envsetup.sh", "device/rockchip"]
+
+
+def project_hash(project_dir: str) -> str:
+    """Stable 8-char hash for a project path — used for per-project lock files."""
+    return hashlib.md5(str(Path(project_dir).resolve()).encode()).hexdigest()[:8]
+
+
+def _read_lock(lock_path: str) -> Optional[str]:
+    """Read a lock file, return content if valid directory path."""
+    p = Path(lock_path)
+    if p.exists():
+        try:
+            content = p.read_text().strip()
+            if content and Path(content).is_dir():
+                return content
+        except OSError:
+            pass
+    return None
 
 
 def _is_valid_project_dir(d: Path) -> bool:
@@ -30,11 +49,11 @@ def _is_valid_project_dir(d: Path) -> bool:
 
 
 def find_project_dir() -> Optional[str]:
-    """Find project root by walking up from CWD to find .target.toml or
-    .target.conf (TOML preferred).
+    """Find project root — per-hash lock prevents cross-project interference.
 
-    Only returns directories that pass _is_valid_project_dir() — a stray
-    config in /tmp (from a previous session) will be ignored.
+    1. TARGET_CONF env var (explicit override)
+    2. Scan /dev/shm/claude-serial-*.lock for valid projects
+    3. Walk-up from CWD (fallback)
     """
     if env := os.environ.get("TARGET_CONF"):
         p = Path(env)
@@ -42,9 +61,15 @@ def find_project_dir() -> Optional[str]:
             d = p.resolve().parent
             if _is_valid_project_dir(d):
                 return str(d)
+    # Scan ALL per-hash locks — return first valid one found
+    import glob
+    for lock_path in sorted(glob.glob("/dev/shm/claude-serial-*.lock")):
+        cached = _read_lock(lock_path)
+        if cached and _is_valid_project_dir(Path(cached)):
+            return cached
+    # Fallback: walk up from CWD
     d = Path.cwd()
     while True:
-        # Prefer TOML, fall back to shell conf (matches Rust config.rs).
         for name in (".target.toml", ".target.conf"):
             if (d / name).exists() and _is_valid_project_dir(d):
                 return str(d)

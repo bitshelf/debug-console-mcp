@@ -123,8 +123,9 @@ def main():
     # ── Multi-DUT state collection ──────────────────────────────────────
     duts = read_dut_configs(project_dir) if project_dir else {}
 
-    # Build multi-DUT status display
-    if len(duts) > 1:
+    # Read state from per-DUT directories (includes single-DUT case).
+    # Falls back to root .dut-serial/target-state only if no DUTs found in config.
+    if duts:
         parts = []
         alerts = []
         for alias, info in duts.items():
@@ -143,8 +144,10 @@ def main():
         if alerts:
             print(json.dumps({"systemMessage": " | ".join(alerts)}))
             sys.exit(0)
-
-    state = read_target_state(project_dir)
+        # Single-DUT: use the first (only) DUT's state
+        state = read_target_state(project_dir, list(duts.keys())[0])
+    else:
+        state = read_target_state(project_dir)
 
     # PID liveness check: if MCP server is dead, state file is stale
     if state and not check_mcp_alive(project_dir):
