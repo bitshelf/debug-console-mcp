@@ -15,6 +15,7 @@ pub mod marker;
 pub mod mcp;
 pub mod mcp_http;
 pub use dut_ctrl as power_control;
+pub mod reconnect;
 pub mod relay_manager;
 pub mod serial_engine;
 pub mod state_manager;

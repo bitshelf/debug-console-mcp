@@ -178,8 +178,13 @@ impl CommandQueue {
         if let Some(ref pc) = self.current {
             if pc.begin_sent && pc.sent_at.elapsed().as_secs_f64() > pc.timeout_secs {
                 if let Some(pc) = self.current.take() {
-                    let output = String::from_utf8_lossy(&pc.buffer).to_string();
-                    pc.resolve(output.trim().to_string(), true, None);
+                    let partial = String::from_utf8_lossy(&pc.buffer).to_string();
+                    let output = if partial.trim().is_empty() {
+                        "(timeout — no output)".to_string()
+                    } else {
+                        format!("(timeout — partial output)\n{}", partial.trim())
+                    };
+                    pc.resolve(output, true, None);
                 }
                 self.dequeue_next();
             }
@@ -285,8 +290,13 @@ impl CommandQueue {
         if let Some(ref pc) = self.current {
             if pc.begin_sent && pc.sent_at.elapsed().as_secs_f64() > pc.timeout_secs {
                 if let Some(pc) = self.current.take() {
-                    let output = String::from_utf8_lossy(&pc.buffer).to_string();
-                    pc.resolve(output.trim().to_string(), true, None);
+                    let partial = String::from_utf8_lossy(&pc.buffer).to_string();
+                    let output = if partial.trim().is_empty() {
+                        "(timeout — no output)".to_string()
+                    } else {
+                        format!("(timeout — partial output)\n{}", partial.trim())
+                    };
+                    pc.resolve(output, true, None);
                     self.dequeue_next();
                 }
             }

@@ -949,6 +949,11 @@ impl McpServer {
                             "Empty output with pipe detected (BusyBox ash buffering). Retry: use printf instead of echo, or append '; true' after the pipe. See skill SKILL.md § Known Limitations."
                         );
                     }
+                    if r.timed_out {
+                        res["hint"] = serde_json::json!(
+                            "Command timed out — target may be booting or unresponsive. Retry with longer timeout (e.g., timeout=30) or check serial_get_state."
+                        );
+                    }
                     res
                 }
                 Err(_) => serde_json::json!({"error": "Command cancelled"}),

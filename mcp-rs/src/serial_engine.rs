@@ -9,6 +9,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 use crate::boot_detector::{BootEvent, BootStageDetector};
+use crate::reconnect::ReconnectManager;
 use crate::command_queue::CommandQueue;
 use crate::config::Config;
 use crate::connection_learner::{ConnectionLearner, LearnConfig, LearnMethod, LearnResult};
@@ -41,10 +42,10 @@ pub struct SerialEngine {
     /// When paused, the engine skips sending data (heartbeat, login, etc.)
     /// Used by dutabo serial to take over the serial port without Agent interference.
     paused: bool,
-    /// Exponential backoff: current delay in seconds for reconnect attempts.
-    reconnect_backoff: f64,
-    /// Timestamp of last disconnect for backoff calculation.
-    last_disconnect: Option<std::time::Instant>,
+    /// Reconnection manager with exponential backoff.
+    reconnect: ReconnectManager,
+    /// Periodic statusline cache refresh timer (debounce: write at most every 5s).
+    statusline_last_refresh: Option<std::time::Instant>,
 }
 
 impl SerialEngine {
@@ -104,25 +105,9 @@ impl SerialEngine {
             interrupt_char,
             poll_position: 0,
             paused: false,
-            reconnect_backoff: 1.0,
-            last_disconnect: None,
+            reconnect: ReconnectManager::new(),
+            statusline_last_refresh: None,
         }
-    }
-
-    /// Return the next reconnect delay using exponential backoff.
-    /// Sequence: 1s → 2s → 4s → 8s → 16s → cap at 30s.
-    /// Resets to 1s if last disconnect was > 60s ago.
-    fn next_reconnect_delay(&mut self) -> Duration {
-        let now = std::time::Instant::now();
-        if let Some(last) = self.last_disconnect {
-            if (now - last).as_secs() > 60 {
-                self.reconnect_backoff = 1.0;
-            }
-        }
-        let delay = self.reconnect_backoff;
-        self.reconnect_backoff = (delay * 2.0).min(30.0);
-        self.last_disconnect = Some(now);
-        Duration::from_secs_f64(delay)
     }
 
     /// 启动引擎: 项目单例检查 → 获取串口锁 → 打开串口 → 启动后台任务
@@ -137,15 +122,59 @@ impl SerialEngine {
             .unwrap_or_else(|| std::env::current_dir().unwrap());
         let dut_dir = self.config.dut_dir();
 
+        // 0. Validate config — catch common misconfigurations early
+        {
+            let mut issues: Vec<String> = Vec::new();
+            if self.config.dev_host_ip().is_empty() {
+                issues.push("dev_host.ip not set".into());
+            }
+            let port = self.config.serial_target();
+            if port.is_empty() || port == "0" {
+                issues.push("serial.port not set".into());
+            }
+            if self.config.login_user().is_empty() {
+                tracing::warn!("[AGENT-NOTIFY] login_user not set — auto-login disabled");
+            }
+            let ref_log = self.config.reference_log();
+            if !ref_log.is_empty() {
+                let ref_path = std::path::PathBuf::from(&ref_log);
+                let abs_path = if ref_path.is_relative() {
+                    self.config.project_dir.as_ref()
+                        .map(|p| p.join(&ref_path))
+                        .unwrap_or(ref_path)
+                } else {
+                    ref_path
+                };
+                if !abs_path.exists() {
+                    tracing::warn!(
+                        "[AGENT-NOTIFY] reference_log '{}' not found. \
+                         Run serial_reset(wait_boot=true) to auto-capture.",
+                        abs_path.display()
+                    );
+                }
+            }
+            if !issues.is_empty() {
+                for issue in &issues {
+                    tracing::error!("[AGENT-NOTIFY] Config error: {issue}");
+                }
+                return Err(format!("Config errors: {}. Fix .target.toml.", issues.join("; ")));
+            }
+        }
+
         // 1. 项目级单例: 同一 project_dir 只能有一个 MCP，自动替换旧进程
         if let Some(conflicting_pid) = lock_manager::check_project_singleton(&project_dir, &dut_dir)
         {
             tracing::warn!("Killing stale MCP process (PID {conflicting_pid})");
             unsafe { libc::kill(conflicting_pid as i32, libc::SIGTERM) };
             std::thread::sleep(std::time::Duration::from_millis(800));
-            // Clean stale PID file
+            // Clean stale PID files (project-level + per-DUT + session)
             let pid_file = project_dir.join(&dut_dir).join("mcp.pid");
             std::fs::remove_file(&pid_file).ok();
+            let auto_dut_alias = self.config.get_str_or("DUT_ALIAS", "default");
+            let alias_pid = project_dir.join(&dut_dir).join(&auto_dut_alias).join("mcp.pid");
+            std::fs::remove_file(&alias_pid).ok();
+            let session_pid = project_dir.join(&dut_dir).join(".session-pid");
+            std::fs::remove_file(&session_pid).ok();
         }
 
         // 2. 获取串口互斥锁
@@ -189,6 +218,11 @@ impl SerialEngine {
                 self.console.sendline("stty -echo");
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 self.probe_initial_state().await;
+                // Warmup: prime the serial pipeline so the first real command
+                // doesn't return empty (BusyBox/ser2net buffering issue).
+                self.console.sendline("echo warmup");
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let _ = self.console.read_available(Duration::from_millis(200), 256).await;
             }
             Err(e) => {
                 tracing::warn!("Cannot open serial: {e}");
@@ -419,20 +453,24 @@ impl SerialEngine {
         // Always drain pending writes
         self.console.drain_writes().await;
 
+        // Periodic statusline cache refresh (every 5s) — keeps timestamps fresh
+        // and shows "last seen N seconds ago" info even when state is stable.
+        self.refresh_statusline_cache();
+
         // Handle resume from dutabo: reconnect with backoff, then go active
         if !self.paused && self.state.current() == TargetState::Dutabo {
-            let delay = self.next_reconnect_delay();
+            let delay = self.reconnect.next_delay();
             tracing::info!(
                 "[AGENT-NOTIFY] Dutabo resume, reconnecting in {:.1}s (backoff {:.0})",
                 delay.as_secs_f64(),
-                self.reconnect_backoff
+                self.reconnect.current_backoff()
             );
             tokio::time::sleep(delay).await;
             if let Ok(()) = self.console.connect().await {
                 self.console.sendline("stty -echo");
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 self.probe_initial_state().await;
-                self.reconnect_backoff = 1.0; // reset on success
+                self.reconnect.reset();
                 tracing::info!("Reconnected after dutabo session");
             }
             return;
@@ -465,18 +503,18 @@ impl SerialEngine {
         self.console.drain_writes().await;
         // disconnected 状态 → 主动尝试重连 (exponential backoff)
         if self.state.current() == TargetState::Disconnected {
-            let delay = self.next_reconnect_delay();
+            let delay = self.reconnect.next_delay();
             tracing::info!(
                 "[AGENT-NOTIFY] Serial disconnected, reconnecting in {:.1}s (backoff {:.0})",
                 delay.as_secs_f64(),
-                self.reconnect_backoff
+                self.reconnect.current_backoff()
             );
             tokio::time::sleep(delay).await;
             if let Ok(()) = self.console.connect().await {
                 self.console.sendline("stty -echo");
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 self.probe_initial_state().await;
-                self.reconnect_backoff = 1.0; // reset on success
+                self.reconnect.reset();
                 tracing::info!("Auto-reconnected after backoff");
             } else {
                 return; // next iteration will try with increased backoff
@@ -583,6 +621,33 @@ impl SerialEngine {
                         tracing::info!("Text similarity: reboot detected → log rotated + booting");
                     }
                 }
+            }
+        }
+    }
+
+    /// Periodic statusline cache refresh — debounced to at most once every 5 seconds.
+    /// Called from `read_loop_iter` on every iteration so timestamps stay fresh even
+    /// when the target is stable in a single state (no transitions).
+    fn refresh_statusline_cache(&mut self) {
+        let now = std::time::Instant::now();
+        let need_refresh = match self.statusline_last_refresh {
+            Some(last) => (now - last).as_secs() >= 5,
+            None => true,
+        };
+        if !need_refresh {
+            return;
+        }
+        self.statusline_last_refresh = Some(now);
+        let alias = self.config.get_str_or("DUT_ALIAS", "default");
+        if let Some(ref proj) = self.config.project_dir {
+            let cache = proj
+                .join(&self.config.dut_dir())
+                .join(&alias)
+                .join("statusline-cache");
+            let state = self.state.current();
+            let text = StateManager::format_statusline(state);
+            if !text.is_empty() {
+                let _ = std::fs::write(&cache, &text);
             }
         }
     }

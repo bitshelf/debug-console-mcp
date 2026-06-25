@@ -218,7 +218,7 @@ impl StateManager {
     }
 
     /// ANSI-formatted statusline text for a given state.
-    fn format_statusline(state: TargetState) -> String {
+    pub(crate) fn format_statusline(state: TargetState) -> String {
         let text: &str = match state {
             TargetState::Active => "\x1b[32m● serial:active\x1b[0m",
             TargetState::Booting => "\x1b[33m◐ serial:booting\x1b[0m",
