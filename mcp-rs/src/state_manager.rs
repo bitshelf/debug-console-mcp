@@ -258,9 +258,18 @@ impl StateManager {
                         .join("target-state");
                     self.atomic_write(&alias_state_file, new.as_str());
                 }
-                let text = Self::format_statusline(new);
+                let text = self.format_statusline(new);
                 self.atomic_write(&self.cache_file, &text);
                 self.atomic_write(&self.shm_cache_file, &text);
+                // Also write per-DUT cache when alias is configured
+                if !self.dut_alias.is_empty() && self.dut_alias != "default" {
+                    let alias_cache = self
+                        .project_dir
+                        .join(".dut-serial")
+                        .join(&self.dut_alias)
+                        .join("statusline-cache");
+                    self.atomic_write(&alias_cache, &text);
+                }
                 // Write Agent notification for critical states
                 if matches!(
                     new,
@@ -273,20 +282,31 @@ impl StateManager {
     }
 
     /// Produce an ANSI-formatted statusline string for a given target state.
-    /// Returns empty string for Stopped and Connecting (no display).
-    pub(crate) fn format_statusline(state: TargetState) -> String {
-        let text: &str = match state {
-            TargetState::Active => "\x1b[32m● serial:active\x1b[0m",
-            TargetState::Booting => "\x1b[33m◐ serial:booting\x1b[0m",
-            TargetState::Booted => "\x1b[32m● serial:booted\x1b[0m",
-            TargetState::UBoot => "\x1b[36m● serial:uboot\x1b[0m",
-            TargetState::Crashed => "\x1b[31m✗ serial:crashed\x1b[0m",
-            TargetState::Disconnected => "\x1b[31m✗ serial:disconnected\x1b[0m",
-            TargetState::DutOff => "\x1b[31m✗ serial:DUT-off\x1b[0m",
-            TargetState::Dutabo => "\x1b[35m● serial:dutabo\x1b[0m",
-            TargetState::Stopped | TargetState::Connecting => "",
+    /// Format a statusline string with ANSI color. Uses the DUT alias
+    /// from .target.toml if available, otherwise "serial".
+    pub(crate) fn format_statusline(&self, state: TargetState) -> String {
+        let label = if self.dut_alias.is_empty() || self.dut_alias == "default" {
+            "serial"
+        } else {
+            &self.dut_alias
         };
-        text.to_string()
+        Self::format_statusline_labeled(state, label)
+    }
+
+    /// Format statusline with explicit label (for testing, or when no
+    /// StateManager instance is available).
+    pub(crate) fn format_statusline_labeled(state: TargetState, label: &str) -> String {
+        match state {
+            TargetState::Active => format!("\x1b[32m● {}:active\x1b[0m", label),
+            TargetState::Booting => format!("\x1b[33m◐ {}:booting\x1b[0m", label),
+            TargetState::Booted => format!("\x1b[32m● {}:booted\x1b[0m", label),
+            TargetState::UBoot => format!("\x1b[36m● {}:uboot\x1b[0m", label),
+            TargetState::Crashed => format!("\x1b[31m✗ {}:crashed\x1b[0m", label),
+            TargetState::Disconnected => format!("\x1b[31m✗ {}:disconnected\x1b[0m", label),
+            TargetState::DutOff => format!("\x1b[31m✗ {}:DUT-off\x1b[0m", label),
+            TargetState::Dutabo => format!("\x1b[35m● {}:dutabo\x1b[0m", label),
+            TargetState::Stopped | TargetState::Connecting => String::new(),
+        }
     }
 
     /// Called on every serial data arrival — resets hang and heartbeat counters.
@@ -653,6 +673,7 @@ mod tests {
 
     #[test]
     fn test_format_statusline_all_states_have_text() {
+        let (sm, _tmp) = create_test_state_manager(60, 3);
         for state in &[
             TargetState::Active,
             TargetState::Booting,
@@ -662,12 +683,12 @@ mod tests {
             TargetState::Disconnected,
             TargetState::DutOff,
         ] {
-            let text = StateManager::format_statusline(*state);
+            let text = sm.format_statusline(*state);
             assert!(!text.is_empty(), "{:?} should have statusline text", state);
         }
         // Stopped/Connecting produce empty string (no display)
-        assert_eq!(StateManager::format_statusline(TargetState::Stopped), "");
-        assert_eq!(StateManager::format_statusline(TargetState::Connecting), "");
+        assert_eq!(sm.format_statusline(TargetState::Stopped), "");
+        assert_eq!(sm.format_statusline(TargetState::Connecting), "");
     }
 
     #[test]

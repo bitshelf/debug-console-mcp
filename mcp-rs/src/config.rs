@@ -1387,4 +1387,37 @@ port = 5000
         assert_eq!(cfg_map.get("RELAY_IP").unwrap(), "10.0.0.1");
         assert_eq!(cfg_map.get("DEV_HOST_IP").unwrap(), "10.0.0.1");
     }
+
+    #[test]
+    fn test_malformed_toml_does_not_panic() {
+        let tmp = TempDir::new().unwrap();
+        let conf = tmp.path().join(".target.toml");
+        std::fs::write(&conf, "this is not valid toml {{{").unwrap();
+        unsafe { std::env::set_var("TARGET_CONF", conf.to_str().unwrap()) };
+        let cfg = load_config(); // must not panic
+        unsafe { std::env::remove_var("TARGET_CONF") };
+        // Should fall back to defaults
+        assert_eq!(cfg.dev_host_ip(), "");
+    }
+
+    #[test]
+    fn test_missing_all_sections_uses_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let conf = tmp.path().join(".target.toml");
+        std::fs::write(&conf, "[dev_host]\nip = \"10.0.0.1\"\n").unwrap();
+        unsafe { std::env::set_var("TARGET_CONF", conf.to_str().unwrap()) };
+        let cfg = load_config();
+        unsafe { std::env::remove_var("TARGET_CONF") };
+        assert_eq!(cfg.dev_host_ip(), "10.0.0.1");
+        assert_eq!(cfg.serial_target(), "2000"); // default
+        assert_eq!(cfg.login_user(), "root"); // default
+    }
+
+    #[test]
+    fn test_empty_string_values() {
+        let mut v = defaults();
+        v.insert("DEV_HOST_IP".into(), "".into());
+        let cfg = Config { values: v, config_path: None, project_dir: None, format: ConfigFormat::None };
+        assert_eq!(cfg.dev_host_ip(), "");
+    }
 }

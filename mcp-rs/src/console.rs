@@ -435,4 +435,18 @@ mod tests {
             assert_eq!(ctrl_byte, expected);
         }
     }
+
+    #[tokio::test]
+    async fn test_console_new_and_close() {
+        let mut console = SerialConsoleDriver::new("127.0.0.1".to_string(), "9999".to_string());
+        assert!(!console.is_open());
+        console.close();
+        assert!(!console.is_open());
+    }
+
+    #[test]
+    fn test_console_default_state() {
+        let console = SerialConsoleDriver::new("192.168.1.1".to_string(), "2000".to_string());
+        assert!(!console.is_open());
+    }
 }

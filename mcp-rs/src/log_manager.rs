@@ -935,6 +935,23 @@ mod tests {
         assert!(!current.contains("boot 1 data")); // flushed to numbered log
     }
 
+    #[test]
+    fn test_empty_log_returns_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lm = LogManager::new(tmp.path(), 10, 100, ".dut-serial");
+        let result = lm.read_log(0, 50, None);
+        assert!(result.content.is_empty());
+    }
+
+    #[test]
+    fn test_archive_index_bounds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lm = LogManager::new(tmp.path(), 10, 100, ".dut-serial");
+        // Out-of-bounds archive should return empty
+        let result = lm.read_log(999, 50, None);
+        assert!(result.content.is_empty());
+    }
+
     /// Double `mark_boot_start` with no data in between should not create
     /// empty logs.
     #[test]

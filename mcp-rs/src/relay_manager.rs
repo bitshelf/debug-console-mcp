@@ -504,4 +504,22 @@ mod tests {
         assert!(!RelayManager::new("127.0.0.1".to_string(), 2001, 0, 1, 0).configured());
         assert!(!RelayManager::new("127.0.0.1".to_string(), 2001, 5, 1, 0).configured());
     }
+
+    #[test]
+    fn test_relay_manager_configured() {
+        let rm = RelayManager::new("127.0.0.1".to_string(), 2001, 1, 2, 0);
+        assert!(rm.configured());
+    }
+
+    #[test]
+    fn test_relay_manager_not_configured_no_channels() {
+        let rm = RelayManager::new("127.0.0.1".to_string(), 2001, 0, 0, 0);
+        assert!(!rm.configured());
+    }
+
+    #[test]
+    fn test_relay_manager_not_configured_no_port() {
+        let rm = RelayManager::new("127.0.0.1".to_string(), 0, 1, 0, 0);
+        assert!(!rm.configured());
+    }
 }

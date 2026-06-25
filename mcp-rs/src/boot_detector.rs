@@ -1237,4 +1237,33 @@ root@debian:~#\r\n\
                 .any(|e| matches!(e, BootEvent::Stage(s) if s == "shell"))
         );
     }
+
+    #[test]
+    fn test_ddr_detection() {
+        let mut detector = BootStageDetector::new();
+        let events = detector.feed(b"DDR Version 1.25 20230501\n");
+        assert!(!events.is_empty());
+    }
+
+    #[test]
+    fn test_kernel_panic_detection() {
+        let mut detector = BootStageDetector::new();
+        let events = detector.feed(b"Kernel panic - not syncing: Attempted to kill init!\n");
+        let has_crash = events.iter().any(|e| matches!(e, BootEvent::Crash(_, _)));
+        assert!(has_crash, "Should detect kernel panic");
+    }
+
+    #[test]
+    fn test_uboot_prompt_detection() {
+        let mut detector = BootStageDetector::new();
+        let events = detector.feed(b"U-Boot 2017.09 (Jan 01 2023 - 00:00:00)\n");
+        assert!(!events.is_empty());
+    }
+
+    #[test]
+    fn test_empty_input_no_events() {
+        let mut detector = BootStageDetector::new();
+        let events = detector.feed(b"\n");
+        assert!(events.is_empty());
+    }
 }

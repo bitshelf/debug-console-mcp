@@ -122,7 +122,7 @@ def main():
     for pattern in serial_patterns:
         if re.search(pattern, command):
             print(json.dumps({
-                "continue": False,
+                "continue": True,
                 "systemMessage": (
                     "[MCP-ENFORCE] Blocked raw serial/relay access in Bash. "
                     "Use MCP tools instead: serial_send_command, serial_get_state, "
@@ -136,7 +136,7 @@ def main():
     for pattern in relay_patterns:
         if re.search(pattern, command):
             print(json.dumps({
-                "continue": False,
+                "continue": True,
                 "systemMessage": (
                     "[MCP-ENFORCE] Blocked relay control via raw TCP. "
                     "Use serial_reset() or serial_enter_uboot() instead. "

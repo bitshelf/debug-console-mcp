@@ -161,6 +161,30 @@ impl SerialEngine {
             }
         }
 
+        // Optional: verify udev alias on dev host (best-effort, doesn't block)
+        let dut_alias = self.config.get_str_or("DUT_ALIAS", "default");
+        if !dut_alias.is_empty() && dut_alias != "default" {
+            let dev_ip = self.config.dev_host_ip();
+            if !dev_ip.is_empty() {
+                let alias_path = format!("/dev/serial/by-alias/{}", dut_alias);
+                let check = std::process::Command::new("ssh")
+                    .args(["-o", "ConnectTimeout=3", &format!("linaro@{}", dev_ip), "test", "-e", &alias_path])
+                    .status();
+                match check {
+                    Ok(status) if status.success() => {
+                        tracing::info!("udev alias verified: {}", alias_path);
+                    }
+                    _ => {
+                        tracing::warn!(
+                            "[AGENT-NOTIFY] udev alias '{}' not found on dev host. \
+                             Run: ssh {} ls /dev/serial/by-alias/",
+                            alias_path, dev_ip
+                        );
+                    }
+                }
+            }
+        }
+
         // 1. 项目级单例: 同一 project_dir 只能有一个 MCP，自动替换旧进程
         if let Some(conflicting_pid) = lock_manager::check_project_singleton(&project_dir, &dut_dir)
         {
@@ -477,27 +501,7 @@ impl SerialEngine {
         }
 
         if self.paused {
-            // Paused: still read serial data and log it, but NO autonomous actions
-            if !self.console.wait_readable(Duration::from_millis(200)).await {
-                return;
-            }
-            match self
-                .console
-                .read_available(Duration::from_millis(0), 4096)
-                .await
-            {
-                Ok(data) if !data.is_empty() => {
-                    let clean = strip_ser2net_banner(&data);
-                    if !clean.is_empty() {
-                        self.logs.write(&clean);
-                    }
-                    self.state.on_activity();
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    self.handle_read_error(e).await;
-                }
-            }
+            // Paused: close serial so dutabo can take over without kickolduser war.
             return;
         }
         self.console.drain_writes().await;
@@ -541,10 +545,48 @@ impl SerialEngine {
                 if !clean_data.is_empty() {
                     self.logs.write(&clean_data);
                 }
-                let events = self.detector.feed(&clean_data);
+                // Catch panics in detector.feed() — a malformed regex or unexpected
+                // input should not crash the MCP server.
+                let events = {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.detector.feed(&clean_data)
+                    }));
+                    match result {
+                        Ok(events) => events,
+                        Err(e) => {
+                            let msg = if let Some(s) = e.downcast_ref::<String>() {
+                                s.clone()
+                            } else if let Some(s) = e.downcast_ref::<&str>() {
+                                s.to_string()
+                            } else {
+                                "unknown panic".to_string()
+                            };
+                            tracing::error!("[AGENT-NOTIFY] SerialEngine panicked in detector.feed(): {}. Reconnecting...", msg);
+                            self.state.transition(TargetState::Disconnected);
+                            return;
+                        }
+                    }
+                };
                 self.handle_boot_events(events).await;
                 let clean = strip_android_klog(&data);
-                self.commands.feed_serial_data(&clean);
+                // Catch panics in feed_serial_data() — marker parsing or buffer
+                // management bugs should not crash the MCP server.
+                {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.commands.feed_serial_data(&clean);
+                    }));
+                    if let Err(e) = result {
+                        let msg = if let Some(s) = e.downcast_ref::<String>() {
+                            s.clone()
+                        } else if let Some(s) = e.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else {
+                            "unknown panic".to_string()
+                        };
+                        tracing::error!("[AGENT-NOTIFY] SerialEngine panicked in commands.feed_serial_data(): {}. Reconnecting...", msg);
+                        self.state.transition(TargetState::Disconnected);
+                    }
+                }
             }
             Ok(_) => {
                 self.commands.check_timeouts();
@@ -657,7 +699,7 @@ impl SerialEngine {
                 .join(&alias)
                 .join("statusline-cache");
             let state = self.state.current();
-            let text = StateManager::format_statusline(state);
+            let text = self.state.format_statusline(state);
             if !text.is_empty() {
                 let _ = std::fs::write(&cache, &text);
             }
@@ -1064,6 +1106,10 @@ impl SerialEngine {
                     elapsed += wait;
                     if elapsed >= timeout || probes >= max_probes {
                         self.detector.remove_watcher_group(&tx);
+                        tracing::warn!(
+                            "Pattern '{}' not detected within {:.0}s. Target state: {:?}. Check serial_get_state.",
+                            pattern, timeout, self.state.current()
+                        );
                         return serde_json::json!({
                             "matched": false,
                             "matched_line": null,
@@ -2147,5 +2193,56 @@ mod tests {
         assert!(result.is_ok());
         let cmd_result = result.unwrap();
         assert!(cmd_result.timed_out);
+    }
+
+    // ── state transition tests (no hardware) ─────────────────────────────
+
+    #[tokio::test]
+    async fn test_engine_new_and_stop() {
+        let mut values = std::collections::HashMap::new();
+        values.insert("DEV_HOST_IP".into(), "127.0.0.1".into());
+        values.insert("SERIAL_PORT".into(), "59999".into());
+        values.insert("LOCK_DIR".into(), "/tmp/debug-console-test-locks".into());
+        values.insert("LOGIN_USER".into(), "root".into());
+        let cfg = Config {
+            values,
+            config_path: None,
+            project_dir: Some(std::env::temp_dir()),
+            format: crate::config::ConfigFormat::None,
+        };
+        // Engine should not panic on new()
+        let engine = new_shared_engine(cfg);
+        let mut eng = engine.lock().await;
+        // start() will fail to connect (no ser2net at 127.0.0.1:59999) but that's OK
+        let _result = eng.start().await;
+        // Should either connect (if something on 59999) or transition to disconnected
+        eng.stop().await;
+    }
+
+    #[test]
+    fn test_target_state_display() {
+        assert_eq!(TargetState::Active.as_str(), "active");
+        assert_eq!(TargetState::Booting.as_str(), "booting");
+        assert_eq!(TargetState::Crashed.as_str(), "crashed");
+        assert_eq!(TargetState::Disconnected.as_str(), "disconnected");
+        assert_eq!(TargetState::Stopped.as_str(), "stopped");
+    }
+
+    #[test]
+    fn test_format_statusline_all_states() {
+        let tmp = TempDir::new().unwrap();
+        let sm = StateManager::new(tmp.path(), 60, 3, ".dut-serial", "");
+        for state in &[
+            TargetState::Active,
+            TargetState::Booting,
+            TargetState::UBoot,
+            TargetState::Crashed,
+            TargetState::Disconnected,
+            TargetState::DutOff,
+        ] {
+            let text = sm.format_statusline(*state);
+            assert!(!text.is_empty());
+            assert!(text.contains('\x1b')); // ANSI color codes
+        }
     }
 }

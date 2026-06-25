@@ -271,4 +271,30 @@ mod tests {
         assert_eq!(ImageType::from_str("kernel"), Some(ImageType::Kernel));
         assert_eq!(ImageType::from_str("unknown"), None);
     }
+
+    #[test]
+    fn test_flash_plan_missing_image() {
+        let values = std::collections::HashMap::new();
+        let cfg = crate::config::Config {
+            values,
+            config_path: None,
+            project_dir: None,
+            format: crate::config::ConfigFormat::None,
+        };
+        let flash_cfg = FlashConfig::from_config(&cfg.values);
+        let plan = FlashPlan::from_config(
+            &flash_cfg,
+            std::path::Path::new("/nonexistent/image.img"),
+            ImageType::Full,
+            "devhost",
+            "devuser",
+        );
+        // FlashPlan::from_config is infallible — nonexistent path stored as-is
+        assert_eq!(
+            plan.local_image.file_name().unwrap().to_str().unwrap(),
+            "image.img"
+        );
+        // Plan still generates commands despite missing image on disk
+        assert!(!plan.commands().is_empty());
+    }
 }

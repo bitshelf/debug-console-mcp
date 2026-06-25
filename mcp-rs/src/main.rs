@@ -35,6 +35,7 @@ Options:
                      Default: info level to {project}/.dut-serial/mcp.log.
       --log-to-stderr  Log to stderr instead of file (useful for debugging).
       --http [HOST:PORT]  Run as Streamable HTTP server (default: 127.0.0.1:3000).
+      --dry-run          Validate config and exit without connecting.
 
 Environment:
   TARGET_CONF        Path to .target.conf file (alternative to CWD search).
@@ -134,6 +135,7 @@ async fn main() {
     let mut log_to_stderr = false;
     let mut http_mode = false;
     let mut http_bind = "127.0.0.1:3000".to_string();
+    let mut dry_run = false;
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -157,6 +159,7 @@ async fn main() {
                     http_bind = args[i].clone();
                 }
             }
+            "--dry-run" => dry_run = true,
             other => {
                 eprintln!("Unknown option: {other}");
                 eprintln!("Use --help for usage information.");
@@ -225,6 +228,48 @@ async fn main() {
             std::env::current_dir().unwrap_or_default().display(),
             std::env::var("TARGET_CONF").ok()
         );
+    }
+
+    // ── Dry-run: validate config and exit ──
+    if dry_run {
+        eprintln!("=== Config Validation ===");
+        eprintln!("Dev Host:  {}", cfg.dev_host_ip());
+        eprintln!("Serial:    {}:{}", cfg.serial_ip(), cfg.serial_target());
+        let login_user = cfg.login_user();
+        eprintln!(
+            "Login:     {}",
+            if login_user.is_empty() {
+                "(not set)"
+            } else {
+                &login_user
+            }
+        );
+        let reference_log = cfg.reference_log();
+        eprintln!(
+            "Reference: {}",
+            if reference_log.is_empty() {
+                "(not set)"
+            } else {
+                &reference_log
+            }
+        );
+        eprintln!(
+            "Relay:     port={} ch:reset={}/maskrom={}/recovery={}",
+            cfg.relay_port(),
+            cfg.reset_channel(),
+            cfg.maskrom_channel(),
+            cfg.recovery_channel()
+        );
+        if cfg.dev_host_ip().is_empty() {
+            eprintln!("\nERROR: dev_host.ip not set. Edit .target.toml");
+            std::process::exit(1);
+        }
+        if cfg.serial_target() == "0" {
+            eprintln!("\nERROR: serial.port not set. Edit .target.toml");
+            std::process::exit(1);
+        }
+        eprintln!("\nConfig OK. No errors found.");
+        std::process::exit(0);
     }
 
     // ── 创建并启动 engine（带超时防护）──

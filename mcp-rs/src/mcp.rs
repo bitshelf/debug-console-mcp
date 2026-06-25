@@ -953,21 +953,27 @@ impl McpServer {
                         );
                     }
                     if r.timed_out {
+                        let eng = self.engine.lock().await;
+                        let host = eng.config.dev_host_ip();
+                        let port = eng.config.serial_target();
                         res["hint"] = serde_json::json!(
-                            "Command timed out — target may be booting or unresponsive. Retry with longer timeout (e.g., timeout=30) or check serial_get_state."
+                            format!("Command timed out after {timeout:.0}s on {host}:{port} — target may be booting or unresponsive. Check serial_get_state.")
                         );
                     }
                     res
                 }
                 Ok(Err(_)) => serde_json::json!({"error": "Command cancelled"}),
                 Err(_elapsed) => {
+                    let eng = self.engine.lock().await;
+                    let host = eng.config.dev_host_ip();
+                    let port = eng.config.serial_target();
                     let mut res = serde_json::json!({
                         "output": "(timeout — engine did not respond)",
                         "exit_code": null,
                         "timed_out": true
                     });
                     res["hint"] = serde_json::json!(
-                        "Engine timeout — MCP may be stuck. Try serial_get_state to check, or restart MCP."
+                        format!("Engine timeout after {timeout:.0}s on {host}:{port} — MCP may be stuck. Try serial_get_state to check, or restart MCP.")
                     );
                     res
                 }
@@ -1240,6 +1246,21 @@ impl McpServer {
                             "required": true
                         }
                     ]
+                },
+                {
+                    "name": "boot-capture",
+                    "description": "Capture a clean boot log for StageLearner. Resets the target and waits for login.",
+                    "arguments": []
+                },
+                {
+                    "name": "crash-diagnose",
+                    "description": "Check if target has crashed and retrieve the crash log.",
+                    "arguments": []
+                },
+                {
+                    "name": "uboot-recovery",
+                    "description": "Enter U-Boot and recover from a bad kernel by flashing a new boot image.",
+                    "arguments": []
                 }
             ]
         })
@@ -1284,6 +1305,36 @@ impl McpServer {
                     "content": {
                         "type": "text",
                         "text": "Send a command to the target via serial_send_command and verify the output. Report the command result.",
+                    }
+                }]
+            }),
+            "boot-capture" => serde_json::json!({
+                "description": "Capture a clean boot log for StageLearner",
+                "messages": [{
+                    "role": "user",
+                    "content": {
+                        "type": "text",
+                        "text": "Run serial_reset(wait_boot=true) to capture a clean boot cycle. Then run serial_get_logs(lines=200) to review the boot log. Check serial_get_state to confirm the target reached active state.",
+                    }
+                }]
+            }),
+            "crash-diagnose" => serde_json::json!({
+                "description": "Check if target has crashed and retrieve crash log",
+                "messages": [{
+                    "role": "user",
+                    "content": {
+                        "type": "text",
+                        "text": "Run serial_get_state — if state is 'crashed', run serial_get_logs(lines=200, pattern='panic|BUG|Oops|Call trace') to see the crash details. Then consider rebooting or entering U-Boot for recovery.",
+                    }
+                }]
+            }),
+            "uboot-recovery" => serde_json::json!({
+                "description": "Enter U-Boot for recovery",
+                "messages": [{
+                    "role": "user",
+                    "content": {
+                        "type": "text",
+                        "text": "Run serial_enter_uboot to get to the U-Boot prompt. From there, use serial_uboot_command('setenv bootdelay 3') and serial_uboot_command('saveenv') to make U-Boot interactive. Then use serial_uboot_command('boot') to continue booting.",
                     }
                 }]
             }),

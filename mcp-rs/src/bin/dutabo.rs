@@ -120,18 +120,33 @@ async fn main() {
 }
 
 fn print_usage() {
-    eprintln!(
-        "\
-dutabo — DUT control CLI
-  dutabo list                       List all configured DUTs
-  dutabo state [--dut <alias>]      Show DUT state
-  dutabo serial [--dut <alias>]     Interactive serial console
-  dutabo reboot [--dut <alias>]     Software reboot DUT
-  dutabo uboot [--dut <alias>]      Enter U-Boot prompt
-  dutabo maskrom [--dut <alias>]    Enter Rockchip MASKROM mode
-  dutabo uf <image> [--dut <alias>] Flash full firmware image
-  dutabo flash-kernel <image> [--dut <alias>]  Flash kernel/boot image"
-    );
+    eprintln!("\
+dutabo — DUT control CLI for embedded Linux targets
+
+Usage:
+  dutabo <command> [options]
+
+Commands:
+  list                       List all configured DUTs from .target.toml
+  state     [--dut <alias>]  Show DUT state (active/booting/crashed/...)
+  serial    [--dut <alias>]  Interactive serial console (Ctrl-T q to quit)
+  reboot    [--dut <alias>]  Software reboot the DUT
+  uboot     [--dut <alias>]  Enter U-Boot interactive prompt
+  maskrom   [--dut <alias>]  Enter Rockchip MASKROM mode
+  uf <image> [--dut <alias>] Flash full firmware image
+  flash-kernel <image> [--dut <alias>]  Flash kernel/boot image
+
+Options:
+  --dut <alias>    Select which DUT (required for multi-DUT configs)
+  --mcp-port <N>   MCP HTTP port (default: 3000)
+
+Examples:
+  dutabo list
+  dutabo state --dut rk3576-pdstars
+  dutabo serial --dut rk3576-yt9215
+  dutabo uf /path/to/update.img --dut rk3576-pdstars
+  dutabo flash-kernel /path/to/boot.img
+    ");
 }
 
 fn find_target_toml() -> Option<PathBuf> {
@@ -515,44 +530,88 @@ fn serial_tcp_relay(host: &str, port: &str) {
     let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let r1 = running.clone();
 
-    // Thread 1: stdin → TCP (with Ctrl-T q escape)
-    std::thread::spawn(move || {
-        let mut buf = [0u8; 1];
-        let mut esc = false;
-        loop {
-            if !r1.load(std::sync::atomic::Ordering::Relaxed) {
-                break;
-            }
-            if std::io::stdin().lock().read_exact(&mut buf).is_err() {
-                break;
-            }
-            let b = buf[0];
-            if esc {
-                if b == b'q' || b == b'Q' {
-                    r1.store(false, std::sync::atomic::Ordering::Relaxed);
+    // Thread 1: stdin → TCP (with Ctrl-T q escape).
+    // Only spawn when stdin is a real TTY. Otherwise (pipe/Agent),
+    // just relay TCP→stdout — don't read stdin (immediate EOF).
+    if is_tty {
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1];
+            let mut esc = false;
+            loop {
+                if !r1.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                let _ = tcp_w.write_all(&[0x14]);
-                let _ = tcp_w.write_all(&[b]);
-                esc = false;
-            } else if b == 0x14 {
-                esc = true;
-            } else {
-                let _ = tcp_w.write_all(&[b]);
+                if std::io::stdin().lock().read_exact(&mut buf).is_err() {
+                    break;
+                }
+                let b = buf[0];
+                if esc {
+                    if b == b'q' || b == b'Q' {
+                        r1.store(false, std::sync::atomic::Ordering::Relaxed);
+                        break;
+                    }
+                    let _ = tcp_w.write_all(&[0x14]);
+                    let _ = tcp_w.write_all(&[b]);
+                    esc = false;
+                } else if b == 0x14 {
+                    esc = true;
+                } else {
+                    let _ = tcp_w.write_all(&[b]);
+                }
             }
-        }
-        r1.store(false, std::sync::atomic::Ordering::Relaxed);
-    });
+            r1.store(false, std::sync::atomic::Ordering::Relaxed);
+        });
+    } else {
+        // Non-interactive mode: set a 30s timeout for output-only relay
+        let r2 = running.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            r2.store(false, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
 
-    // Thread 2: TCP → stdout
-    eprintln!("Connected to {host}:{port} (Ctrl-T q to exit)\n");
+    // Thread 2: TCP → stdout (with ANSI escape filtering)
+    if is_tty {
+        eprintln!("Connected to {host}:{port} (Ctrl-T q to exit)\n");
+    } else {
+        eprintln!("Connected to {host}:{port} (non-interactive, 30s timeout)\n");
+    }
     let mut buf = [0u8; 4096];
+    let mut out = Vec::with_capacity(4096);
     while running.load(std::sync::atomic::Ordering::Relaxed) {
         match tcp_r.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                let _ = std::io::stdout().write_all(&buf[..n]);
-                let _ = std::io::stdout().flush();
+                out.clear();
+                let raw = &buf[..n];
+                let mut i = 0;
+                while i < raw.len() {
+                    // Skip ANSI escape sequences: ESC[ ... m/; / etc, ESC]0;...BEL
+                    if raw[i] == 0x1b && i + 1 < raw.len() {
+                        let next = raw[i + 1];
+                        if next == b'[' || next == b']' || next == b'(' || next == b')'
+                           || next == b'>' || next == b'='
+                        {
+                            // Skip ESC + bracket + parameters + terminator
+                            i += 2;
+                            while i < raw.len() && !(raw[i] >= b'@' && raw[i] <= b'~')
+                                  && raw[i] != b'\x07'
+                            {
+                                i += 1;
+                            }
+                            if i < raw.len() {
+                                i += 1; // skip terminator
+                            }
+                            continue;
+                        }
+                    }
+                    out.push(raw[i]);
+                    i += 1;
+                }
+                if !out.is_empty() {
+                    let _ = std::io::stdout().write_all(&out);
+                    let _ = std::io::stdout().flush();
+                }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(std::time::Duration::from_millis(50));

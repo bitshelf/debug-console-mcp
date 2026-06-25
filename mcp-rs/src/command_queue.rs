@@ -22,6 +22,11 @@ const BUFFER_CAP: usize = 8 * 1024 * 1024; // 8 MB
 /// When trimming, keep the most recent TRIM_KEEP bytes.
 const TRIM_KEEP: usize = 4 * 1024 * 1024; // 4 MB
 
+/// Max pending commands before rejecting new ones.
+/// Prevents memory exhaustion from rapid-fire command submission.
+#[allow(dead_code)]
+const MAX_PENDING: usize = 100;
+
 /// Strip ANSI escape codes (regex compiled once via `LazyLock`).
 fn strip_ansi(data: &[u8]) -> Vec<u8> {
     use std::sync::LazyLock;
@@ -150,6 +155,19 @@ impl CommandQueue {
         command: String,
         timeout_secs: f64,
     ) -> oneshot::Receiver<CommandResult> {
+        // Reject new commands when the pending queue is full, preventing
+        // memory exhaustion from rapid-fire command submission.
+        if self.pending.len() >= MAX_PENDING {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(CommandResult {
+                output: "(rejected — too many pending commands)".to_string(),
+                exit_code: None,
+                timed_out: false,
+                truncated: false,
+            });
+            return rx;
+        }
+
         let (tx, rx) = oneshot::channel();
         let marker = gen_marker();
         let pc = PendingCommand {
@@ -747,5 +765,76 @@ mod tests {
         let result = rx.try_recv().unwrap();
         assert!(!result.timed_out, "should not time out");
         assert!(!result.truncated, "small output must not set truncated");
+    }
+
+    #[test]
+    fn test_sequential_commands_do_not_interfere() {
+        let mut cq = CommandQueue::new();
+        let sm = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sm2 = sm.clone();
+        let write_fn = Box::new(move |data: &[u8]| {
+            *sm2.lock().unwrap() = String::from_utf8_lossy(data).to_string();
+        });
+        cq.set_write_fn(write_fn);
+
+        let mut rx1 = cq.execute("cmd1".to_string(), 90.0);
+        let mut rx2 = cq.execute("cmd2".to_string(), 90.0);
+
+        // First command should be sent, second queued
+        let sent1 = sm.lock().unwrap();
+        assert!(sent1.contains("cmd1"));
+        assert!(rx1.try_recv().is_err()); // not resolved yet
+        assert!(rx2.try_recv().is_err()); // not even started
+    }
+
+    #[test]
+    fn test_queue_drains_on_timeout() {
+        let mut cq = CommandQueue::new();
+        let write_fn = Box::new(|_data: &[u8]| {});
+        cq.set_write_fn(write_fn);
+
+        let mut rx1 = cq.execute("cmd1".to_string(), 0.001); // 1ms timeout
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        cq.feed_serial_data(b""); // triggers timeout check
+        let result = rx1.try_recv().unwrap();
+        assert!(result.timed_out);
+        assert!(result.output.contains("timeout"));
+    }
+
+    #[test]
+    fn test_multiple_commands_sequential_resolve() {
+        let mut cq = CommandQueue::new();
+        let sm = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sm2 = sm.clone();
+        let write_fn = Box::new(move |data: &[u8]| {
+            sm2.lock().unwrap().push(String::from_utf8_lossy(data).to_string());
+        });
+        cq.set_write_fn(write_fn);
+
+        let _rx1 = cq.execute("cmd_a".to_string(), 90.0);
+        let _rx2 = cq.execute("cmd_b".to_string(), 90.0);
+        let _rx3 = cq.execute("cmd_c".to_string(), 90.0);
+
+        // All three should be written (first sent, others queued)
+        let writes = sm.lock().unwrap();
+        assert_eq!(writes.len(), 1); // only first sent immediately
+    }
+
+    #[test]
+    fn test_rapid_fire_commands() {
+        let mut cq = CommandQueue::new();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = count.clone();
+        let write_fn = Box::new(move |_data: &[u8]| {
+            c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        cq.set_write_fn(write_fn);
+
+        let mut receivers = Vec::new();
+        for i in 0..50 {
+            receivers.push(cq.execute(format!("cmd{}", i), 90.0));
+        }
+        // All 50 should be queued (only 1 sent immediately to write_fn)
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
