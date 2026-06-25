@@ -10,7 +10,6 @@ to interact with the target's serial port or relay, and BLOCKS them
 import json
 import re
 import sys
-import os
 from pathlib import Path
 
 _HOOK_DIR = Path(__file__).resolve().parent
@@ -70,7 +69,7 @@ def _read_dev_host() -> str:
 
 
 # Patterns that indicate raw serial access — should use MCP instead
-def _build_serial_patterns() -> list[str]:
+def _build_serial_patterns() -> list:
     """Build serial raw-access patterns, using the actual dev host IP if available."""
     dev_host = _read_dev_host()
     host_pattern = re.escape(dev_host) if dev_host else r"192\.168\.\d+\.\d+"
@@ -94,7 +93,7 @@ def _build_serial_patterns() -> list[str]:
     ]
 
 # Patterns that are valid but should prefer MCP (built dynamically with dev host IP)
-def _build_relay_patterns() -> list[str]:
+def _build_relay_patterns() -> list:
     """Build relay raw-access patterns, using the actual dev host IP if available."""
     dev_host = _read_dev_host()
     host_pattern = re.escape(dev_host) if dev_host else r"192\.168\.\d+\.\d+"
@@ -137,12 +136,13 @@ def main():
     if dev_host:
         dev_host_pattern = re.escape(dev_host)
         dangerous = [
-            (rf"ssh\s+.*{dev_host_pattern}.*(?:reboot|shutdown|poweroff)", "reboot/shutdown"),
+            # Only block reboot/shutdown of the dev host ITSELF, not target commands
+            # like "reboot loader" or "reboot -f" which target the board via serial
+            (rf"ssh\s+.*{dev_host_pattern}\s+(?:\"|')\s*(?:reboot|shutdown\s+now|poweroff)\s*(?:\"|')", "reboot/shutdown dev host"),
             (rf"ssh\s+.*{dev_host_pattern}.*(?:dd\s+if=|dd\s+of=/dev)", "dd disk write"),
             (rf"ssh\s+.*{dev_host_pattern}.*(?:mkfs\.|mke2fs|mkfs)", "mkfs format"),
             (rf"ssh\s+.*{dev_host_pattern}.*rm\s+-rf\s+/", "rm -rf /"),
             (rf"ssh\s+.*{dev_host_pattern}.*(?:apt\s+install|apt\s+remove|dpkg)", "apt/pkg modify"),
-            (rf"ssh\s+.*{dev_host_pattern}.*(?:upgrade_tool\s+uf|upgrade_tool\s+db)(?!.*\.img)", "upgrade_tool without image"),
         ]
         for pattern, label in dangerous:
             if re.search(pattern, command):

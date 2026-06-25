@@ -501,8 +501,19 @@ impl SerialEngine {
         }
 
         if self.paused {
-            // Paused: close serial so dutabo can take over without kickolduser war.
             return;
+        }
+
+        // Check for dutabo takeover sentinel file
+        if let Some(ref proj) = self.config.project_dir {
+            let sentinel = proj.join(".dut-serial").join(".dutabo-active");
+            if sentinel.exists() {
+                if self.console.is_open() {
+                    self.console.close(); // release serial so dutabo can connect
+                    self.state.transition(crate::state_manager::TargetState::Dutabo);
+                }
+                return; // don't reconnect while dutabo is active
+            }
         }
         self.console.drain_writes().await;
         // disconnected 状态 → 主动尝试重连 (exponential backoff)

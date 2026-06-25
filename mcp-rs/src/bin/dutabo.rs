@@ -417,13 +417,20 @@ async fn cmd_serial(dut: &debug_console_mcp::config::DutConfig, mcp_port: u16) {
         }
     }
 
-    // Pause Agent
-    let _ = pause_agent(mcp_port);
+    // Signal MCP to release serial (writes sentinel file)
+    let sentinel = std::env::current_dir()
+        .unwrap_or_default()
+        .join(".dut-serial")
+        .join(".dutabo-active");
+    std::fs::write(&sentinel, "1").ok();
+    // Wait for MCP to release
+    std::thread::sleep(std::time::Duration::from_millis(500));
 
     // Native Rust TCP serial relay — no external tools, no shell escaping
     serial_tcp_relay(host, &dut.serial_port);
 
-    // Resume Agent
+    // Clean up sentinel so MCP can reconnect
+    std::fs::remove_file(&sentinel).ok();
     let _ = resume_agent(mcp_port);
     eprintln!("Session ended.");
 }
