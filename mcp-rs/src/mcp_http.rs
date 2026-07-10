@@ -27,12 +27,6 @@ use crate::serial_engine::SharedEngine;
 
 type SharedServer = Arc<Mutex<McpServer>>;
 
-/// WebSocket serial relay echo-control commands.
-/// On connect: enable echo so the user sees what they type.
-/// On disconnect: disable echo so MCP command markers work again.
-const WS_ECHO_ON: &[u8] = b"stty echo\n";
-const WS_ECHO_OFF: &[u8] = b"stty -echo\n";
-
 /// Before registering the WS broadcast channel we send a newline to the board
 /// to trigger a clean prompt, then wait this long for the read loop to consume
 /// any stale serial-buffer data.  Shorter = faster startup; must be ≥ 1 full
@@ -175,10 +169,8 @@ async fn serial_ws_handler(mut socket: WebSocket, state: SharedServer) {
         eng.set_ws_tx(ws_tx.clone());
     }
 
-    // Enable echo for interactive session (engine startup sends stty -echo
-    // so command markers aren't garbled; interactive users need to see what
-    // they type).
-    let _ = write_tx.send(WS_ECHO_ON.to_vec()).await;
+    // Terminal stays in getty defaults (echo on, icanon, …) — same as PuTTY.
+    // No stty manipulation needed; command queue echo-skipping handles MCP.
 
     // Spawn task: broadcast → mpsc (decouples broadcast from WebSocket borrow)
     let mut ws_rx = ws_tx.subscribe();
@@ -224,9 +216,6 @@ async fn serial_ws_handler(mut socket: WebSocket, state: SharedServer) {
             }
         }
     }
-
-    // Cleanup: disable echo so command markers work again after interactive session
-    let _ = write_tx.send(WS_ECHO_OFF.to_vec()).await;
 
     let mut eng = engine.lock().await;
     eng.clear_ws_tx();
@@ -377,20 +366,11 @@ mod tests {
         assert_eq!(json["commands"]["total"], 42);
     }
 
-    // ── Regression: WebSocket echo management ──────────────────────────
-
-    #[test]
-    fn test_ws_echo_commands_are_distinct() {
-        // Ensure the echo commands are actually different — a copy-paste bug
-        // that sends the same command for both would be silent and disastrous.
-        assert_ne!(super::WS_ECHO_ON, super::WS_ECHO_OFF);
-        assert!(super::WS_ECHO_ON.ends_with(b"\n"));
-        assert!(super::WS_ECHO_OFF.ends_with(b"\n"));
-    }
+    // ── Regression: WebSocket write channel ──────────────────────────
 
     #[tokio::test]
-    async fn test_ws_write_channel_accepts_echo_commands() {
-        // The write channel must accept echo commands even when the console
+    async fn test_ws_write_channel_accepts_data() {
+        // The write channel must accept data even when the console
         // is not connected. If the channel is full or broken, dutabo serial
         // sessions silently break (keystrokes never reach the board).
         let engine = create_test_engine();
@@ -399,13 +379,15 @@ mod tests {
             eng.console.write_sender()
         };
 
+        // Channel must accept a keystroke
         assert!(
-            write_tx.send(super::WS_ECHO_ON.to_vec()).await.is_ok(),
-            "write channel should accept echo-on command"
+            write_tx.send(b"a".to_vec()).await.is_ok(),
+            "write channel should accept keystrokes"
         );
+        // Channel must accept newline
         assert!(
-            write_tx.send(super::WS_ECHO_OFF.to_vec()).await.is_ok(),
-            "write channel should accept echo-off command"
+            write_tx.send(b"\n".to_vec()).await.is_ok(),
+            "write channel should accept newline"
         );
     }
 }

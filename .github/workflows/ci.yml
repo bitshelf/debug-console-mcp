@@ -15,6 +15,9 @@ jobs:
       - name: Test
         working-directory: mcp-rs
         run: cargo test --lib -- --test-threads=1
+      - name: Integration tests
+        working-directory: mcp-rs
+        run: cargo test --tests -- --test-threads=1
       - name: Build
         working-directory: mcp-rs
         run: cargo build --release

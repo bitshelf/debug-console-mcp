@@ -241,10 +241,10 @@ impl CommandQueue {
 
         let marker = pc.marker_bytes();
 
-        // Step 1: find real begin marker. stty -echo is pre-set by the engine,
-        // so normally there's no echoed text. But if a command's echo leaks
-        // through, loop to skip up to 2 echoed marker occurrences — markers
-        // preceded by `echo '` or `; echo` are shell syntax, not real output.
+        // Step 1: find real begin marker. Terminal echo is left on (like PuTTY
+        // serial), so the command line is echoed. Skip up to 2 echoed marker
+        // occurrences — markers preceded by `echo '` or `; echo` are shell
+        // syntax, not real output.
         if !pc.found_begin {
             pc.search_buf.extend_from_slice(&data);
             if pc.search_buf.len() > self.buffer_cap {
@@ -352,9 +352,10 @@ impl CommandQueue {
 
     fn send_command(&mut self, mut pc: PendingCommand) {
         let m = &pc.marker;
-        // stty -echo is pre-set by SerialEngine on start; no per-command toggle
-        // needed. The { cmd; } wrapper ensures pipe output is fully flushed before
-        // the exit-code line runs — fixes BusyBox ash pipe buffering issues.
+        // Echo is left on (PuTTY-like); the echo-skipping logic handles the
+        // echoed command text.  The { cmd; } wrapper ensures pipe output is
+        // fully flushed before the exit-code line runs — fixes BusyBox ash
+        // pipe buffering issues.
         let line = format!(
             "echo '{}''{}'; {{ {}; }}; echo \"EXIT:$?\"; echo '{}''{}'\n",
             &m[..4],
@@ -652,7 +653,9 @@ mod tests {
         // 4. Command output
         // 5. Exit code
         // 6. End marker
-        // With stty -echo, the sent command is NOT echoed. Only the output appears.
+        // Echo is left on; the echoed command line (if present) is skipped
+        // by the marker-based echo detection.  Test data simulates the
+        // post-echo-skip stream.
         let mut serial_stream = Vec::new();
         // Actual marker output (from echo 'MARKER')
         serial_stream.extend_from_slice(&marker_bytes);
@@ -697,7 +700,8 @@ mod tests {
         let marker: String = format!("{}{}", parts[1], parts[3]);
         let mb = marker.as_bytes().to_vec();
 
-        // With stty -echo, no echoed command text. Only output appears.
+        // Echo is left on; echoed command text (if present) is skipped by the
+        // marker-based echo detection.  Test data simulates post-echo-skip stream.
         let mut data = Vec::new();
         data.extend_from_slice(&mb); // real marker
         data.push(b'\n');

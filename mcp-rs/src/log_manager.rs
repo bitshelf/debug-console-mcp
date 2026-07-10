@@ -10,7 +10,6 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
 
 /// Message sent to the background writer thread.
 enum WriterMsg {
@@ -134,10 +133,8 @@ impl LogManager {
         if self.current_file.is_none() {
             self.ensure_current_file();
         }
-        let clean = strip_ansi_and_null(data);
-
         // ── Ring buffer (synchronous, instant) ──────────────────────────
-        self.ring_buffer.extend_from_slice(&clean);
+        self.ring_buffer.extend_from_slice(data);
         if self.ring_buffer.len() > self.max_buffer_size {
             let drain = self.ring_buffer.len() - self.max_buffer_size / 2;
             self.ring_buffer.drain(..drain);
@@ -145,10 +142,10 @@ impl LogManager {
         }
 
         // ── File I/O → background writer thread ─────────────────────────
-        if !clean.is_empty() {
+        if !data.is_empty() {
             self.ensure_writer();
             if let Some(ref tx) = self.writer_tx {
-                let _ = tx.send(WriterMsg::Data(clean));
+                let _ = tx.send(WriterMsg::Data(data.to_vec()));
             }
         }
     }
@@ -290,6 +287,7 @@ impl LogManager {
     /// `current.serial.log` (symlink or regular), and create a fresh empty
     /// regular file for the new cycle.
     fn start_new_cycle(&mut self) {
+        self.flush_sync();
         self.current_file.take();
         let path = self.log_dir.join("current.serial.log");
         // Remove whatever is at `current.serial.log` (regular file or stale
@@ -533,38 +531,6 @@ impl LogManager {
     }
 }
 
-/// Strip ANSI escape codes + null bytes + other control chars (keep \n \r \t).
-/// The regex is compiled once and cached via `LazyLock`.
-fn strip_ansi_and_null(data: &[u8]) -> Vec<u8> {
-    static RE_ANSI: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
-        regex::bytes::Regex::new(r"(\x1b\[|\x9b)[0-?]*[ -/]*[@-~]|\x1b[>=]|\x1b[()][A-Z0-9]")
-            .unwrap()
-    });
-    let mut result = Vec::with_capacity(data.len());
-    let mut i = 0;
-    while i < data.len() {
-        let b = data[i];
-        if b == 0x00 {
-            // Skip null bytes
-            i += 1;
-            continue;
-        }
-        if b == 0x1b || b == 0x9b {
-            // ANSI escape sequence start — skip the whole sequence via regex
-            if let Some(m) = RE_ANSI.find(&data[i..]) {
-                i += m.end();
-                continue;
-            }
-        }
-        // Keep printable chars + newline/cr/tab
-        if b >= 0x20 || b == b'\n' || b == b'\r' || b == b'\t' {
-            result.push(b);
-        }
-        i += 1;
-    }
-    result
-}
-
 struct LogFileInfo {
     name: String,
     size: u64,
@@ -595,6 +561,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let lm = LogManager::new(tmp.path(), max_logs, max_size_mb, ".dut-serial");
         (lm, tmp)
+    }
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
     }
 
     #[test]
@@ -638,6 +610,74 @@ mod tests {
         assert!(content.contains("line 1"));
         assert!(content.contains("line 2"));
         assert!(content.contains("line 3"));
+    }
+
+    #[test]
+    fn test_write_preserves_raw_dut_bytes_in_current_full_and_ring() {
+        let (mut lm, tmp) = create_test_log_manager(10, 100);
+        let raw = b"state \x1b[32mUP\x1b[0m\0\x01\r\n    inet \x1b[32m127.0.0.1\x1b[0m/8\n";
+
+        lm.ensure_current_file();
+        lm.write(raw);
+        lm.flush_sync();
+
+        let log_dir = tmp.path().join(".dut-serial/logs");
+        let current = fs::read(log_dir.join("current.serial.log")).unwrap();
+        let full = fs::read(log_dir.join("full.serial.log")).unwrap();
+
+        assert!(contains_bytes(&current, raw));
+        assert!(contains_bytes(&full, raw));
+        assert!(contains_bytes(&lm.ring_buffer, raw));
+    }
+
+    #[test]
+    fn test_write_preserves_split_ip_color_sequences_without_inserting_m() {
+        let (mut lm, tmp) = create_test_log_manager(10, 100);
+        let chunks: [&[u8]; 5] = [
+            b"2: eth0: <BROADCAST> mtu 1500 state \x1b[32",
+            b"mUP\x1b[0",
+            b"m group default\n    inet \x1b[32",
+            b"m127.0.0.1\x1b[0",
+            b"m/8 scope host lo\n",
+        ];
+
+        lm.ensure_current_file();
+        for chunk in chunks {
+            lm.write(chunk);
+        }
+        lm.flush_sync();
+
+        let log = fs::read(tmp.path().join(".dut-serial/logs/current.serial.log")).unwrap();
+        let expected = b"2: eth0: <BROADCAST> mtu 1500 state \x1b[32mUP\x1b[0m group default\n    inet \x1b[32m127.0.0.1\x1b[0m/8 scope host lo\n";
+
+        assert!(contains_bytes(&log, expected));
+        assert!(!contains_bytes(&log, b"state mUP"));
+        assert!(!contains_bytes(&log, b"inet m127"));
+    }
+
+    #[test]
+    fn test_rotate_preserves_raw_dut_bytes_in_archive() {
+        let (mut lm, tmp) = create_test_log_manager(10, 100);
+        let raw = b"awlink0: <NOARP,ECHO> state \x1b[31mDOWN\x1b[0m\0\n";
+
+        lm.ensure_current_file();
+        lm.write(raw);
+        lm.rotate();
+        lm.flush_sync();
+
+        let log_dir = tmp.path().join(".dut-serial/logs");
+        let archive = std::fs::read_dir(&log_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("boot-") && n.ends_with(".log"))
+            })
+            .expect("expected archived boot log");
+        let archived = fs::read(archive.path()).unwrap();
+
+        assert!(contains_bytes(&archived, raw));
     }
 
     #[test]
@@ -736,6 +776,7 @@ mod tests {
         lm.write(b"INFO: all good\n");
         lm.write(b"ERROR: another failure\n");
         lm.write(b"DEBUG: debugging\n");
+        lm.flush_sync();
 
         let result = lm.read_log(0, 100, Some("ERROR"));
         assert_eq!(result.filtered_lines, 2);

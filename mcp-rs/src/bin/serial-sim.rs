@@ -117,6 +117,7 @@ struct Shell {
     fs: FakeFS,
     boot_time: Instant,
     line_buf: String,
+    cursor: usize,
     echo: bool,
     logged_in: bool,
     login_user: String,
@@ -129,6 +130,7 @@ impl Shell {
             fs: FakeFS::new(hostname),
             boot_time: Instant::now(),
             line_buf: String::new(),
+            cursor: 0,
             echo: true,
             logged_in: false,
             login_user: String::new(),
@@ -270,6 +272,82 @@ impl Shell {
 
 // ── Connection handler ─────────────────────────────────────────────────────
 
+enum InputState {
+    Ground,
+    Esc,
+    Csi(Vec<u8>),
+}
+
+fn redraw_inserted_tail(stream: &mut TcpStream, tail: &str, cursor_back: usize) {
+    let _ = stream.write_all(tail.as_bytes());
+    for _ in 0..cursor_back {
+        let _ = stream.write_all(b"\x1b[D");
+    }
+}
+
+fn handle_graphic_input(stream: &mut TcpStream, shell: &mut Shell, b: u8) {
+    let ch = b as char;
+    if shell.cursor >= shell.line_buf.len() {
+        shell.line_buf.push(ch);
+        shell.cursor = shell.line_buf.len();
+        if shell.echo {
+            let _ = stream.write_all(&[b]);
+            let _ = stream.flush();
+        }
+        return;
+    }
+
+    shell.line_buf.insert(shell.cursor, ch);
+    shell.cursor += 1;
+    if shell.echo {
+        let tail = &shell.line_buf[shell.cursor..];
+        let _ = stream.write_all(&[b]);
+        redraw_inserted_tail(stream, tail, tail.len());
+        let _ = stream.flush();
+    }
+}
+
+fn handle_backspace(stream: &mut TcpStream, shell: &mut Shell) {
+    if shell.cursor == 0 || shell.line_buf.is_empty() {
+        return;
+    }
+
+    shell.cursor -= 1;
+    shell.line_buf.remove(shell.cursor);
+    if shell.echo {
+        if shell.cursor == shell.line_buf.len() {
+            let _ = stream.write_all(b"\x08 \x08");
+        } else {
+            let _ = stream.write_all(b"\x08\x1b[P");
+        }
+        let _ = stream.flush();
+    }
+}
+
+fn handle_csi_input(stream: &mut TcpStream, shell: &mut Shell, seq: &[u8]) {
+    match seq {
+        b"\x1b[D" => {
+            if shell.cursor > 0 {
+                shell.cursor -= 1;
+                if shell.echo {
+                    let _ = stream.write_all(seq);
+                    let _ = stream.flush();
+                }
+            }
+        }
+        b"\x1b[C" => {
+            if shell.cursor < shell.line_buf.len() {
+                shell.cursor += 1;
+                if shell.echo {
+                    let _ = stream.write_all(seq);
+                    let _ = stream.flush();
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn handle_client(
     mut stream: TcpStream,
     hostname: &str,
@@ -310,6 +388,7 @@ fn handle_client(
     let _ = stream.set_nodelay(true);
 
     let mut read_buf = [0u8; 256];
+    let mut input_state = InputState::Ground;
 
     while running.load(Ordering::Relaxed) {
         match stream.read(&mut read_buf) {
@@ -319,15 +398,33 @@ fn handle_client(
 
                 // Handle backspace
                 for &b in data {
-                    match b {
-                        b'\x7f' | b'\x08' => {
-                            // Backspace
-                            if !shell.line_buf.is_empty() {
-                                shell.line_buf.pop();
-                                if shell.echo {
-                                    let _ = stream.write_all(b"\x08 \x08");
-                                }
+                    match &mut input_state {
+                        InputState::Esc => {
+                            if b == b'[' {
+                                input_state = InputState::Csi(vec![0x1b, b'[']);
+                            } else {
+                                input_state = InputState::Ground;
                             }
+                            continue;
+                        }
+                        InputState::Csi(seq) => {
+                            seq.push(b);
+                            if (b'@'..=b'~').contains(&b) {
+                                let seq = std::mem::take(seq);
+                                handle_csi_input(&mut stream, &mut shell, &seq);
+                                input_state = InputState::Ground;
+                            }
+                            continue;
+                        }
+                        InputState::Ground => {}
+                    }
+
+                    match b {
+                        b'\x1b' => {
+                            input_state = InputState::Esc;
+                        }
+                        b'\x7f' | b'\x08' => {
+                            handle_backspace(&mut stream, &mut shell);
                         }
                         b'\r' | b'\n' => {
                             // Enter — process the line
@@ -335,6 +432,7 @@ fn handle_client(
                                 let _ = stream.write_all(b"\r\n");
                             }
                             let line = std::mem::take(&mut shell.line_buf);
+                            shell.cursor = 0;
                             let response = shell.process_line(&line);
                             let _ = stream.write_all(response.as_bytes());
                             let _ = stream.flush();
@@ -351,17 +449,14 @@ fn handle_client(
                         b'\x03' => {
                             // Ctrl-C → new prompt
                             shell.line_buf.clear();
+                            shell.cursor = 0;
                             let _ = stream.write_all(b"^C");
                             let response = shell.prompt();
                             let _ = stream.write_all(response.as_bytes());
                             let _ = stream.flush();
                         }
                         _ if b.is_ascii_graphic() || b == b' ' || b == b'\t' => {
-                            shell.line_buf.push(b as char);
-                            if shell.echo {
-                                let _ = stream.write_all(&[b]);
-                                let _ = stream.flush();
-                            }
+                            handle_graphic_input(&mut stream, &mut shell, b);
                         }
                         _ => {
                             // Pass through other control chars (e.g. ANSI sequences)

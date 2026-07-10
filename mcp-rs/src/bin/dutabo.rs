@@ -4,7 +4,9 @@
 //!   dutabo serial → pause Agent → WebSocket/TCP relay → resume Agent
 //!   dutabo state/reboot/etc → MCP HTTP → Agent
 
+use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
 const MCP_DEFAULT_PORT: u16 = 3000;
 const MC_PORT_BASE: u16 = 3001;
@@ -16,6 +18,240 @@ const HEALTH_POLL_INTERVAL_MS: u64 = 200;
 const HEALTH_POLL_RETRIES: u32 = 15;
 
 static INITIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+struct TerminalSanitizer {
+    state: AnsiState,
+    allow_color: bool,
+}
+
+enum AnsiState {
+    Ground,
+    Esc(Vec<u8>),
+    Csi(Vec<u8>),
+    Osc,
+}
+
+impl TerminalSanitizer {
+    fn new(allow_color: bool) -> Self {
+        Self {
+            state: AnsiState::Ground,
+            allow_color,
+        }
+    }
+
+    fn filter(&mut self, raw: &[u8], out: &mut Vec<u8>) {
+        for &b in raw {
+            match &mut self.state {
+                AnsiState::Ground => {
+                    if b == 0x1b {
+                        self.state = AnsiState::Esc(vec![b]);
+                    } else {
+                        out.push(b);
+                    }
+                }
+                AnsiState::Esc(seq) => {
+                    seq.push(b);
+                    match b {
+                        b'[' => {
+                            let seq = std::mem::take(seq);
+                            self.state = AnsiState::Csi(seq);
+                        }
+                        b']' => {
+                            self.state = AnsiState::Osc;
+                        }
+                        b'(' | b')' | b'>' | b'=' => {}
+                        _ => {
+                            self.state = AnsiState::Ground;
+                        }
+                    }
+                }
+                AnsiState::Csi(seq) => {
+                    seq.push(b);
+                    if (b'@'..=b'~').contains(&b) {
+                        if b == b'm' {
+                            // SGR color code — strip (or preserve if allow_color + safe)
+                            if self.allow_color && is_safe_sgr(seq) {
+                                out.extend_from_slice(seq);
+                            }
+                        } else {
+                            // Cursor movement, erase, insert/delete, save/restore —
+                            // readline needs all non-SGR CSI sequences for correct
+                            // visual feedback.  Stripping any of them causes cursor
+                            // desync and backspace-deletes-wrong-character bugs.
+                            out.extend_from_slice(seq);
+                        }
+                        self.state = AnsiState::Ground;
+                    }
+                }
+                AnsiState::Osc => {
+                    if b == b'\x07' {
+                        self.state = AnsiState::Ground;
+                    } else if b == b'\\' {
+                        self.state = AnsiState::Ground;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn is_safe_sgr(seq: &[u8]) -> bool {
+    seq.starts_with(b"\x1b[")
+        && seq[2..seq.len().saturating_sub(1)]
+            .iter()
+            .all(|b| b.is_ascii_digit() || *b == b';')
+}
+
+
+fn highlight_serial_prompt(data: &[u8], out: &mut Vec<u8>) {
+    let mut start = 0;
+    while start < data.len() {
+        let end = data[start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|pos| start + pos + 1)
+            .unwrap_or(data.len());
+        highlight_serial_prompt_line(&data[start..end], out);
+        start = end;
+    }
+}
+
+struct PromptParts {
+    prefix: Option<Range<usize>>,
+    user: Range<usize>,
+    separator: Option<Range<usize>>,
+    dir: Range<usize>,
+    suffix: Option<Range<usize>>,
+    sigil: Range<usize>,
+}
+
+fn highlight_serial_prompt_line(line: &[u8], out: &mut Vec<u8>) {
+    let Some(parts) = prompt_parts(line) else {
+        out.extend_from_slice(line);
+        return;
+    };
+    let tail = parts.sigil.end;
+
+    if let Some(prefix) = parts.prefix {
+        out.extend_from_slice(&line[prefix]);
+    }
+    out.extend_from_slice(b"\x1b[1;32m");
+    out.extend_from_slice(&line[parts.user]);
+    out.extend_from_slice(b"\x1b[0m");
+    if let Some(separator) = parts.separator {
+        out.extend_from_slice(&line[separator]);
+    }
+    out.extend_from_slice(b"\x1b[1;34m");
+    out.extend_from_slice(&line[parts.dir]);
+    out.extend_from_slice(b"\x1b[0m");
+    if let Some(suffix) = parts.suffix {
+        out.extend_from_slice(&line[suffix]);
+    }
+    out.extend_from_slice(b"\x1b[1;37m");
+    out.extend_from_slice(&line[parts.sigil]);
+    out.extend_from_slice(b"\x1b[0m");
+    out.extend_from_slice(&line[tail..]);
+}
+
+fn prompt_parts(line: &[u8]) -> Option<PromptParts> {
+    if line.first().is_none_or(|b| b.is_ascii_whitespace()) {
+        return None;
+    }
+    let end = line
+        .iter()
+        .position(|&b| b == b'\r' || b == b'\n')
+        .unwrap_or(line.len());
+    let text = std::str::from_utf8(&line[..end]).ok()?;
+
+    parse_colon_prompt(text, line).or_else(|| parse_bracket_prompt(text, line))
+}
+
+fn parse_colon_prompt(text: &str, line: &[u8]) -> Option<PromptParts> {
+    static COLON_USER_RE: LazyLock<fancy_regex::Regex> = LazyLock::new(|| {
+        fancy_regex::Regex::new(r"^[^/#\-\s]\S*\s?[^\s.:\[\]]+?(?=:\S[^\r\n$#]*[$#]\s)").unwrap()
+    });
+    static COLON_DIR_RE: LazyLock<fancy_regex::Regex> =
+        LazyLock::new(|| fancy_regex::Regex::new(r"(?<=:)\S[^\r\n$#]*?(?=[$#]\s)").unwrap());
+    static COLON_SIGIL_RE: LazyLock<fancy_regex::Regex> =
+        LazyLock::new(|| fancy_regex::Regex::new(r"(?<=\S)[$#]\s").unwrap());
+    let user = match_range(&COLON_USER_RE, text)?;
+    let dir = match_range(&COLON_DIR_RE, text)?;
+    let sigil = match_range(&COLON_SIGIL_RE, text)?;
+    let separator = user.end..dir.start;
+    if &line[separator.clone()] != b":" {
+        return None;
+    }
+    if !valid_prompt_user(&line[user.clone()]) || !valid_prompt_dir(&line[dir.clone()]) {
+        return None;
+    }
+    Some(PromptParts {
+        prefix: None,
+        user,
+        separator: Some(separator),
+        dir,
+        suffix: None,
+        sigil,
+    })
+}
+
+fn parse_bracket_prompt(text: &str, line: &[u8]) -> Option<PromptParts> {
+    static BRACKET_USER_RE: LazyLock<fancy_regex::Regex> = LazyLock::new(|| {
+        fancy_regex::Regex::new(r"(?<=^\[)[^/#\-\s]\S*\s?[^\s.\[\]]+?(?=\s+\S[^\[\]\r\n]*\][$#]\s)")
+            .unwrap()
+    });
+    static BRACKET_DIR_RE: LazyLock<fancy_regex::Regex> =
+        LazyLock::new(|| fancy_regex::Regex::new(r"(?<=\s)\S[^\]\r\n]*?(?=\][$#]\s)").unwrap());
+    static BRACKET_SIGIL_RE: LazyLock<fancy_regex::Regex> =
+        LazyLock::new(|| fancy_regex::Regex::new(r"(?<=\])[$#]\s").unwrap());
+    let user = match_range(&BRACKET_USER_RE, text)?;
+    let dir = match_range(&BRACKET_DIR_RE, text)?;
+    let sigil = match_range(&BRACKET_SIGIL_RE, text)?;
+    if text.as_bytes().first() != Some(&b'[') || dir.end >= sigil.start {
+        return None;
+    }
+    let prefix = 0..1;
+    let separator = user.end..dir.start;
+    let suffix = dir.end..sigil.start;
+    if !line[separator.clone()]
+        .iter()
+        .all(|b| b.is_ascii_whitespace())
+        || &line[suffix.clone()] != b"]"
+    {
+        return None;
+    }
+    if !valid_prompt_user(&line[user.clone()]) || !valid_prompt_dir(&line[dir.clone()]) {
+        return None;
+    }
+    Some(PromptParts {
+        prefix: Some(prefix),
+        user,
+        separator: Some(separator),
+        dir,
+        suffix: Some(suffix),
+        sigil,
+    })
+}
+
+fn match_range(re: &fancy_regex::Regex, text: &str) -> Option<Range<usize>> {
+    re.find(text).ok().flatten().map(|m| m.start()..m.end())
+}
+
+fn valid_prompt_user(user: &[u8]) -> bool {
+    !user.is_empty()
+        && !matches!(user[0], b'/' | b'#' | b'-' | b' ' | b'\t')
+        && user
+            .iter()
+            .all(|b| !b.is_ascii_control() && !matches!(*b, b':' | b'[' | b']' | b'/' | b'#'))
+        && user.iter().any(|b| b.is_ascii_alphanumeric())
+}
+
+fn valid_prompt_dir(dir: &[u8]) -> bool {
+    !dir.is_empty()
+        && !dir[0].is_ascii_whitespace()
+        && dir
+            .iter()
+            .all(|b| !b.is_ascii_control() && !matches!(*b, b'[' | b']'))
+}
 
 #[tokio::main]
 async fn main() {
@@ -607,41 +843,22 @@ async fn serial_ws_relay(mcp_port: u16) {
         });
     }
 
-    // WebSocket → stdout (with ANSI filter)
+    // WebSocket → stdout.
+    // TerminalSanitizer strips SGR color codes from kernel boot logs.
+    // A small readline CSI subset (cursor movement A/B/C/D, erase-to-EOL K,
+    // and delete-character P) passes through so the shell can move the cursor
+    // and redraw the command line without allowing screen-wide controls from
+    // serial logs.
+    // Prompt highlighting then re-adds safe SGR colors for readability.
+    let mut sanitizer = TerminalSanitizer::new(is_tty);
     let mut out = Vec::with_capacity(4096);
+    let mut rendered = Vec::with_capacity(4096);
     let mut first_write = true;
     while running.load(std::sync::atomic::Ordering::Relaxed) {
         match ws_stream.next().await {
             Some(Ok(Message::Binary(data))) => {
                 out.clear();
-                let raw = &data;
-                let mut i = 0;
-                while i < raw.len() {
-                    if raw[i] == 0x1b && i + 1 < raw.len() {
-                        let next = raw[i + 1];
-                        if next == b'['
-                            || next == b']'
-                            || next == b'('
-                            || next == b')'
-                            || next == b'>'
-                            || next == b'='
-                        {
-                            i += 2;
-                            while i < raw.len()
-                                && !(raw[i] >= b'@' && raw[i] <= b'~')
-                                && raw[i] != b'\x07'
-                            {
-                                i += 1;
-                            }
-                            if i < raw.len() {
-                                i += 1;
-                            }
-                            continue;
-                        }
-                    }
-                    out.push(raw[i]);
-                    i += 1;
-                }
+                sanitizer.filter(&data, &mut out);
                 if !out.is_empty() {
                     // Ensure the first byte written to stdout starts at column 0.
                     // The server may have stale serial data that reaches us mid-line.
@@ -651,7 +868,13 @@ async fn serial_ws_relay(mcp_port: u16) {
                             let _ = std::io::stdout().write_all(b"\r\n");
                         }
                     }
-                    let _ = std::io::stdout().write_all(&out);
+                    rendered.clear();
+                    if is_tty {
+                        highlight_serial_prompt(&out, &mut rendered);
+                    } else {
+                        rendered.extend_from_slice(&out);
+                    }
+                    let _ = std::io::stdout().write_all(&rendered);
                     let _ = std::io::stdout().flush();
                 }
             }
@@ -892,51 +1115,33 @@ fn serial_tcp_relay(host: &str, port: &str) {
         });
     }
 
-    // Thread 2: TCP → stdout (with ANSI escape filtering)
+    // Thread 2: TCP → stdout.
+    // TerminalSanitizer strips SGR color codes; a small readline CSI subset
+    // passes through for prompt redraw and in-line deletion support.
+    // Prompt highlighting re-adds safe SGR colors for readability.
     if is_tty {
         eprintln!("Connected to {host}:{port} (Ctrl-T q to exit)\n");
     } else {
         eprintln!("Connected to {host}:{port} (non-interactive, 30s timeout)\n");
     }
     let mut buf = [0u8; 4096];
+    let mut sanitizer = TerminalSanitizer::new(is_tty);
     let mut out = Vec::with_capacity(4096);
+    let mut rendered = Vec::with_capacity(4096);
     while running.load(std::sync::atomic::Ordering::Relaxed) {
         match tcp_r.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
                 out.clear();
-                let raw = &buf[..n];
-                let mut i = 0;
-                while i < raw.len() {
-                    // Skip ANSI escape sequences: ESC[ ... m/; / etc, ESC]0;...BEL
-                    if raw[i] == 0x1b && i + 1 < raw.len() {
-                        let next = raw[i + 1];
-                        if next == b'['
-                            || next == b']'
-                            || next == b'('
-                            || next == b')'
-                            || next == b'>'
-                            || next == b'='
-                        {
-                            // Skip ESC + bracket + parameters + terminator
-                            i += 2;
-                            while i < raw.len()
-                                && !(raw[i] >= b'@' && raw[i] <= b'~')
-                                && raw[i] != b'\x07'
-                            {
-                                i += 1;
-                            }
-                            if i < raw.len() {
-                                i += 1; // skip terminator
-                            }
-                            continue;
-                        }
-                    }
-                    out.push(raw[i]);
-                    i += 1;
-                }
+                sanitizer.filter(&buf[..n], &mut out);
                 if !out.is_empty() {
-                    let _ = std::io::stdout().write_all(&out);
+                    rendered.clear();
+                    if is_tty {
+                        highlight_serial_prompt(&out, &mut rendered);
+                    } else {
+                        rendered.extend_from_slice(&out);
+                    }
+                    let _ = std::io::stdout().write_all(&rendered);
                     let _ = std::io::stdout().flush();
                 }
             }
@@ -1086,7 +1291,6 @@ async fn cmd_flash(
             }
         }
     }
-
     // Re-check device status
     let devs_out = std::process::Command::new("ssh")
         .args([ssh_dest.as_str(), ld_cmd.as_str()])
@@ -1124,6 +1328,8 @@ async fn cmd_flash(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// Result of feeding a byte into the Ctrl-T escape detector.
     #[derive(Debug, PartialEq, Eq)]
     enum EscapeAction {
@@ -1205,5 +1411,117 @@ mod tests {
         assert!(!esc.esc);
         // Next byte after quit is a normal key
         assert_eq!(esc.feed(b'a'), EscapeAction::Send(vec![b'a']));
+    }
+
+    #[test]
+    fn sanitizer_preserves_split_sgr_without_leaking_final_byte() {
+        let mut sanitizer = TerminalSanitizer::new(true);
+        let mut out = Vec::new();
+
+        sanitizer.filter(b"2: eth0: <BROADCAST> mtu 1500 state \x1b[32", &mut out);
+        sanitizer.filter(b"mUP\x1b[0", &mut out);
+        sanitizer.filter(b"m group default\n    inet \x1b[32", &mut out);
+        sanitizer.filter(b"m127.0.0.1\x1b[0", &mut out);
+        sanitizer.filter(b"m/8 scope host lo\n", &mut out);
+
+        let rendered = String::from_utf8(out).unwrap();
+        assert_eq!(
+            rendered,
+            "2: eth0: <BROADCAST> mtu 1500 state \x1b[32mUP\x1b[0m group default\n    inet \x1b[32m127.0.0.1\x1b[0m/8 scope host lo\n"
+        );
+        assert!(!rendered.contains("state mUP"));
+        assert!(!rendered.contains("inet m127"));
+    }
+
+    #[test]
+    fn sanitizer_strips_non_color_control_sequences() {
+        let mut sanitizer = TerminalSanitizer::new(true);
+        let mut out = Vec::new();
+
+        sanitizer.filter(b"a\x1b[2Jb\x1b]0;title\x07c", &mut out);
+
+        assert_eq!(String::from_utf8(out).unwrap(), "abc");
+    }
+
+    #[test]
+    fn sanitizer_preserves_readline_redraw_sequences() {
+        let mut sanitizer = TerminalSanitizer::new(true);
+        let mut out = Vec::new();
+
+        sanitizer.filter(b"abc\x1b[D\x1b[Kd\x1b[P", &mut out);
+
+        assert_eq!(String::from_utf8(out).unwrap(), "abc\x1b[D\x1b[Kd\x1b[P");
+    }
+
+    #[test]
+    fn prompt_highlight_colors_user_dir_and_sigil() {
+        let mut out = Vec::new();
+
+        highlight_serial_prompt(b"root@myd-lt527:/# ip -c a\r\n", &mut out);
+        let rendered = String::from_utf8(out).unwrap();
+
+        assert!(rendered.contains("\x1b[1;32mroot@myd-lt527\x1b[0m:"));
+        assert!(rendered.contains("\x1b[1;34m/\x1b[0m"));
+        assert!(rendered.contains("\x1b[1;37m# \x1b[0mip -c a"));
+    }
+
+    #[test]
+    fn prompt_highlight_handles_root_without_host() {
+        let mut out = Vec::new();
+
+        highlight_serial_prompt(b"root:/# ls\r\n", &mut out);
+        let rendered = String::from_utf8(out).unwrap();
+
+        assert!(rendered.contains("\x1b[1;32mroot\x1b[0m:"));
+        assert!(rendered.contains("\x1b[1;34m/\x1b[0m"));
+        assert!(rendered.contains("\x1b[1;37m# \x1b[0mls"));
+    }
+
+    #[test]
+    fn prompt_highlight_handles_bracket_prompt() {
+        let mut out = Vec::new();
+
+        highlight_serial_prompt(b"[root@myd-lt527 ~]# pwd\r\n", &mut out);
+        let rendered = String::from_utf8(out).unwrap();
+
+        assert!(rendered.contains("[\x1b[1;32mroot@myd-lt527\x1b[0m "));
+        assert!(rendered.contains("\x1b[1;34m~\x1b[0m]"));
+        assert!(rendered.contains("\x1b[1;37m# \x1b[0mpwd"));
+    }
+
+    #[test]
+    fn prompt_highlight_handles_user_shell_prompt() {
+        let mut out = Vec::new();
+
+        highlight_serial_prompt(b"ubuntu@board:~/work tree$ git status\r\n", &mut out);
+        let rendered = String::from_utf8(out).unwrap();
+
+        assert!(rendered.contains("\x1b[1;32mubuntu@board\x1b[0m:"));
+        assert!(rendered.contains("\x1b[1;34m~/work tree\x1b[0m"));
+        assert!(rendered.contains("\x1b[1;37m$ \x1b[0mgit status"));
+    }
+
+    #[test]
+    fn prompt_highlight_handles_bracket_user_without_host() {
+        let mut out = Vec::new();
+
+        highlight_serial_prompt(b"[root /var/log]# tail messages\r\n", &mut out);
+        let rendered = String::from_utf8(out).unwrap();
+
+        assert!(rendered.contains("[\x1b[1;32mroot\x1b[0m "));
+        assert!(rendered.contains("\x1b[1;34m/var/log\x1b[0m]"));
+        assert!(rendered.contains("\x1b[1;37m# \x1b[0mtail messages"));
+    }
+
+    #[test]
+    fn prompt_highlight_does_not_color_non_prompt_lines() {
+        let mut out = Vec::new();
+
+        highlight_serial_prompt(b"cat: /tmp# not a prompt\r\n", &mut out);
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "cat: /tmp# not a prompt\r\n"
+        );
     }
 }

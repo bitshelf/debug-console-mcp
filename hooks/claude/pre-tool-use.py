@@ -85,6 +85,7 @@ def _build_serial_patterns() -> list:
         r">\s*/dev/tty",                 # direct write to serial
         r"echo.*>\s*/dev/tty",
         r"socat\s+.*tty",                # socat to serial
+        r"dutabo\s+serial",              # dutabo interactive serial (human-only, Agent uses MCP)
         # Relay raw byte patterns: match literal \x prefix in shell strings.
         # In the command string, '\xa0' appears as backslash-x-a-0 (4 chars).
         # The regex \\x matches a literal backslash followed by 'x'.

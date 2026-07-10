@@ -317,16 +317,13 @@ impl SerialEngine {
             tracing::debug!("DUT log dir ready: {}", alias_dir.display());
         }
 
-        // 6. 连接串口 + stty -echo + 探测初始状态
+        // 6. 连接串口 + 探测初始状态
         match self.console.connect().await {
             Ok(()) => {
                 tracing::info!("Serial connected to {}:{}", self.host, self.serial_target);
-                // Disable echo before any command — avoids marker-in-echo garbling.
-                // drain_writes flushes the send buffer; the subsequent
-                // probe_initial_state read_available call naturally waits for
-                // the response — no explicit sleep needed.
-                self.console.sendline("stty -echo");
-                self.console.drain_writes().await;
+                // Terminal stays in getty defaults (echo on, icanon, …) — same
+                // behaviour as PuTTY serial.  The command queue's echo-skipping
+                // logic handles echoed markers correctly.
                 self.probe_initial_state().await;
                 // Warmup: prime the serial pipeline so the first real command
                 // doesn't return empty (BusyBox/ser2net buffering issue).
@@ -471,9 +468,6 @@ impl SerialEngine {
         }
         if let Some(h) = self.watchdog_handle.take() {
             h.abort();
-        }
-        if self.console.is_open() {
-            self.console.sendline("stty echo");
         }
         self.console.close();
         self.relay.close();
@@ -721,7 +715,6 @@ impl SerialEngine {
         // reconnect_after has elapsed, try the actual reconnect now.
         if self.reconnect_after.take().is_some() {
             if let Ok(()) = self.console.connect().await {
-                self.console.sendline("stty -echo");
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 self.probe_initial_state().await;
                 self.reconnect.reset();
@@ -760,7 +753,6 @@ impl SerialEngine {
                 }
                 // Window elapsed — try reconnect now.
                 if let Ok(()) = self.console.connect().await {
-                    self.console.sendline("stty -echo");
                     tokio::time::sleep(Duration::from_millis(500)).await;
                     self.probe_initial_state().await;
                     self.reconnect.reset();
@@ -914,7 +906,6 @@ impl SerialEngine {
             // re-enumeration glitches (< 500ms) during board reboots.
             match self.console.connect_with_timeout(2).await {
                 Ok(()) => {
-                    self.console.sendline("stty -echo");
                     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                     self.probe_initial_state().await;
                     self.reconnect.reset();

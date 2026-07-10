@@ -10,7 +10,6 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::serial_engine::SharedEngine;
-use crate::state_manager::TargetState;
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
@@ -82,14 +81,14 @@ fn tool_definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "serial_enter_uboot",
-            description: "Force target into U-Boot interactive prompt via relay reset + interrupt-character flood. Uses UBOOT_INTERRUPT_CHAR from .target.toml (ctrl_c for Rockchip, 2 for Allwinner, etc.). Works even with bootdelay=0. If no relay is configured, skips reset and just floods (board must be manually reset).",
+            description: "Force target into U-Boot interactive prompt via relay reset + continuous interrupt-character flood. Uses UBOOT_INTERRUPT_CHAR, so boards that need a byte other than Ctrl-C are supported. Retries up to failure_retry times on timeout.",
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "failure_retry": {"type": "integer", "default": 3, "description": "Number of retry attempts on timeout"},
                     "failure_retry_interval": {"type": "number", "default": 1.0, "description": "Seconds between retries"},
-                    "flood_duration_secs": {"type": "number", "default": 15.0, "description": "Total flood duration in seconds (must cover SPL→U-Boot window, typically 3-8s)"},
-                    "flood_interval_ms": {"type": "integer", "default": 100, "description": "Interval between interrupt bytes (100ms avoids UART FIFO overflow)"},
+                    "flood_duration_secs": {"type": "number", "default": 15.0, "description": "Total interrupt-character flood duration (must cover SPL→U-Boot window, typically 3-8s)"},
+                    "flood_interval_ms": {"type": "integer", "default": 100, "description": "Interval between interrupt bytes (100ms = 10 bytes/s, avoids UART FIFO overflow)"},
                 },
             }),
         },
@@ -567,10 +566,7 @@ impl McpServer {
                 let start = std::time::Instant::now();
                 let result = self.handle_call_tool(params).await;
                 let elapsed_ms = start.elapsed().as_millis();
-                let success = result
-                    .get("success")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
+                let success = result.get("success").and_then(|v| v.as_bool()).unwrap_or(true);
                 tracing::info!(
                     tool = %tool_name,
                     elapsed_ms = %elapsed_ms,
@@ -651,8 +647,8 @@ impl McpServer {
         let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let args = params.get("arguments").cloned().unwrap_or(Value::Null);
 
-        // serial_enter_uboot: relay reset + continuous Ctrl-C flood, then
-        // await U-Boot prompt. Retries up to `failure_retry` times.
+        // serial_enter_uboot: relay reset + continuous interrupt-character
+        // flood, then await U-Boot prompt. Retries up to `failure_retry` times.
         //
         // CRITICAL: The flood must release the engine lock between bursts so
         // the read loop can process U-Boot banners and trigger the watcher.
@@ -660,9 +656,9 @@ impl McpServer {
         // the read loop — the watcher never fired even when U-Boot appeared.
         //
         // For bootdelay=0: SPL/BL31/OP-TEE don't read the serial port, so
-        // Ctrl-C chars accumulate in the UART FIFO. When U-Boot's abortboot()
-        // calls tstc(), even ONE pending Ctrl-C interrupts. We send 1 byte
-        // per 100ms for up to 15s, releasing the lock between each burst.
+        // interrupt chars accumulate in the UART FIFO. When U-Boot's
+        // abortboot() calls tstc(), even ONE pending byte interrupts. We send
+        // 1 byte per 100ms for up to 15s, releasing the lock between bursts.
         if name == "serial_enter_uboot" {
             let failure_retry = args
                 .get("failure_retry")
@@ -683,18 +679,19 @@ impl McpServer {
 
             let mut last_error = String::new();
             for attempt in 1..=failure_retry {
-                // Phase 1: relay reset + initial burst (holds lock ~1s).
-                // If no relay is configured, skip the reset and just flood —
-                // the user must manually reset the board.
+                // Phase 1: relay reset + initial burst when relay is available.
+                // If no reset relay is configured, keep the watcher armed and
+                // still run the flood. This preserves software/manual reboot
+                // workflows for boards that only need UBOOT_INTERRUPT_CHAR.
                 let mut rx = {
                     let mut engine = self.engine.lock().await;
                     let rx = engine.queue_enter_uboot();
                     match engine.do_relay_reset_and_flood().await {
-                        Ok(()) => {} // relay reset succeeded
-                        Err(e) if e.contains("No reset") => {
-                            // No relay — skip reset, just flood.  The board
-                            // must already be rebooting (manual reset).
-                            tracing::info!("No relay configured — flooding without reset");
+                        Ok(()) => {}
+                        Err(e) if e.contains("No reset control configured") => {
+                            tracing::warn!(
+                                "serial_enter_uboot: no relay reset configured; continuing with interrupt flood only"
+                            );
                         }
                         Err(e) => {
                             return serde_json::json!({
@@ -705,9 +702,8 @@ impl McpServer {
                     rx
                 };
 
-                // Phase 2: continuous low-rate flood of the configured
-                // interrupt character (Ctrl-C for Rockchip, '2' for Allwinner).
-                // The lock is released between each byte so the read loop can
+                // Phase 2: continuous low-rate interrupt-character flood,
+                // RELEASING the lock between each byte so the read loop can
                 // process U-Boot banners and trigger the watcher.
                 let flood_rounds = (flood_duration_secs * 1000.0 / flood_interval_ms as f64) as u64;
                 let mut matched: Option<Result<crate::boot_detector::WatcherMatch, ()>> = None;
@@ -720,7 +716,7 @@ impl McpServer {
                         }
                         Err(_) => {} // Empty or closed — keep flooding
                     }
-                    // Send one Ctrl-C, then release lock for the interval.
+                    // Send one configured interrupt byte, then release lock for the interval.
                     {
                         let mut engine = self.engine.lock().await;
                         engine.flood_one().await;
@@ -936,7 +932,9 @@ impl McpServer {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
             {
                 let mut engine = self.engine.lock().await;
-                engine.detector.add_watcher(&pattern, tx.clone());
+                engine
+                    .detector
+                    .add_watcher(&pattern, tx.clone());
             }
 
             // Phase 2: await outside the lock — read loop can still process
@@ -967,29 +965,20 @@ impl McpServer {
             });
         }
 
+        if name == "serial_reset" {
+            let result = self.handle_serial_reset(&args).await;
+            return Self::tool_text_response(result);
+        }
+
+        if name == "serial_power_cycle" {
+            let result = self.handle_serial_power_cycle(&args).await;
+            return Self::tool_text_response(result);
+        }
+
         // serial_send_command 需要在 lock 外 await，避免与 read_once 死锁
         if name == "serial_send_command" {
             let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
             let timeout = args.get("timeout").and_then(|v| v.as_f64()).unwrap_or(90.0);
-
-            // State guard: if the board is known to be unresponsive, fail fast
-            // instead of holding the server lock for the full timeout.  This
-            // prevents a single dead-board command from blocking all other MCP
-            // requests (health checks, state queries, other tools).
-            {
-                let eng = self.engine.lock().await;
-                let cur = eng.state.current();
-                if cur == TargetState::DutOff {
-                    return serde_json::json!({
-                        "content": [{"type": "text", "text": serde_json::to_string(&serde_json::json!({
-                            "output": "(rejected — target is DUT-off)",
-                            "exit_code": null,
-                            "timed_out": false,
-                            "hint": "Target is not responding. Use serial_reset to reboot, or check board power."
-                        })).unwrap_or_default()}]
-                    });
-                }
-            }
             let span = tracing::info_span!(
                 "serial_send_command",
                 cmd = %command,
@@ -1000,6 +989,22 @@ impl McpServer {
             );
             let _guard = span.enter();
             let cmd_trimmed = command.trim();
+            {
+                let engine = self.engine.lock().await;
+                if engine.state.current() == crate::state_manager::TargetState::DutOff {
+                    let result = serde_json::json!({
+                        "output": "",
+                        "exit_code": null,
+                        "timed_out": false,
+                        "error": "DUT is off or unresponsive; refusing to wait for command timeout",
+                        "hint": "Power on or reset the DUT, then check serial_get_state.",
+                    });
+                    span.record("result.output", "");
+                    span.record("result.exit_code", tracing::field::Empty);
+                    span.record("result.timed_out", false);
+                    return Self::tool_text_response(result);
+                }
+            }
             if cmd_trimmed == "reboot" || cmd_trimmed == "poweroff" || cmd_trimmed == "shutdown" {
                 let mut engine = self.engine.lock().await;
                 engine.console.sendline(command);
@@ -1015,9 +1020,10 @@ impl McpServer {
                 let mut engine = self.engine.lock().await;
                 engine.queue_command(command, timeout)
             };
-            let result = match tokio::time::timeout(std::time::Duration::from_secs_f64(timeout), rx)
-                .await
-            {
+            let result = match tokio::time::timeout(
+                std::time::Duration::from_secs_f64(timeout),
+                rx
+            ).await {
                 Ok(Ok(r)) => {
                     let mut res = serde_json::json!({"output": r.output, "exit_code": r.exit_code, "timed_out": r.timed_out, "truncated": r.truncated});
                     span.record("result.output", &r.output);
@@ -1029,56 +1035,30 @@ impl McpServer {
                         );
                     }
                     if r.timed_out {
-                        let mut eng = self.engine.lock().await;
-                        let host = eng.config.dev_host_ip();
-                        let port = eng.config.serial_target();
-                        // Probe: send a blank line to check if the board is still alive.
-                        // If we get any data back within 2s, the board is just slow.
-                        // If not, it's dead — transition to DUT-off so statusline
-                        // reflects reality instead of lying with "active".
-                        eng.console.sendline("");
-                        eng.console.drain_writes().await;
-                        drop(eng); // release engine lock during probe read
-                        let alive = {
-                            let mut eng2 = self.engine.lock().await;
-                            match eng2.console.read_available(Duration::from_secs(2), 256).await {
-                                Ok(data) if !data.is_empty() => true,
-                                _ => {
-                                    eng2.state.transition(TargetState::DutOff);
-                                    false
-                                }
-                            }
-                        };
-                        res["hint"] = serde_json::json!(format!(
-                            "Command timed out after {timeout:.0}s on {host}:{port}. {}",
-                            if alive {
-                                "Target is slow but still responding — try a longer timeout."
-                            } else {
-                                "Target is unresponsive (DUT-off). Check board power and serial connection."
-                            }
-                        ));
+                        let probe = self.probe_after_command_timeout().await;
+                        res["hint"] = serde_json::json!(
+                            probe["hint"].as_str().unwrap_or("Command timed out. Check serial_get_state.")
+                        );
+                        if probe["state_after"].as_str() == Some("DUT-off") {
+                            res["state_after"] = serde_json::json!("DUT-off");
+                        }
                     }
                     res
                 }
                 Ok(Err(_)) => serde_json::json!({"error": "Command cancelled"}),
                 Err(_elapsed) => {
-                    let mut eng = self.engine.lock().await;
-                    let host = eng.config.dev_host_ip();
-                    let port = eng.config.serial_target();
-                    // Engine didn't respond — the read loop may be stuck or the
-                    // board is completely dead. Transition to DUT-off so the
-                    // statusline reflects reality.
-                    if eng.state.current() == TargetState::Active {
-                        eng.state.transition(TargetState::DutOff);
-                    }
+                    let probe = self.probe_after_command_timeout().await;
                     let mut res = serde_json::json!({
                         "output": "(timeout — engine did not respond)",
                         "exit_code": null,
                         "timed_out": true
                     });
-                    res["hint"] = serde_json::json!(format!(
-                        "Engine timeout after {timeout:.0}s on {host}:{port} — target is unresponsive (DUT-off). Check board power and serial connection."
-                    ));
+                    res["hint"] = serde_json::json!(
+                        probe["hint"].as_str().unwrap_or("Engine timeout. Try serial_get_state or restart MCP.")
+                    );
+                    if probe["state_after"].as_str() == Some("DUT-off") {
+                        res["state_after"] = serde_json::json!("DUT-off");
+                    }
                     res
                 }
             };
@@ -1092,9 +1072,194 @@ impl McpServer {
             self.call_tool_impl(&mut engine, name, &args).await
         };
 
+        Self::tool_text_response(result)
+    }
+
+    fn tool_text_response(result: Value) -> Value {
         serde_json::json!({
             "content": [{"type": "text", "text": serde_json::to_string(&result).unwrap_or_default()}]
         })
+    }
+
+    async fn wait_for_login_without_engine_lock(&self, timeout: f64) -> Value {
+        let pattern = "login:";
+        let (mut rx, console_tx) = {
+            let mut engine = self.engine.lock().await;
+            let rx = engine.queue_wait_pattern(pattern);
+            let console_tx = engine.console.write_sender();
+            (rx, console_tx)
+        };
+
+        let result =
+            crate::serial_engine::wait_pattern_with_probe(&mut rx, timeout, true, &console_tx)
+                .await;
+
+        {
+            let mut engine = self.engine.lock().await;
+            engine.detector.remove_watcher_by_pattern(pattern);
+        }
+
+        result
+    }
+
+    async fn probe_after_command_timeout(&self) -> Value {
+        let (console_tx, host, port) = {
+            let engine = self.engine.lock().await;
+            (
+                engine.console.write_sender(),
+                engine.config.dev_host_ip(),
+                engine.config.serial_target(),
+            )
+        };
+
+        // Use send with a short timeout — try_send silently drops if the
+        // channel is full, which would cause a false DUT-off transition.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            console_tx.send(b"\n".to_vec()),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let mut engine = self.engine.lock().await;
+        match engine
+            .console
+            .read_available(std::time::Duration::from_millis(800), 4096)
+            .await
+        {
+            Ok(data) if !data.is_empty() => {
+                engine.logs.write(&data);
+                let events = engine.detector.feed(&data);
+                engine.state.on_activity();
+                if events.iter().any(|e| {
+                    matches!(
+                        e,
+                        crate::boot_detector::BootEvent::Stage(s)
+                            if matches!(
+                                s.as_str(),
+                                "shell" | "android_shell" | "android_adbd"
+                                    | "android_bootanim" | "android_surfaceflinger"
+                                    | "android_boot_completed"
+                            )
+                    )
+                }) {
+                    engine
+                        .state
+                        .transition(crate::state_manager::TargetState::Active);
+                }
+                serde_json::json!({
+                    "state_after": engine.state.current().as_str(),
+                    "hint": format!("Command timed out on {host}:{port}, but the DUT responded to a probe. Check serial_get_state and retry when it is ready."),
+                })
+            }
+            Ok(_) => {
+                engine
+                    .state
+                    .transition(crate::state_manager::TargetState::DutOff);
+                serde_json::json!({
+                    "state_after": "DUT-off",
+                    "hint": format!("Command timed out after no probe response on {host}:{port}; state changed to DUT-off. Power on or reset the DUT."),
+                })
+            }
+            Err(e) => {
+                engine
+                    .state
+                    .transition(crate::state_manager::TargetState::Disconnected);
+                serde_json::json!({
+                    "state_after": "disconnected",
+                    "hint": format!("Command timed out and probe read failed on {host}:{port}: {e}. Check ser2net or cabling."),
+                })
+            }
+        }
+    }
+
+    async fn handle_serial_reset(&self, args: &Value) -> Value {
+        let wait_boot = args
+            .get("wait_boot")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let failure_retry = args
+            .get("failure_retry")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(3) as usize;
+        let failure_retry_interval = args
+            .get("failure_retry_interval")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0);
+
+        let attempts_limit = failure_retry.max(1);
+        let mut attempts = 0usize;
+        loop {
+            attempts += 1;
+
+            let reset_result = {
+                let mut engine = self.engine.lock().await;
+                engine.reset_target(false, 1, failure_retry_interval).await
+            };
+
+            if !reset_result["success"].as_bool().unwrap_or(false) || !wait_boot {
+                return reset_result;
+            }
+
+            let wait_result = self.wait_for_login_without_engine_lock(120.0).await;
+            if wait_result["matched"].as_bool().unwrap_or(false) {
+                let engine = self.engine.lock().await;
+                return serde_json::json!({
+                    "success": true,
+                    "new_boot_number": engine.logs.boot_number(),
+                    "log_path": engine.logs.current_path().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
+                    "boot_complete": true,
+                    "attempts": attempts,
+                });
+            }
+
+            if attempts >= attempts_limit {
+                let engine = self.engine.lock().await;
+                return serde_json::json!({
+                    "success": true,
+                    "new_boot_number": engine.logs.boot_number(),
+                    "log_path": engine.logs.current_path().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
+                    "boot_complete": false,
+                    "attempts": attempts,
+                    "error": "login prompt not detected within timeout",
+                });
+            }
+
+            tokio::time::sleep(Duration::from_secs_f64(failure_retry_interval)).await;
+        }
+    }
+
+    async fn handle_serial_power_cycle(&self, args: &Value) -> Value {
+        let wait_boot = args
+            .get("wait_boot")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        let power_result = {
+            let mut engine = self.engine.lock().await;
+            engine.power_cycle_target(false).await
+        };
+
+        if !power_result["success"].as_bool().unwrap_or(false) || !wait_boot {
+            return power_result;
+        }
+
+        let wait_result = self.wait_for_login_without_engine_lock(120.0).await;
+        let engine = self.engine.lock().await;
+        if wait_result["matched"].as_bool().unwrap_or(false) {
+            serde_json::json!({
+                "success": true,
+                "new_boot_number": engine.logs.boot_number(),
+                "log_path": engine.logs.current_path().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
+                "boot_complete": true,
+            })
+        } else {
+            serde_json::json!({
+                "success": false,
+                "error": "Boot did not complete within timeout",
+                "new_boot_number": engine.logs.boot_number(),
+            })
+        }
     }
 
     /// Tool 实现分发
@@ -1104,8 +1269,9 @@ impl McpServer {
         name: &str,
         args: &Value,
     ) -> Value {
-        // Note: serial_send_command and serial_enter_uboot are intercepted in
-        // handle_call_tool to release the engine lock during network I/O.
+        // Keep this dispatcher for short operations only. Tools that wait for
+        // serial output must be intercepted in handle_call_tool so the read loop
+        // can reacquire the engine lock and feed watchers.
         match name {
             "serial_get_state" => engine.get_state_dict(),
             "serial_get_logs" => {
@@ -1115,30 +1281,6 @@ impl McpServer {
                 engine.read_log(archive, lines, pattern)
             }
             "serial_list_logs" => engine.list_logs(),
-            "serial_reset" => {
-                let wait_boot = args
-                    .get("wait_boot")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
-                let failure_retry = args
-                    .get("failure_retry")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(3) as usize;
-                let failure_retry_interval = args
-                    .get("failure_retry_interval")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(1.0);
-                engine
-                    .reset_target(wait_boot, failure_retry, failure_retry_interval)
-                    .await
-            }
-            "serial_power_cycle" => {
-                let wait_boot = args
-                    .get("wait_boot")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
-                engine.power_cycle_target(wait_boot).await
-            }
             "serial_enter_maskrom" => engine.enter_maskrom().await,
             // serial_wait_pattern moved to handle_call_tool (lock release)
             "serial_uboot_command" => {
@@ -1164,7 +1306,7 @@ impl McpServer {
                         "p99": p99,
                     },
                 })
-            }
+            },
             "serial_claim" => engine.claim_serial().await,
             "serial_load_reference" => {
                 let path_str = args
@@ -1562,6 +1704,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use std::collections::HashMap;
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
     fn create_test_engine() -> SharedEngine {
@@ -1599,6 +1742,40 @@ mod tests {
             method: Some(method.to_string()),
             params,
         }
+    }
+
+    fn create_external_reset_engine(tmp: &TempDir) -> SharedEngine {
+        let script = tmp.path().join("dev-ctl-ok.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let mut values = HashMap::new();
+        values.insert("DEV_HOST_IP".into(), "127.0.0.1".into());
+        values.insert("SERIAL_PORT".into(), "59999".into());
+        values.insert("RELAY_PORT".into(), "0".into());
+        values.insert("RESET_CHANNEL".into(), "1".into());
+        values.insert("MASKROM_CHANNEL".into(), "0".into());
+        values.insert("HANG_TIMEOUT".into(), "60".into());
+        values.insert("HANG_HYSTERESIS".into(), "3".into());
+        values.insert("MAX_ARCHIVED_LOGS".into(), "10".into());
+        values.insert("MAX_LOG_FILE_SIZE".into(), "100".into());
+        values.insert("DUT_DIR".into(), ".dut-serial".into());
+        values.insert("LOCK_DIR".into(), "/tmp/debug-console-test-locks".into());
+        values.insert("LOGIN_USER".into(), "root".into());
+        values.insert("LOGIN_PASS".into(), "".into());
+        values.insert("DUT_ALIAS".into(), "test-dut".into());
+        values.insert("DEV_CTL".into(), script.to_string_lossy().to_string());
+
+        let config = Config {
+            values,
+            config_path: None,
+            project_dir: Some(tmp.path().to_path_buf()),
+            format: crate::config::ConfigFormat::None,
+        };
+
+        crate::serial_engine::new_shared_engine(config)
     }
 
     #[tokio::test]
@@ -1650,6 +1827,39 @@ mod tests {
         assert!(tool_names.contains(&"serial_send_command"));
         assert!(tool_names.contains(&"serial_get_state"));
         assert!(tool_names.contains(&"serial_get_logs"));
+    }
+
+    #[tokio::test]
+    async fn test_enter_uboot_description_uses_interrupt_character() {
+        let engine = create_test_engine();
+        let mut server = McpServer::new(engine);
+        server.initialized = true;
+
+        let req = make_request(1, "tools/list", None);
+        let resp = server.handle_message(req).await.unwrap();
+        let result = resp.result.unwrap();
+        let tools = result["tools"].as_array().unwrap();
+        let enter_uboot = tools
+            .iter()
+            .find(|t| t["name"] == "serial_enter_uboot")
+            .unwrap();
+        let description = enter_uboot["description"].as_str().unwrap();
+        assert!(description.contains("interrupt-character"));
+        assert!(description.contains("UBOOT_INTERRUPT_CHAR"));
+        assert!(
+            !description.contains("continuous Ctrl-C flood"),
+            "description must not hard-code Ctrl-C"
+        );
+
+        let schema = &enter_uboot["inputSchema"]["properties"];
+        assert!(schema["flood_duration_secs"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("interrupt-character"));
+        assert!(schema["flood_interval_ms"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("interrupt bytes"));
     }
 
     #[tokio::test]
@@ -1811,6 +2021,202 @@ mod tests {
         assert!(text.contains("DEV_HOST_IP"));
     }
 
+    #[tokio::test]
+    async fn test_serial_enter_uboot_no_relay_floods_instead_of_failing_immediately() {
+        let engine = create_test_engine();
+        let mut server = McpServer::new(engine);
+        server.initialized = true;
+
+        let params = serde_json::json!({
+            "name": "serial_enter_uboot",
+            "arguments": {
+                "failure_retry": 1,
+                "flood_duration_secs": 0.05,
+                "flood_interval_ms": 10
+            }
+        });
+        let req = make_request(1, "tools/call", Some(params));
+        let resp = server.handle_message(req).await.unwrap();
+        let result = resp.result.expect("tools/call should have result");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["success"], false);
+        assert!(
+            !body["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("No reset control configured"),
+            "missing relay should not abort before the interrupt flood"
+        );
+        assert_eq!(body["attempts"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_serial_send_command_rejects_when_dut_off() {
+        let engine = create_test_engine();
+        {
+            let mut guard = engine.lock().await;
+            guard
+                .state
+                .transition(crate::state_manager::TargetState::DutOff);
+        }
+        let mut server = McpServer::new(engine);
+        server.initialized = true;
+
+        let params = serde_json::json!({
+            "name": "serial_send_command",
+            "arguments": {
+                "command": "echo should-not-wait",
+                "timeout": 30
+            }
+        });
+        let req = make_request(1, "tools/call", Some(params));
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            server.handle_message(req),
+        )
+        .await
+        .expect("DUT-off command should be rejected immediately")
+        .unwrap();
+
+        let result = resp.result.expect("tools/call should have result");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["timed_out"], false);
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("DUT is off or unresponsive"));
+    }
+
+    #[tokio::test]
+    async fn test_serial_send_command_timeout_probe_marks_dut_off() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping TCP-backed timeout probe test: {e}");
+                return;
+            }
+            Err(e) => panic!("failed to bind local test listener: {e}"),
+        };
+        let port = listener.local_addr().unwrap().port();
+        let server_handle = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let mut values = HashMap::new();
+        values.insert("DEV_HOST_IP".into(), "127.0.0.1".into());
+        values.insert("SERIAL_PORT".into(), port.to_string());
+        values.insert("RELAY_PORT".into(), "0".into());
+        values.insert("RESET_CHANNEL".into(), "0".into());
+        values.insert("MASKROM_CHANNEL".into(), "0".into());
+        values.insert("HANG_TIMEOUT".into(), "60".into());
+        values.insert("HANG_HYSTERESIS".into(), "3".into());
+        values.insert("MAX_ARCHIVED_LOGS".into(), "10".into());
+        values.insert("MAX_LOG_FILE_SIZE".into(), "100".into());
+        values.insert("DUT_DIR".into(), ".dut-serial".into());
+        values.insert("LOCK_DIR".into(), "/tmp/debug-console-test-locks".into());
+        values.insert("LOGIN_USER".into(), "root".into());
+        values.insert("LOGIN_PASS".into(), "".into());
+        let config = Config {
+            values,
+            config_path: None,
+            project_dir: Some(tmp.path().to_path_buf()),
+            format: crate::config::ConfigFormat::None,
+        };
+        let engine = crate::serial_engine::new_shared_engine(config);
+        let engine_check = engine.clone();
+        {
+            let mut guard = engine.lock().await;
+            guard.console.connect().await.unwrap();
+            let write_tx = guard.console.write_sender();
+            guard.commands.set_write_fn(Box::new(move |data| {
+                write_tx.try_send(data.to_vec()).ok();
+            }));
+            guard.state.transition(crate::state_manager::TargetState::Active);
+        }
+        let mut server = McpServer::new(engine);
+        server.initialized = true;
+
+        let params = serde_json::json!({
+            "name": "serial_send_command",
+            "arguments": {
+                "command": "echo no-target",
+                "timeout": 0.05
+            }
+        });
+        let req = make_request(1, "tools/call", Some(params));
+        let resp = server.handle_message(req).await.unwrap();
+        let result = resp.result.expect("tools/call should have result");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["timed_out"], true);
+        assert_eq!(body["state_after"], "DUT-off");
+        assert!(body["hint"]
+            .as_str()
+            .unwrap()
+            .contains("state changed to DUT-off"));
+
+        let engine = engine_check.lock().await;
+        assert_eq!(
+            engine.state.current(),
+            crate::state_manager::TargetState::DutOff
+        );
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_serial_reset_wait_boot_releases_engine_lock() {
+        let tmp = TempDir::new().unwrap();
+        let engine = create_external_reset_engine(&tmp);
+        let engine_probe = engine.clone();
+        let mut server = McpServer::new(engine);
+        server.initialized = true;
+
+        let params = serde_json::json!({
+            "name": "serial_reset",
+            "arguments": {
+                "wait_boot": true,
+                "failure_retry": 1,
+                "failure_retry_interval": 0.01
+            }
+        });
+        let req = make_request(1, "tools/call", Some(params));
+
+        let task = tokio::spawn(async move { server.handle_message(req).await });
+
+        let mut lock_was_available = false;
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if let Ok(mut engine) = engine_probe.try_lock() {
+                lock_was_available = true;
+                let _ = engine.detector.feed(b"login:\n");
+            }
+            if task.is_finished() {
+                break;
+            }
+        }
+
+        assert!(
+            lock_was_available,
+            "serial_reset(wait_boot=true) held the engine lock while waiting for login"
+        );
+
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("serial_reset did not complete after login was fed")
+            .expect("serial_reset task panicked")
+            .expect("tools/call should return a response");
+        let result = resp.result.expect("tools/call should have result");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["success"], true);
+        assert_eq!(body["boot_complete"], true);
+        assert_eq!(body["attempts"], 1);
+    }
+
     #[test]
     fn test_prompts_include_v03_tools() {
         let prompts = McpServer::build_prompts();
@@ -1820,41 +2226,22 @@ mod tests {
             .iter()
             .map(|p| p["name"].as_str().unwrap())
             .collect();
-        assert!(
-            names.contains(&"boot-capture"),
-            "Should have boot-capture prompt"
-        );
-        assert!(
-            names.contains(&"crash-diagnose"),
-            "Should have crash-diagnose prompt"
-        );
-        assert!(
-            names.contains(&"uboot-recovery"),
-            "Should have uboot-recovery prompt"
-        );
+        assert!(names.contains(&"boot-capture"), "Should have boot-capture prompt");
+        assert!(names.contains(&"crash-diagnose"), "Should have crash-diagnose prompt");
+        assert!(names.contains(&"uboot-recovery"), "Should have uboot-recovery prompt");
     }
 
     #[test]
     fn test_prompt_content_not_empty() {
         let boot = McpServer::build_prompt_content("boot-capture");
-        assert!(
-            boot["messages"].as_array().map_or(false, |a| !a.is_empty()),
-            "boot-capture prompt should have messages"
-        );
+        assert!(boot["messages"].as_array().map_or(false, |a| !a.is_empty()),
+            "boot-capture prompt should have messages");
         let crash = McpServer::build_prompt_content("crash-diagnose");
-        assert!(
-            crash["messages"]
-                .as_array()
-                .map_or(false, |a| !a.is_empty()),
-            "crash-diagnose prompt should have messages"
-        );
+        assert!(crash["messages"].as_array().map_or(false, |a| !a.is_empty()),
+            "crash-diagnose prompt should have messages");
         let uboot = McpServer::build_prompt_content("uboot-recovery");
-        assert!(
-            uboot["messages"]
-                .as_array()
-                .map_or(false, |a| !a.is_empty()),
-            "uboot-recovery prompt should have messages"
-        );
+        assert!(uboot["messages"].as_array().map_or(false, |a| !a.is_empty()),
+            "uboot-recovery prompt should have messages");
     }
 
     #[tokio::test]

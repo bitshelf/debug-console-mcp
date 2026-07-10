@@ -530,8 +530,7 @@ mod serial_sim {
         let mut child = cmd.spawn().expect("Failed to start serial-sim");
 
         // Read the dynamically-assigned port from stdout
-        let mut port_str = String::new();
-        {
+        let port_str = {
             let stdout = child.stdout.as_mut().unwrap();
             let mut buf = [0u8; 16];
             let mut total = Vec::new();
@@ -551,8 +550,8 @@ mod serial_sim {
                     Err(_) => break,
                 }
             }
-            port_str = String::from_utf8_lossy(&total).trim().to_string();
-        }
+            String::from_utf8_lossy(&total).trim().to_string()
+        };
         let port: u16 = port_str.parse().expect(&format!(
             "serial-sim did not print a port, got: {port_str:?}"
         ));
@@ -733,6 +732,40 @@ mod serial_sim {
         assert!(
             text.contains("hello"),
             "echo hello should succeed after backspace correction, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_xshell_style_inline_backspace_redraw() {
+        let sim = start_sim(true);
+        let mut stream =
+            TcpStream::connect(format!("127.0.0.1:{}", sim.port)).unwrap();
+        read_until_timeout(&mut stream, 2000);
+
+        stream.write_all(b"ping baidu.com").unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        for _ in 0.." baidu.com".len() {
+            stream.write_all(b"\x1b[D").unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        stream.write_all(&[0x7f, 0x7f]).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        stream.write_all(b"\n").unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+
+        let response = read_until_timeout(&mut stream, 2000);
+        let text = String::from_utf8_lossy(&response);
+        assert!(
+            response.windows(3).any(|w| w == b"\x1b[D"),
+            "left-arrow redraw should be echoed like a direct terminal, got: {text:?}"
+        );
+        assert!(
+            response.windows(3).any(|w| w == b"\x1b[P"),
+            "in-line backspace should emit delete-character redraw, got: {text:?}"
+        );
+        assert!(
+            text.contains("/bin/sh: pi: not found"),
+            "backspacing 'ng' inside ping should execute 'pi baidu.com', got: {text:?}"
         );
     }
 

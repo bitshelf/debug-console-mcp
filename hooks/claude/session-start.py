@@ -219,6 +219,28 @@ def main():
         port = _project_http_port(proj)
         _ensure_http_mcp(proj, port)
 
+        # ── Auto-generate .mcp.json if missing or port changed ──
+        mcp_json_path = os.path.join(proj, ".mcp.json")
+        url = f"http://127.0.0.1:{port}/mcp"
+        need_write = True
+        if os.path.exists(mcp_json_path):
+            try:
+                with open(mcp_json_path) as f:
+                    existing = json.load(f)
+                existing_url = existing.get("mcpServers", {}).get("debug-console", {}).get("url", "")
+                if existing_url == url:
+                    need_write = False
+            except (json.JSONDecodeError, IOError):
+                pass
+        if need_write:
+            with open(mcp_json_path, "w") as f:
+                json.dump({
+                    "mcpServers": {
+                        "debug-console": {"url": url}
+                    }
+                }, f, indent=2)
+                f.write("\n")
+
     sys.exit(0)
 
 
