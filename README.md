@@ -7,18 +7,19 @@ power control, multi-DUT support, exponential backoff reconnect.
 > Design spec: [docs/tech-design.md](docs/tech-design.md)
 > Observability: `#[instrument]` tracing spans on all key async functions
 
-## Quick Start — New Project
+## Quick Start
 
 ```bash
-# 1. Build & deploy
-cd mcp-rs && cargo build --release && ./deploy.sh
+# 1. Install Claude Code plugin (auto-installs debug-console-mcp binary)
+claude plugin marketplace add https://github.com/bitshelf/debug-console-mcp
+claude plugin install embedded-debug@bitshelf/debug-console-mcp
 
 # 2. Create config + per-DUT directory
 cp references/.target.toml.example .target.toml
 vi .target.toml                            # set [[dev_hosts]].ip, [dut.serial].port, [dut].alias
 mkdir -p .dut-serial/$(grep alias .target.toml | head -1 | cut -d'"' -f2)/logs
 
-# 3. Restart Claude Code → SessionStart hook auto-starts MCP
+# 3. Restart Claude Code → plugin auto-starts MCP
 ```
 
 ## Hardware Setup — Dev Host
@@ -66,8 +67,8 @@ connection: &con2000
 
 | Alias | USB Serial | ser2net Port | OS |
 |-------|-----------|-------------|-----|
-| `rk3576-pdstars` | `5C2C244700` | 2000 | Yocto |
-| `rk3576-yt9215` | `56E6019371` | 2008 | Ubuntu |
+| `rk3576-board1` | `XXXXXXXXXX` | 2000 | Yocto |
+| `rk3576-board2` | `YYYYYYYYYY` | 2008 | Ubuntu |
 
 ## Configuration Reference (`.target.toml`)
 
@@ -80,7 +81,7 @@ ip = "192.168.1.105"
 user = "linaro"
 
 [[dut]]
-alias = "rk3576-pdstars"
+alias = "rk3576-board1"
 dev_host = "rk-board-pc"
 
 [dut.serial]
@@ -104,7 +105,7 @@ reset_time_ms = 3000      # minimum USB relay reset pulse (default: 3000)
 [dut.monitor]
 hang_timeout = 60
 max_archived_logs = 10
-reference_log = ".dut-serial/rk3576-pdstars/reference-boot.log"
+reference_log = ".dut-serial/rk3576-board1/reference-boot.log"
 # StageLearner similarity thresholds (0.0–1.0). Defaults from Cargo.toml.
 learner_stage_threshold = 0.45   # boot stage classification
 learner_crash_threshold = 0.50   # crash pattern detection
@@ -129,11 +130,11 @@ Add additional `[[dut]]` blocks. Each DUT gets:
 # ... same dev_hosts ...
 
 [[dut]]
-alias = "rk3576-pdstars"
+alias = "rk3576-board1"
 # ... config ...
 
 [[dut]]
-alias = "rk3576-yt9215"
+alias = "rk3576-board2"
 dev_host = "rk-board-pc"
 
 [dut.serial]
@@ -143,7 +144,7 @@ port = 2008    # different port!
 login_user = "root"
 
 [dut.monitor]
-reference_log = ".dut-serial/rk3576-yt9215/reference-boot.log"
+reference_log = ".dut-serial/rk3576-board2/reference-boot.log"
 ```
 
 ## MCP Tools (28 total)
@@ -192,7 +193,7 @@ reference_log = ".dut-serial/rk3576-yt9215/reference-boot.log"
 
 When `.target.toml` has multiple `[[dut]]` entries, statusline shows all:
 ```
-● rk3576-pdstars:active  ● rk3576-yt9215:active
+● rk3576-board1:active  ● rk3576-board2:active
 ```
 
 ## StageLearner Tuning
@@ -289,9 +290,12 @@ debug-console-mcp --log-to-stderr --verbose
 
 ## Hooks
 
+Hooks are registered automatically by the Claude Code plugin (`hooks/hooks.json`).
+No manual `settings.json` edits needed.
+
 | Hook | Trigger | Purpose |
 |------|---------|---------|
-| `session-start.py` | Enter project | Detect `.target.toml`, start MCP (HTTP mode) |
+| `session-start.py` | Enter project | Detect `.target.toml`, init serial connection |
 | `pre-tool-use.py` | Before Bash | Block raw `nc`/`tio`/`screen` serial access |
 | `user-prompt-submit.py` | Before each prompt | Multi-DUT state alert, auto-restart MCP |
 | `statusline.py` | ~1s refresh | Show DUT state(s) in statusline |
@@ -330,6 +334,15 @@ debug-console-mcp --log-to-stderr --verbose
 
 ## CLI (`dutabo`)
 
+`dutabo` is a manual CLI tool for interactive debug. Install separately:
+
+```bash
+cargo install --git https://github.com/bitshelf/debug-console-mcp
+# → installs dutabo to ~/.cargo/bin
+```
+
+Commands:
+
 ```bash
 dutabo list                    # list DUTs from .target.toml
 dutabo serial [--dut <alias>]  # interactive serial console
@@ -337,4 +350,65 @@ dutabo reset [--dut <alias>]   # hardware reset
 dutabo uf <image> [--dut]      # flash firmware
 dutabo uboot [--dut <alias>]   # enter U-Boot
 dutabo state [--dut <alias>]   # get DUT state
+
+## #[tool] Macro Migration (Future)
+
+**Status**: rmcp 3.0.1 is integrated with manual `ServerHandler` impl (`mcp_handler.rs`).
+Full `#[tool_router]` + `#[tool_handler]` migration is blocked pending rmcp 3.x API maturity.
+
+### Current Architecture
+
+```
+mcp_handler.rs ──► ServerHandler (manual impl) ──► McpServer::handle_call_tool()
+mcp.rs         ──► ToolDef vec (28 tools)      ──► call_tool_impl() dispatch
+```
+
+Tools are defined as `Vec<ToolDef>` with manual JSON schema and dispatched via
+match statements. The `mcp_handler.rs` `ServerHandler` impl delegates
+`call_tool` → `McpServer::handle_call_tool` for complex tools.
+
+### Target Architecture (from adancurusul/serial-mcp-server)
+
+```rust
+#[tool_router]
+impl McpHandler {
+    #[tool(description = "Send a shell command to the target")]
+    async fn serial_send_command(&self, Parameters(args): Parameters<SendCmd>) -> String {
+        // ... typed implementation
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for McpHandler { ... }
+```
+
+### What's Ready
+
+- Tool parameter types defined: `SendCmd`, `GetLogs`, `Reset`, etc.
+  (in `mcp_handler.rs` params! macro)
+- `schemars::JsonSchema` derive available for auto-schema generation
+- `#[tool_router]` and `#[tool_handler]` macros compile but have API issues
+
+### Blockers (rmcp 3.0.1)
+
+1. `E0716` — temporary `Value` lifetime when borrowing engine return values
+2. `E0119` — conflicting `ServerHandler` impls when mixing `#[tool_router(server_handler)]`
+   with manual `impl ServerHandler` for task overrides
+3. Method visibility — `#[tool_router]` impl block can't see helper methods
+   defined in separate `impl McpHandler` blocks
+
+### Migration Steps (when rmcp 3.x stabilizes)
+
+1. Remove `ToolDef` vec and `tool_definitions()` from `mcp.rs`
+2. Move each tool impl into `#[tool]` method on `McpHandler`
+3. Use `#[tool_router(server_handler)]` for auto ServerHandler generation
+4. Complex tools (multi-phase lock): extract into standalone async fns
+5. Delete manual `handle_message()` JSON-RPC router from `mcp.rs`
+6. Remove `JsonRpcRequest`/`JsonRpcResponse` types
+
+### Reference
+
+- [adancurusul/serial-mcp-server](https://github.com/adancurusul/serial-mcp-server) — reference implementation (rmcp 0.3.2)
+- [rmcp docs](https://docs.rs/rmcp/latest/rmcp/) — official rmcp 3.0.1 docs
+- [rmcp-macros](https://docs.rs/rmcp-macros/latest/rmcp_macros/) — #[tool] macro reference
 ```

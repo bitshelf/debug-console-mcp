@@ -1,0 +1,6 @@
+#!/bin/bash
+# Bootstrap shim for debug-console-mcp MCP server.
+# Downloads the prebuilt binary from GitHub Release on first use.
+
+SCRIPT_DIR="$(cd -- "$(dirname "$0")" && pwd)"
+exec "$SCRIPT_DIR/../scripts/ensure-binary.sh" "debug-console-mcp" "$@"

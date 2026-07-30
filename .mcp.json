@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "debug-console": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/debug-console-mcp",
+      "args": [],
+      "env": {
+        "RUST_LOG": "info"
+      }
+    }
+  }
+}

@@ -130,45 +130,47 @@ fn highlight_serial_prompt_line(line: &[u8], out: &mut Vec<u8>) {
         out.extend_from_slice(line);
         return;
     };
-    let tail = parts.sigil.end;
+    let clean = strip_ansi_escapes::strip(line);
+    if parts.sigil.end > clean.len() {
+        out.extend_from_slice(line);
+        return;
+    }
+    let content = &clean[..parts.sigil.end];
+    let tail = &clean[parts.sigil.end..];
 
-    if let Some(prefix) = parts.prefix {
-        out.extend_from_slice(&line[prefix]);
+    if let Some(prefix) = &parts.prefix {
+        out.extend_from_slice(&content[prefix.clone()]);
     }
     out.extend_from_slice(b"\x1b[1;32m");
-    out.extend_from_slice(&line[parts.user]);
+    out.extend_from_slice(&content[parts.user.clone()]);
     out.extend_from_slice(b"\x1b[0m");
-    if let Some(separator) = parts.separator {
-        out.extend_from_slice(&line[separator]);
+    if let Some(separator) = &parts.separator {
+        out.extend_from_slice(&content[separator.clone()]);
     }
     out.extend_from_slice(b"\x1b[1;34m");
-    out.extend_from_slice(&line[parts.dir]);
+    out.extend_from_slice(&content[parts.dir.clone()]);
     out.extend_from_slice(b"\x1b[0m");
-    if let Some(suffix) = parts.suffix {
-        out.extend_from_slice(&line[suffix]);
+    if let Some(suffix) = &parts.suffix {
+        out.extend_from_slice(&content[suffix.clone()]);
     }
     out.extend_from_slice(b"\x1b[1;37m");
-    out.extend_from_slice(&line[parts.sigil]);
+    out.extend_from_slice(&content[parts.sigil.clone()]);
     out.extend_from_slice(b"\x1b[0m");
-    out.extend_from_slice(&line[tail..]);
+    out.extend_from_slice(tail);
 }
 
 fn prompt_parts(line: &[u8]) -> Option<PromptParts> {
-    if line.first().is_none_or(|b| b.is_ascii_whitespace()) {
-        return None;
-    }
-    let end = line
-        .iter()
-        .position(|&b| b == b'\r' || b == b'\n')
-        .unwrap_or(line.len());
-    let text = std::str::from_utf8(&line[..end]).ok()?;
-
-    parse_colon_prompt(text, line).or_else(|| parse_bracket_prompt(text, line))
+    let clean = strip_ansi_escapes::strip(line);
+    if clean.is_empty() { return None; }
+    let end = clean.iter().position(|&b| b == b'\r' || b == b'\n').unwrap_or(clean.len());
+    let text = std::str::from_utf8(&clean[..end]).ok()?;
+    parse_colon_prompt(text, &clean).or_else(|| parse_bracket_prompt(text, &clean))
 }
+
 
 fn parse_colon_prompt(text: &str, line: &[u8]) -> Option<PromptParts> {
     static COLON_USER_RE: LazyLock<fancy_regex::Regex> = LazyLock::new(|| {
-        fancy_regex::Regex::new(r"^[^/#\-\s]\S*\s?[^\s.:\[\]]+?(?=:\S[^\r\n$#]*[$#]\s)").unwrap()
+        fancy_regex::Regex::new(r"^[^/#\-\s]\S*\s?[^\s.:\[\]]*?(?=:\S[^\r\n$#]*[$#]\s)").unwrap()
     });
     static COLON_DIR_RE: LazyLock<fancy_regex::Regex> =
         LazyLock::new(|| fancy_regex::Regex::new(r"(?<=:)\S[^\r\n$#]*?(?=[$#]\s)").unwrap());
@@ -271,10 +273,10 @@ async fn main() {
     let mut positional: Vec<String> = Vec::new();
     let mut i = 1;
     while i < args.len() {
-        if args[i] == "--dut" && i + 1 < args.len() {
+        if (args[i] == "--dut" || args[i] == "-d") && i + 1 < args.len() {
             dut_alias = Some(args[i + 1].clone());
             i += 2;
-        } else if args[i] == "--mcp-port" && i + 1 < args.len() {
+        } else if (args[i] == "--mcp-port" || args[i] == "-p") && i + 1 < args.len() {
             mcp_port = args[i + 1].parse().unwrap_or(MCP_DEFAULT_PORT);
             mcp_port_explicit = true;
             i += 2;
@@ -297,7 +299,7 @@ async fn main() {
 
     if !matches!(
         cmd.as_str(),
-        "list" | "state" | "serial" | "reboot" | "uboot" | "maskrom" | "uf" | "flash-kernel"
+        "list" | "state" | "serial" | "reboot" | "uboot" | "maskrom" | "uf" | "flash-kernel" | "cleanup"
     ) {
         eprintln!("Unknown command: {cmd}");
         print_usage();
@@ -338,6 +340,15 @@ async fn main() {
 
     if cmd == "list" {
         cmd_list(&duts);
+        return;
+    }
+
+    if cmd == "cleanup" {
+        if kill_mcp_http_by_pid() {
+            println!("Auto-started MCP server stopped.");
+        } else {
+            println!("No auto-started MCP server found.");
+        }
         return;
     }
 
@@ -390,19 +401,82 @@ Commands:
   maskrom   [--dut <alias>]  Enter Rockchip MASKROM mode
   uf <image> [--dut <alias>] Flash full firmware image
   flash-kernel <image> [--dut <alias>]  Flash kernel/boot image
+  cleanup                    Stop auto-started MCP HTTP server
 
 Options:
-  --dut <alias>    Select which DUT (required for multi-DUT configs)
-  --mcp-port <N>   MCP HTTP port (default: 3000)
+  -d, --dut <alias>   Select which DUT (required for multi-DUT configs)
+  -p, --mcp-port <N>  MCP HTTP port (default: 3000)
 
 Examples:
   dutabo list
-  dutabo state --dut rk3576-pdstars
-  dutabo serial --dut rk3576-yt9215
-  dutabo uf /path/to/update.img --dut rk3576-pdstars
+  dutabo state -d rk3576-board1
+  dutabo serial -d rk3576-board2
+  dutabo uf /path/to/update.img -d rk3576-board1
   dutabo flash-kernel /path/to/boot.img
     "
     );
+}
+
+/// Check if a TCP server is listening on localhost:<port>.
+fn is_port_listening(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &format!("127.0.0.1:{port}").parse().unwrap(),
+        std::time::Duration::from_millis(200),
+    )
+    .is_ok()
+}
+
+/// Write the PID of an auto-started MCP HTTP server for later cleanup.
+fn write_mcp_http_pid(pid: u32) {
+    if let Some(project_dir) = find_target_toml().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        let dut_dir = project_dir.join(".dut-serial");
+        let _ = std::fs::create_dir_all(&dut_dir);
+        let pid_file = dut_dir.join("mcp-http.pid");
+        if let Err(e) = std::fs::write(&pid_file, pid.to_string()) {
+            eprintln!("Cannot write PID file {pid_file:?}: {e}");
+        }
+    }
+}
+
+/// Read the PID file and kill the auto-started MCP HTTP server.
+/// Returns true if a PID was found and the process was killed.
+fn kill_mcp_http_by_pid() -> bool {
+    let pid_file = match find_target_toml()
+        .and_then(|p| p.parent().map(|d| d.join(".dut-serial").join("mcp-http.pid")))
+    {
+        Some(p) if p.exists() => p,
+        _ => return false,
+    };
+    let pid_str = match std::fs::read_to_string(&pid_file) {
+        Ok(s) => s.trim().to_string(),
+        Err(_) => return false,
+    };
+    let pid: u32 = match pid_str.parse() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+
+    // Unix: send SIGTERM via kill(1)
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = std::fs::remove_file(&pid_file);
+        true
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = std::fs::remove_file(&pid_file);
+        true
+    }
 }
 
 fn find_target_toml() -> Option<PathBuf> {
@@ -426,6 +500,23 @@ fn project_mcp_port(project_dir: &std::path::Path) -> u16 {
     let canonical =
         std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
     h.update(canonical.to_string_lossy().as_bytes());
+    let hex = format!("{:x}", h.finalize());
+    let val = u64::from_str_radix(&hex[..8], 16).unwrap_or(0);
+    MC_PORT_BASE + (val % MC_PORT_RANGE as u64) as u16
+}
+
+/// DUT-specific MCP port — includes alias in hash so each DUT gets its own port.
+fn project_mcp_port_for_dut(dut: &debug_console_mcp::config::DutConfig) -> u16 {
+    use md5::{Digest, Md5};
+    let mut h = Md5::new();
+    let project_dir = find_target_toml()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let canonical =
+        std::fs::canonicalize(&project_dir).unwrap_or_else(|_| project_dir.clone());
+    h.update(canonical.to_string_lossy().as_bytes());
+    h.update(b":");
+    h.update(dut.alias.as_bytes());
     let hex = format!("{:x}", h.finalize());
     let val = u64::from_str_radix(&hex[..8], 16).unwrap_or(0);
     MC_PORT_BASE + (val % MC_PORT_RANGE as u64) as u16
@@ -482,7 +573,7 @@ fn select_dut(
     if duts.len() == 1 {
         return Some(duts[0].clone());
     }
-    eprintln!("Multiple DUTs. Choose with --dut:");
+    eprintln!("Multiple DUTs. Choose with -d/--dut:");
     for d in duts {
         eprintln!("  - {}", d.alias);
     }
@@ -547,39 +638,51 @@ async fn mcp_call(
                 }
             }
             Err(_) if attempt == 0 => {
-                eprintln!("MCP server not running — starting...");
+                // Check if a server is already running on this port.
+                if is_port_listening(port) {
+                    INITIALIZED.store(false, std::sync::atomic::Ordering::Relaxed);
+                    continue 'outer;
+                }
+
+                eprintln!("MCP server not running — starting on port {port}...");
                 let bin = std::env::current_exe()
                     .ok()
                     .and_then(|p| Some(p.parent()?.join("debug-console-mcp")))
                     .unwrap_or_else(|| PathBuf::from("debug-console-mcp"));
                 let mut command = std::process::Command::new(&bin);
-                command.args(["--http", &format!("127.0.0.1:{port}")]);
+                command.args([
+                    "--http",
+                    &format!("127.0.0.1:{port}"),
+                    "--idle-timeout",
+                    "60",
+                ]);
                 command.env("TARGET_DUT_ALIAS", &dut.alias);
                 if let Some(path) = find_target_toml() {
                     command.env("TARGET_CONF", path);
                 }
-                if command
+                match command
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .spawn()
-                    .is_ok()
                 {
-                    for _ in 0..10 {
-                        std::thread::sleep(std::time::Duration::from_millis(500));
-                        if std::process::Command::new("curl")
-                            .args([
-                                "-sf",
-                                "-o",
-                                "/dev/null",
-                                &format!("http://127.0.0.1:{port}/health"),
-                            ])
-                            .status()
-                            .map(|s| s.success())
-                            .unwrap_or(false)
-                        {
-                            INITIALIZED.store(false, std::sync::atomic::Ordering::Relaxed);
-                            continue 'outer;
+                    Ok(child) => {
+                        let pid = child.id();
+                        write_mcp_http_pid(pid);
+                        // Detach: drop child handle so it's not reaped on dutabo exit.
+                        // The server is a long-lived background process.
+                        std::mem::drop(child);
+
+                        for _ in 0..10 {
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            if is_port_listening(port) {
+                                INITIALIZED.store(false, std::sync::atomic::Ordering::Relaxed);
+                                continue 'outer;
+                            }
                         }
+                        eprintln!("MCP server started but not responding on port {port}");
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to start MCP server: {e}");
                     }
                 }
             }
@@ -701,30 +804,28 @@ async fn cmd_maskrom(dut: &debug_console_mcp::config::DutConfig, port: u16) {
 
 // ── Serial (interactive) ─────────────────────────────────────────────────
 
-async fn cmd_serial(dut: &debug_console_mcp::config::DutConfig, mcp_port: u16) {
-    // Ensure MCP server is running (HTTP required for WS)
+async fn cmd_serial(dut: &debug_console_mcp::config::DutConfig, _mcp_port: u16) {
+    // Multi-DUT: each DUT needs its own MCP server. Use a DUT-specific port
+    // to avoid connecting to the wrong DUT's serial.
+    let port = project_mcp_port_for_dut(dut);
+    let health_url = format!("http://127.0.0.1:{port}/health");
+
     if !std::process::Command::new("curl")
-        .args([
-            "-sf",
-            "-o",
-            "/dev/null",
-            &format!("http://127.0.0.1:{mcp_port}/health"),
-        ])
+        .args(["-sf", "-o", "/dev/null", &health_url])
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
     {
-        eprintln!("Starting MCP server...");
+        eprintln!("Starting MCP server for {} on port {port}...", dut.alias);
         let bin = std::env::current_exe()
             .ok()
             .and_then(|p| Some(p.parent()?.join("debug-console-mcp")))
             .unwrap_or_else(|| PathBuf::from("debug-console-mcp"));
         let mut command = std::process::Command::new(&bin);
-        command.args(["--http", &format!("127.0.0.1:{mcp_port}")]);
+        command.args(["--http", &format!("127.0.0.1:{port}")]);
         if let Some(path) = find_target_toml() {
             command.env("TARGET_CONF", path);
         }
-        // Pass DUT alias so the MCP uses the correct serial config
         command.env("TARGET_DUT_ALIAS", &dut.alias);
         let _ = command
             .stdout(std::process::Stdio::null())
@@ -733,12 +834,7 @@ async fn cmd_serial(dut: &debug_console_mcp::config::DutConfig, mcp_port: u16) {
         for _ in 0..HEALTH_POLL_RETRIES {
             std::thread::sleep(std::time::Duration::from_millis(HEALTH_POLL_INTERVAL_MS));
             if std::process::Command::new("curl")
-                .args([
-                    "-sf",
-                    "-o",
-                    "/dev/null",
-                    &format!("http://127.0.0.1:{mcp_port}/health"),
-                ])
+                .args(["-sf", "-o", "/dev/null", &health_url])
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false)
@@ -748,7 +844,7 @@ async fn cmd_serial(dut: &debug_console_mcp::config::DutConfig, mcp_port: u16) {
         }
     }
 
-    serial_ws_relay(mcp_port).await;
+    serial_ws_relay(port).await;
     // Session ended — clean exit, no message needed.
 }
 
@@ -844,13 +940,11 @@ async fn serial_ws_relay(mcp_port: u16) {
     }
 
     // WebSocket → stdout.
-    // TerminalSanitizer strips SGR color codes from kernel boot logs.
-    // A small readline CSI subset (cursor movement A/B/C/D, erase-to-EOL K,
-    // and delete-character P) passes through so the shell can move the cursor
-    // and redraw the command line without allowing screen-wide controls from
-    // serial logs.
-    // Prompt highlighting then re-adds safe SGR colors for readability.
-    let mut sanitizer = TerminalSanitizer::new(is_tty);
+    // TerminalSanitizer strips SGR color codes from kernel boot logs while
+    // preserving safe SGR (e.g. ip -c output). Prompt highlighting then
+    // re-applies its own SGR on top. Leading ANSI escapes before a prompt
+    // are preserved in the output prefix (skip_ansi_escapes).
+    let mut sanitizer = TerminalSanitizer::new(true);
     let mut out = Vec::with_capacity(4096);
     let mut rendered = Vec::with_capacity(4096);
     let mut first_write = true;
@@ -1434,13 +1528,18 @@ mod tests {
     }
 
     #[test]
-    fn sanitizer_strips_non_color_control_sequences() {
+    /// CSI sequences like \x1b[2J (erase screen) are *preserved* (not stripped)
+    /// because readline needs cursor movement / erase / insert-delete
+    /// sequences for correct visual feedback. Only SGR color codes (\x1b[..m)
+    /// and OSC sequences (\x1b]..BEL) are filtered.
+    fn sanitizer_strips_osc_preserves_csi() {
         let mut sanitizer = TerminalSanitizer::new(true);
         let mut out = Vec::new();
 
         sanitizer.filter(b"a\x1b[2Jb\x1b]0;title\x07c", &mut out);
 
-        assert_eq!(String::from_utf8(out).unwrap(), "abc");
+        // OSC sequence stripped, CSI \x1b[2J preserved for readline
+        assert_eq!(String::from_utf8(out).unwrap(), "a\x1b[2Jbc");
     }
 
     #[test]
@@ -1502,6 +1601,29 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn prompt_highlight_bracketed_paste_prefix() {
+        // ANSI-prefixed prompt: strip ANSI, highlight clean text
+        let mut out = Vec::new();
+        highlight_serial_prompt(b"\x1b[?2004hroot@board:/# ls\r\n", &mut out);
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.contains("\x1b[1;32mroot@board\x1b[0m:"));
+        assert!(rendered.contains("\x1b[1;34m/\x1b[0m"));
+        assert!(rendered.contains("\x1b[1;37m# \x1b[0mls"));
+    }
+
+    #[test]
+    fn prompt_highlight_colored_prompt() {
+        // Target-colored prompt: all ANSI stripped, our highlighting applied
+        let mut out = Vec::new();
+        highlight_serial_prompt(b"\x1b[32mroot@myd-lt527:/\x1b[0m# ls\r\n", &mut out);
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.contains("\x1b[1;32mroot@myd-lt527"), "user not highlighted: {rendered:?}");
+        assert!(rendered.contains("\x1b[1;34m/"), "dir not highlighted: {rendered:?}");
+        assert!(rendered.contains("\x1b[1;37m# "), "sigil not highlighted: {rendered:?}");
+    }
+
+    #[test]
     fn prompt_highlight_handles_bracket_user_without_host() {
         let mut out = Vec::new();
 
@@ -1511,6 +1633,18 @@ mod tests {
         assert!(rendered.contains("[\x1b[1;32mroot\x1b[0m "));
         assert!(rendered.contains("\x1b[1;34m/var/log\x1b[0m]"));
         assert!(rendered.contains("\x1b[1;37m# \x1b[0mtail messages"));
+    }
+
+    #[test]
+    fn prompt_highlight_short_colon_prompt() {
+        // Regression: user@hostname directly followed by :/ without extra chars
+        // e.g. root@board-name:/#
+        let mut out = Vec::new();
+        highlight_serial_prompt(b"root@board-name:/# ls\r\n", &mut out);
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.contains("\x1b[1;32mroot@board-name\x1b[0m:"));
+        assert!(rendered.contains("\x1b[1;34m/\x1b[0m"));
+        assert!(rendered.contains("\x1b[1;37m# \x1b[0mls"));
     }
 
     #[test]

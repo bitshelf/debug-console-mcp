@@ -79,7 +79,11 @@ use crate::state_manager::{StateManager, TargetState};
 
 /// Ceiling for send-and-read-response round-trip (TCP → ser2net → UART → back).
 /// Typical LAN response is 20-80 ms.
-const COMMAND_RESPONSE_CEILING: Duration = Duration::from_millis(2000);
+const COMMAND_RESPONSE_CEILING: Duration = Duration::from_secs(30);
+/// Probe poll interval used by send_and_expect — longer than EXPECT_POLL
+/// so slow serial targets have time to respond.
+const PROBE_POLL: Duration = Duration::from_millis(200);
+/// How long probe_initial_state waits before declaring DUT-off (secs).
 
 /// Poll tick for the expect loop — how often we check for new serial data.
 const EXPECT_POLL: Duration = Duration::from_millis(50);
@@ -539,10 +543,15 @@ impl SerialEngine {
         // Step 1: non-blocking drain of kernel buffer
         match self
             .console
-            .read_available(EXPECT_POLL, 4096)
+            .read_available(PROBE_POLL, 4096)
             .await
         {
             Ok(data) if !data.is_empty() => {
+                let hex_preview: String = data.iter().take(128)
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                tracing::info!(len = data.len(), hex = %hex_preview, "Probe: initial data");
                 let filtered = strip_ser2net_banner(&data);
                 let probe_data = if !filtered.is_empty() { &filtered } else { &data };
 
@@ -572,7 +581,7 @@ impl SerialEngine {
                 }
 
                 // Buffered data inconclusive — trigger fresh prompt
-                match self.send_and_expect("").await {
+                match self.send_and_expect("\r").await {
                     Ok(d2) if !d2.is_empty() => {
                         self.logs.write(&d2);
                         let e2 = self.detector.feed(&d2);
@@ -603,7 +612,7 @@ impl SerialEngine {
             }
             Ok(_) => {
                 // Board appears idle — send empty line to verify it's alive
-                match self.send_and_expect("").await {
+                match self.send_and_expect("\r").await {
                     Ok(d2) if !d2.is_empty() => {
                         self.logs.write(&d2);
                         let e2 = self.detector.feed(&d2);
@@ -794,6 +803,12 @@ impl SerialEngine {
                     let _ = tx.send(data.clone());
                 }
                 self.state.on_activity();
+                // Log raw hex for debugging: first 64 bytes of each read
+                let hex_preview: String = data.iter().take(64)
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                tracing::info!(len = data.len(), hex = %hex_preview, "Serial read");
                 self.maybe_detect_shutdown(&data);
                 if self.state.current() == TargetState::DutOff {
                     self.state.transition(TargetState::Active);
@@ -1133,6 +1148,25 @@ impl SerialEngine {
         let result = self.logs.read_log(archive_index, lines, pattern);
         serde_json::json!({
             "content": result.content,
+            "filename": result.filename,
+            "total_lines": result.total_lines,
+            "filtered_lines": result.filtered_lines,
+        })
+    }
+
+    /// Read log with shell prompt syntax highlighting applied.
+    pub fn read_log_highlighted(
+        &self,
+        archive_index: usize,
+        lines: usize,
+        pattern: Option<&str>,
+    ) -> serde_json::Value {
+        let result = self.logs.read_log(archive_index, lines, pattern);
+        let mut highlighted = Vec::with_capacity(result.content.len() * 2);
+        crate::highlight::highlight_serial_prompt(result.content.as_bytes(), &mut highlighted);
+        let content = String::from_utf8_lossy(&highlighted).into_owned();
+        serde_json::json!({
+            "content": content,
             "filename": result.filename,
             "total_lines": result.total_lines,
             "filtered_lines": result.filtered_lines,
@@ -2282,7 +2316,7 @@ fn strip_android_klog(data: &[u8]) -> Vec<u8> {
 /// Engine wrapper for shared access between read loop and MCP handler
 pub type SharedEngine = Arc<Mutex<SerialEngine>>;
 
-pub fn new_shared_engine(config: Config) -> SharedEngine {
+pub fn new_shared_engine(config: crate::config::Config) -> SharedEngine {
     Arc::new(Mutex::new(SerialEngine::new(config)))
 }
 

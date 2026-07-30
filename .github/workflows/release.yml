@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
+
+      - name: Install cross-compiler
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+
+      - name: Build (x86_64)
+        working-directory: mcp-rs
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Build (aarch64)
+        working-directory: mcp-rs
+        run: cargo build --release --target aarch64-unknown-linux-gnu
+
+      - name: Checksums
+        run: |
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            cp mcp-rs/target/$target/release/debug-console-mcp debug-console-mcp-$target
+            cp mcp-rs/target/$target/release/dutabo dutabo-$target
+          done
+          sha256sum debug-console-mcp-* dutabo-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            debug-console-mcp-x86_64-unknown-linux-gnu
+            debug-console-mcp-aarch64-unknown-linux-gnu
+            dutabo-x86_64-unknown-linux-gnu
+            dutabo-aarch64-unknown-linux-gnu
+            SHA256SUMS

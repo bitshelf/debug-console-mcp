@@ -1,0 +1,22 @@
+{
+  "name": "embedded-debug",
+  "version": "0.3.0",
+  "description": "Embedded Linux DUT serial debugger: boot-log capture, U-Boot control, kernel-crash detection, relay reset, StageLearner self-learning.",
+  "author": {
+    "name": "loh",
+    "url": "https://github.com/bitshelf/debug-console-mcp"
+  },
+  "homepage": "https://github.com/bitshelf/debug-console-mcp",
+  "repository": "https://github.com/bitshelf/debug-console-mcp",
+  "license": "MIT",
+  "keywords": ["serial", "embedded", "rockchip", "uboot", "mcp", "dut", "debug"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Embedded Debug Console",
+    "shortDescription": "Serial debugger for embedded Linux DUTs with MCP integration",
+    "developerName": "loh",
+    "category": "Development Tools",
+    "capabilities": ["Read", "Write", "Bash"]
+  }
+}

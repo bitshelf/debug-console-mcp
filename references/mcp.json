@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "debug-console": {
+      "command": "debug-console-mcp",
+      "args": [],
+      "env": {
+        "RUST_LOG": "info"
+      }
+    }
+  }
+}

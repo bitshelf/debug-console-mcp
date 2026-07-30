@@ -7,6 +7,7 @@
 //! Transport: stdio (newline-delimited JSON-RPC 2.0)
 
 // All modules are in lib.rs — use the library crate.
+use std::path::PathBuf;
 use debug_console_mcp as lib;
 
 const HELP: &str = "\
@@ -35,6 +36,7 @@ Options:
                      Default: info level to {project}/.dut-serial/mcp.log.
       --log-to-stderr  Log to stderr instead of file (useful for debugging).
       --http [HOST:PORT]  Run as Streamable HTTP server (default: 127.0.0.1:3000).
+      --idle-timeout N   When --http, exit after N seconds with no requests (default: off).
       --dry-run          Validate config and exit without connecting.
 
 Environment:
@@ -96,8 +98,8 @@ Troubleshooting:
   # Kill all MCP processes and restart:
   pkill debug-console-mcp; debug-console-mcp --log-to-stderr
 
-  # Build and deploy:
-  bash deploy-all.sh
+  # Install CLI tool for manual debug:
+  cargo install --git https://github.com/bitshelf/debug-console-mcp
 
 Version: debug-console-mcp v{}\n";
 
@@ -135,6 +137,7 @@ async fn main() {
     let mut log_to_stderr = false;
     let mut http_mode = false;
     let mut http_bind = "127.0.0.1:3000".to_string();
+    let mut idle_timeout: Option<u64> = None;
     let mut dry_run = false;
     let mut diagnose = false;
 
@@ -159,6 +162,12 @@ async fn main() {
                 if i + 1 < args.len() && !args[i + 1].starts_with('-') {
                     i += 1;
                     http_bind = args[i].clone();
+                }
+            }
+            "--idle-timeout" => {
+                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                    i += 1;
+                    idle_timeout = args[i].parse().ok();
                 }
             }
             "--dry-run" => dry_run = true,
@@ -230,6 +239,14 @@ async fn main() {
             std::env::current_dir().unwrap_or_default().display(),
             std::env::var("TARGET_CONF").ok()
         );
+    }
+
+    // ── Validate config ──
+    if let Err(errors) = cfg.validate() {
+        for e in &errors {
+            eprintln!("CONFIG ERROR: {e}");
+        }
+        std::process::exit(1);
     }
 
     // ── Dry-run: validate config and exit ──
@@ -331,7 +348,7 @@ async fn main() {
 
     {
         let mut eng = engine.lock().await;
-        match tokio::time::timeout(std::time::Duration::from_secs(5), eng.start()).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(35), eng.start()).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::error!("Engine start failed: {e}"),
             Err(_) => tracing::error!("Engine start timed out after 5s"),
@@ -350,6 +367,21 @@ async fn main() {
         }
     }
 
+    // ── Write project dir for statusline discovery ──
+    if let Some(ref project_dir) = cfg.project_dir {
+        use md5::{Digest, Md5};
+        let mut hasher = Md5::new();
+        hasher.update(project_dir.to_string_lossy().as_bytes());
+        let h = format!("{:x}", hasher.finalize()).chars().take(8).collect::<String>();
+        let hint_path = PathBuf::from("/dev/shm").join(format!("claude-serial-{}.lock", h));
+        if let Err(e) = std::fs::write(&hint_path, project_dir.to_string_lossy().as_bytes()) {
+            tracing::warn!("Cannot write project hint {:?}: {e}", hint_path);
+        }
+    }
+
+    // ── 创建 TaskManager（MCP SEP-2663 Tasks Extension）──
+    let tasks = lib::task_manager::TaskManager::new();
+
     // ── 运行 MCP server ──
     if http_mode {
         // Streamable HTTP transport (2025-03-26 spec)
@@ -358,15 +390,29 @@ async fn main() {
         } else {
             ("127.0.0.1".to_string(), 3000u16)
         };
-        tracing::info!("Starting Streamable HTTP on {host}:{port}");
-        if let Err(e) = lib::mcp_http::run_http(engine.clone(), &host, port).await {
+        tracing::info!("Starting Streamable HTTP on {host}:{port} (idle_timeout: {idle_timeout:?})");
+        if let Err(e) = lib::mcp_http::run_http(
+            engine.clone(),
+            &host,
+            port,
+            idle_timeout.map(std::time::Duration::from_secs),
+        ).await {
             tracing::error!("HTTP server error: {e}");
         }
     } else {
-        // Stdio transport (default)
-        let mut server = lib::mcp::McpServer::new(engine.clone());
-        if let Err(e) = server.run().await {
-            tracing::error!("MCP server error: {e}");
+        // Stdio transport via rmcp SDK
+        use rmcp::{transport::stdio, ServiceExt};
+        let handler = lib::mcp_handler::McpHandler::new(engine.clone(), tasks);
+        match handler.serve(stdio()).await {
+            Ok(service) => {
+                tracing::info!("rmcp stdio server started");
+                if let Err(e) = service.waiting().await {
+                    tracing::error!("rmcp server stopped: {e:?}");
+                }
+            }
+            Err(e) => {
+                tracing::error!("rmcp serve failed: {e:?}");
+            }
         }
     }
 

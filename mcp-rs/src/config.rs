@@ -1,4 +1,4 @@
-//! Config loading — TOML (.target.toml) with shell (.target.conf) fallback.
+//! Config loading — TOML (.target.toml).
 //! Searches upward from CWD. TARGET_CONF env var overrides path.
 
 use std::collections::HashMap;
@@ -53,7 +53,6 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfigFormat {
     Toml,
-    Shell,
     None,
 }
 
@@ -404,9 +403,13 @@ pub fn parse_dut_configs(toml_path: &Path) -> Result<Vec<DutConfig>, String> {
 
     let global = parse_toml_config(toml_path);
 
-    // Build dev_host registry from [[dev_hosts]] array
+    // Build dev_host registry from [[dev_hosts]] array (or legacy [dev_host])
     let mut dev_hosts: Vec<DevHostConfig> = Vec::new();
-    for dh in &t.dev_hosts {
+    let dev_host_list: Vec<&DevHostToml> = t.dev_hosts
+        .as_ref()
+        .map(|x| x.as_slice().iter().collect())
+        .unwrap_or_default();
+    for dh in &dev_host_list {
         dev_hosts.push(DevHostConfig {
             alias: dh.alias.clone().unwrap_or_default(),
             ip: dh.ip.clone().unwrap_or_default(),
@@ -680,10 +683,9 @@ fn dut_toml_to_config(
 
 #[derive(serde::Deserialize, Default)]
 struct TargetToml {
-    // Preferred multi-DUT format. Legacy single-board tables are still parsed
-    // below for backward compatibility with existing project configs.
+    // [[dev_hosts]] array only.
     #[serde(default)]
-    dev_hosts: Vec<DevHostToml>,
+    dev_hosts: Option<Vec<DevHostToml>>,
     serial: Option<SerialToml>,
     target: Option<TargetCredsToml>,
     uboot: Option<UbootToml>,
@@ -705,6 +707,7 @@ struct DevHostToml {
     user: Option<String>,
     pass: Option<String>,
 }
+
 
 #[derive(serde::Deserialize, Default)]
 struct SerialToml {
@@ -824,8 +827,9 @@ fn parse_toml_config(path: &Path) -> HashMap<String, String> {
         }
     };
 
-    // Populate global config from first [[dev_hosts]] entry
-    if let Some(dh) = t.dev_hosts.first() {
+    // Populate global config from [[dev_hosts]] (or legacy [dev_host])
+    let dev_host = t.dev_hosts.as_ref().and_then(|x| x.first());
+    if let Some(dh) = dev_host {
         if let Some(ref v) = dh.alias {
             cfg.insert("DEV_HOST_ALIAS".into(), v.clone());
         }
@@ -1077,46 +1081,9 @@ fn merge_dut_config(cfg: &mut HashMap<String, String>, dut: DutToml) {
     }
 }
 
-// ── Shell config parsing ──────────────────────────────────────────────
-
-fn parse_shell_config(path: &Path) -> HashMap<String, String> {
-    let mut cfg = HashMap::new();
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return cfg,
-    };
-
-    let re =
-        regex::Regex::new(r#"^(\w+)=(?:"([^"]*?)"|'([^']*?)'|([^\s#]*))\s*(?:#.*)?$"#).unwrap();
-
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let line = line.strip_prefix("export ").unwrap_or(line);
-        if let Some(caps) = re.captures(line) {
-            let raw_key = caps.get(1).unwrap().as_str().to_string();
-            let key = raw_key
-                .strip_prefix("RK_")
-                .or_else(|| raw_key.strip_prefix("LR_"))
-                .unwrap_or(&raw_key)
-                .to_string();
-            let value = caps
-                .get(2)
-                .or_else(|| caps.get(3))
-                .or_else(|| caps.get(4))
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
-            cfg.insert(key, value);
-        }
-    }
-    cfg
-}
-
 // ── Config path discovery ─────────────────────────────────────────────
 
-/// Find config file in CWD: tries .target.toml first, then .target.conf (backward compat).
+/// Find config file in CWD: searches for .target.toml.
 /// TARGET_CONF env var overrides the search path.
 fn find_config_path() -> Option<PathBuf> {
     // TARGET_CONF env var overrides
@@ -1128,7 +1095,7 @@ fn find_config_path() -> Option<PathBuf> {
     }
     let mut d = std::env::current_dir().ok()?;
     loop {
-        for name in &[".target.toml", ".target.conf"] {
+        for name in &[".target.toml"] {
             let candidate = d.join(name);
             if candidate.exists() {
                 return Some(candidate);
@@ -1141,42 +1108,35 @@ fn find_config_path() -> Option<PathBuf> {
     None
 }
 
-/// Load config: defaults + file overrides (TOML preferred, shell fallback)
+/// Load config: defaults + .target.toml overrides.
 pub fn load_config() -> Config {
     let mut values = defaults();
     let path = find_config_path();
 
     let format = match path {
         Some(ref p) if p.extension().is_some_and(|e| e == "toml") => ConfigFormat::Toml,
-        Some(ref p) if p.extension().is_some_and(|e| e == "conf") => ConfigFormat::Shell,
-        Some(_) => ConfigFormat::Shell, // unknown extension → try shell
-        None => ConfigFormat::None,
+        _ => ConfigFormat::None,
     };
 
     if let Some(ref p) = path {
-        let file_cfg = match format {
-            ConfigFormat::Toml => parse_toml_config(p),
-            ConfigFormat::Shell | ConfigFormat::None => parse_shell_config(p),
-        };
+        let file_cfg = parse_toml_config(p);
         values.extend(file_cfg);
-        if format == ConfigFormat::Toml {
-            if let Ok(alias) = std::env::var("TARGET_DUT_ALIAS") {
-                if !alias.trim().is_empty() {
-                    match parse_dut_configs(p) {
-                        Ok(duts) => {
-                            if let Some(dut) = duts.into_iter().find(|d| d.alias == alias) {
-                                values = dut.to_config_map(&values);
-                            } else {
-                                tracing::warn!(
-                                    "TARGET_DUT_ALIAS={} not found in {}; using default DUT",
-                                    alias,
-                                    p.display()
-                                );
-                            }
+        if let Ok(alias) = std::env::var("TARGET_DUT_ALIAS") {
+            if !alias.trim().is_empty() {
+                match parse_dut_configs(p) {
+                    Ok(duts) => {
+                        if let Some(dut) = duts.into_iter().find(|d| d.alias == alias) {
+                            values = dut.to_config_map(&values);
+                        } else {
+                            tracing::warn!(
+                                "TARGET_DUT_ALIAS={} not found in {}; using default DUT",
+                                alias,
+                                p.display()
+                            );
                         }
-                        Err(e) => {
-                            tracing::warn!("Cannot parse DUT configs for TARGET_DUT_ALIAS: {e}")
-                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Cannot parse DUT configs for TARGET_DUT_ALIAS: {e}")
                     }
                 }
             }
@@ -1193,6 +1153,68 @@ pub fn load_config() -> Config {
         config_path,
         project_dir,
         format,
+    }
+}
+
+// ── Validation ────────────────────────────────────────────────────────
+
+impl Config {
+    /// Validate required fields at startup. Returns Err with human-readable
+    /// message listing all missing/invalid fields. Pattern from serial-mcp-server.
+    pub fn validate(&self) -> Result<(), Vec<String>> {
+        let mut errors: Vec<String> = Vec::new();
+
+        // Required: dev host IP
+        if self.dev_host_ip().is_empty() {
+            errors.push("dev_host.ip: required field is empty. Set [[dev_hosts]].ip in .target.toml".into());
+        }
+
+        // Required: serial port
+        let port = self.serial_target();
+        if port == "0" || port == "2000" {
+            if self.dev_host_ip().is_empty() {
+                // Don't double-error — no host means port is meaningless
+            } else {
+                errors.push(format!(
+                    "dut.serial.port: must be set to a non-zero port (current: {port}). \
+                     Set [dut.serial].port in .target.toml"
+                ));
+            }
+        }
+
+        // Optional but warn: login_user
+        if self.login_user().is_empty() {
+            tracing::warn!("login_user not set — boot-to-shell detection will not work");
+        }
+
+        // Validate DUT configs if TOML is present
+        if let Some(ref p) = self.config_path {
+            if p.exists() {
+                match crate::config::parse_dut_configs(p) {
+                    Ok(duts) => {
+                        if duts.is_empty() {
+                            errors.push("No [[dut]] entries found in .target.toml".into());
+                        }
+                        for dut in &duts {
+                            if dut.serial_port.is_empty() || dut.serial_port == "0" {
+                                errors.push(format!(
+                                    "DUT '{}': serial.port is not set", dut.alias
+                                ));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        errors.push(format!("Failed to parse [[dut]] from .target.toml: {e}"));
+                    }
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 }
 
@@ -1215,33 +1237,6 @@ mod tests {
         assert_eq!(d.get("DEV_HOST_IP").unwrap(), "");
         assert_eq!(d.get("SERIAL_PORT").unwrap(), "2000");
         assert_eq!(d.get("HANG_TIMEOUT").unwrap(), "60");
-    }
-
-    #[test]
-    fn test_parse_shell_config_simple() {
-        let tmp = TempDir::new().unwrap();
-        let conf = tmp.path().join("test.conf");
-        let mut f = std::fs::File::create(&conf).unwrap();
-        writeln!(f, "DEV_HOST_IP=10.0.0.1").unwrap();
-        writeln!(f, "SERIAL_PORT=3000").unwrap();
-        writeln!(f, "# comment").unwrap();
-        writeln!(f, "LOGIN_USER=admin").unwrap();
-        let cfg = parse_shell_config(&conf);
-        assert_eq!(cfg.get("DEV_HOST_IP").unwrap(), "10.0.0.1");
-        assert_eq!(cfg.get("SERIAL_PORT").unwrap(), "3000");
-        assert_eq!(cfg.get("LOGIN_USER").unwrap(), "admin");
-    }
-
-    #[test]
-    fn test_parse_shell_config_quotes() {
-        let tmp = TempDir::new().unwrap();
-        let conf = tmp.path().join("test.conf");
-        let mut f = std::fs::File::create(&conf).unwrap();
-        writeln!(f, r#"LOGIN_PASS="my password""#).unwrap();
-        writeln!(f, "LOGIN_USER='root'").unwrap();
-        let cfg = parse_shell_config(&conf);
-        assert_eq!(cfg.get("LOGIN_PASS").unwrap(), "my password");
-        assert_eq!(cfg.get("LOGIN_USER").unwrap(), "root");
     }
 
     #[test]
@@ -1314,28 +1309,147 @@ port = 2000
     }
 
     #[test]
-    fn test_load_config_shell_fallback() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+    fn test_toml_config_dev_hosts_single_table() {
+        // [[dev_hosts]] array (standard format)
         let tmp = TempDir::new().unwrap();
-        std::fs::create_dir_all(tmp.path().join(".dut-serial")).unwrap();
-        let conf = tmp.path().join(".target.conf");
-        let mut f = std::fs::File::create(&conf).unwrap();
-        writeln!(f, "DEV_HOST_IP=172.16.0.1").unwrap();
-        writeln!(f, "SERIAL_PORT=9000").unwrap();
-        drop(f);
+        let conf = tmp.path().join(".target.toml");
+        std::fs::write(
+            &conf,
+            r#"
+[[dev_hosts]]
+alias = "main-host"
+ip = "10.0.0.100"
+user = "modern"
 
-        unsafe {
-            std::env::set_var("TARGET_CONF", conf.to_str().unwrap());
-        }
-        let cfg = load_config();
-        unsafe {
-            std::env::remove_var("TARGET_CONF");
-        }
+[serial]
+port = 3000
+"#,
+        )
+        .unwrap();
+        let cfg = parse_toml_config(&conf);
+        assert_eq!(cfg.get("DEV_HOST_IP").unwrap(), "10.0.0.100");
+        assert_eq!(cfg.get("DEV_HOST_USER").unwrap(), "modern");
+        assert_eq!(cfg.get("DEV_HOST_ALIAS").unwrap(), "main-host");
+        assert_eq!(cfg.get("SERIAL_PORT").unwrap(), "3000");
+    }
 
-        assert_eq!(cfg.dev_host_ip(), "172.16.0.1");
-        assert_eq!(cfg.serial_target().parse::<u16>().unwrap(), 9000);
-        assert_eq!(cfg.format, ConfigFormat::Shell);
-        assert_eq!(cfg.hang_timeout(), 60); // default
+    #[test]
+    fn test_toml_config_multi_dev_hosts_multi_dut() {
+        let tmp = TempDir::new().unwrap();
+        let conf = tmp.path().join(".target.toml");
+        std::fs::write(
+            &conf,
+            r#"
+[[dev_hosts]]
+alias = "rk-board-pc"
+ip = "192.168.1.100"
+user = "linaro"
+
+[[dev_hosts]]
+alias = "lab-pc-2"
+ip = "192.168.2.200"
+user = "root"
+
+[[dut]]
+alias = "rk3576"
+dev_host = "rk-board-pc"
+
+[dut.serial]
+port = 2000
+
+[dut.target]
+login_user = "root"
+
+[dut.uboot]
+interrupt_char = "ctrl_c"
+interrupt_strategy = "aggressive"
+
+[dut.relay]
+port = 2001
+reset_ch = 1
+
+[[dut]]
+alias = "rk3588"
+dev_host = "lab-pc-2"
+
+[dut.serial]
+port = 2010
+
+[dut.target]
+login_user = "testuser"
+login_pass = "pass"
+
+[dut.monitor]
+hang_timeout = 90
+reference_log = ".dut-serial/rk3588/reference-boot.log"
+"#,
+        )
+        .unwrap();
+        let result = parse_dut_configs(&conf).unwrap();
+        assert_eq!(result.len(), 2);
+
+        let rk3576 = &result[0];
+        assert_eq!(rk3576.alias, "rk3576");
+        assert_eq!(rk3576.dev_host_ip, "192.168.1.100");
+        assert_eq!(rk3576.dev_host_user, "linaro");
+        assert_eq!(rk3576.serial_port, "2000");
+        assert_eq!(rk3576.login_user, "root");
+        assert_eq!(rk3576.reset_ch, 1);
+        assert_eq!(rk3576.relay_port, 2001);
+
+        let rk3588 = &result[1];
+        assert_eq!(rk3588.alias, "rk3588");
+        assert_eq!(rk3588.dev_host_ip, "192.168.2.200");
+        assert_eq!(rk3588.dev_host_user, "root");
+        assert_eq!(rk3588.serial_port, "2010");
+        assert_eq!(rk3588.login_user, "testuser");
+        assert_eq!(rk3588.login_pass, "pass");
+    }
+
+    #[test]
+    /// Regression test: single-DUT with `[[dev_hosts]]` array format.
+    #[test]
+    fn test_parse_dut_configs_with_dev_hosts_single_table() {
+        let tmp = TempDir::new().unwrap();
+        let conf = tmp.path().join(".target.toml");
+        std::fs::write(
+            &conf,
+            r#"
+[[dev_hosts]]
+ip = "192.168.1.105"
+user = "linaro"
+
+[serial]
+port = 2002
+
+[target]
+login_user = "root"
+login_pass = ""
+
+[uboot]
+interrupt_char = "ctrl_c"
+interrupt_strategy = "aggressive"
+
+[relay]
+type = "usb-relay"
+port = 2000
+
+[monitor]
+hang_timeout = 60
+max_archived_logs = 10
+
+reference_log = ".dut-serial/reference-boot.log"
+"#,
+        )
+        .unwrap();
+        let result = parse_dut_configs(&conf).unwrap();
+        assert_eq!(result.len(), 1);
+        let dut = &result[0];
+        assert_eq!(dut.dev_host_ip, "192.168.1.105");
+        assert_eq!(dut.dev_host_user, "linaro");
+        assert_eq!(dut.serial_port, "2002");
+        assert_eq!(dut.login_user, "root");
+        assert_eq!(dut.relay_port, 2000);
     }
 
     #[test]

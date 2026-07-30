@@ -17,6 +17,7 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -27,6 +28,13 @@ use crate::serial_engine::SharedEngine;
 
 type SharedServer = Arc<Mutex<McpServer>>;
 
+/// Shared timestamp of the last HTTP activity (unix epoch millis).
+/// Updated by every request handler. Read by the idle-timeout checker.
+struct AppState {
+    server: SharedServer,
+    last_activity: AtomicU64,
+}
+
 /// Before registering the WS broadcast channel we send a newline to the board
 /// to trigger a clean prompt, then wait this long for the read loop to consume
 /// any stale serial-buffer data.  Shorter = faster startup; must be ≥ 1 full
@@ -34,10 +42,15 @@ type SharedServer = Arc<Mutex<McpServer>>;
 const WS_FLUSH_DRAIN: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Run the Streamable HTTP server on the given host:port.
+///
+/// If `idle_timeout` is set, the server will gracefully shut down after
+/// no HTTP requests for `idle_timeout` seconds. This prevents zombie
+/// processes when auto-started by `dutabo`.
 pub async fn run_http(
     engine: SharedEngine,
     bind_host: &str,
     bind_port: u16,
+    idle_timeout: Option<Duration>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Spawn read loop: event-driven (epoll), with a short sleep after each
     // iteration to avoid a busy loop under data floods.
@@ -68,7 +81,13 @@ pub async fn run_http(
         eng.set_background_tasks(read_handle, watchdog_handle);
     }
 
-    let server = Arc::new(Mutex::new(McpServer::new(engine.clone())));
+    let state = Arc::new(AppState {
+        server: Arc::new(Mutex::new(McpServer::new(
+            engine.clone(),
+            crate::task_manager::TaskManager::new(),
+        ))),
+        last_activity: AtomicU64::new(now_millis()),
+    });
 
     // CORS: allow all origins (this is a local debug tool, not a public API).
     let cors = CorsLayer::permissive();
@@ -78,10 +97,31 @@ pub async fn run_http(
         .route("/health", get(handle_health))
         .route("/serial/ws", get(handle_serial_ws))
         .layer(cors)
-        .with_state(server);
+        .with_state(state.clone());
 
     let addr = format!("{bind_host}:{bind_port}");
     tracing::info!("[debug-console-mcp] Streamable HTTP listening on http://{addr}");
+
+    // Idle-timeout background task: checks every 5s, triggers shutdown if
+    // no activity for `idle_timeout` seconds.
+    if let Some(timeout) = idle_timeout {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                let idle_secs =
+                    (now_millis() - state.last_activity.load(Ordering::Relaxed)) / 1000;
+                if idle_secs >= timeout.as_secs() {
+                    tracing::info!(
+                        "HTTP server idle for {idle_secs}s (>{}s), shutting down",
+                        timeout.as_secs()
+                    );
+                    std::process::exit(0);
+                }
+            }
+        });
+    }
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
@@ -95,12 +135,20 @@ pub async fn run_http(
     Ok(())
 }
 
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 /// POST /mcp — Main JSON-RPC endpoint.
 async fn handle_mcp_post(
-    State(server): State<SharedServer>,
+    State(state): State<Arc<AppState>>,
     Json(request): Json<JsonRpcRawRequest>,
 ) -> Response {
-    let mut srv = server.lock().await;
+    state.last_activity.store(now_millis(), Ordering::Relaxed);
+    let mut srv = state.server.lock().await;
 
     match srv.handle_raw_message(request).await {
         Some(response) => match serde_json::to_string(&response) {
@@ -134,12 +182,12 @@ async fn handle_mcp_post(
 ///
 /// Client sends keystrokes (Text/Binary), receives serial output (Binary).
 /// The MCP engine continues monitoring (logs, state, crash detection).
-async fn handle_serial_ws(State(state): State<SharedServer>, ws: WebSocketUpgrade) -> Response {
+async fn handle_serial_ws(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(move |socket| serial_ws_handler(socket, state))
 }
 
-async fn serial_ws_handler(mut socket: WebSocket, state: SharedServer) {
-    let server = state.lock().await;
+async fn serial_ws_handler(mut socket: WebSocket, state: Arc<AppState>) {
+    let server = state.server.lock().await;
     let engine = server.engine.clone();
     drop(server);
 
@@ -223,9 +271,9 @@ async fn serial_ws_handler(mut socket: WebSocket, state: SharedServer) {
 
 /// GET /health — Kubernetes-compatible liveness probe with live state.
 async fn handle_health(
-    State(state): State<SharedServer>,
+    State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
-    let server = match tokio::time::timeout(Duration::from_secs(2), state.lock()).await {
+    let server = match tokio::time::timeout(Duration::from_secs(2), state.server.lock()).await {
         Ok(s) => s,
         Err(_) => {
             return Ok(Json(
@@ -289,11 +337,18 @@ mod tests {
         new_shared_engine(config)
     }
 
+    fn make_app_state(engine: SharedEngine) -> Arc<AppState> {
+        Arc::new(AppState {
+            server: Arc::new(Mutex::new(McpServer::new(engine, crate::task_manager::TaskManager::new()))),
+            last_activity: AtomicU64::new(0),
+        })
+    }
+
     #[tokio::test]
     async fn test_health_endpoint() {
         let engine = create_test_engine();
-        let server = Arc::new(Mutex::new(McpServer::new(engine.clone())));
-        let result = handle_health(State(server)).await.unwrap();
+        let state = make_app_state(engine);
+        let result = handle_health(State(state)).await.unwrap();
         let json = result.0;
         assert_eq!(json["status"], "ok");
         assert_eq!(json["serial"]["state"], "stopped");
@@ -306,7 +361,7 @@ mod tests {
     #[tokio::test]
     async fn test_mcp_post_initialize() {
         let engine = create_test_engine();
-        let server = Arc::new(Mutex::new(McpServer::new(engine)));
+        let state = make_app_state(engine);
 
         let request = JsonRpcRawRequest {
             jsonrpc: "2.0".to_string(),
@@ -315,14 +370,14 @@ mod tests {
             params: None,
         };
 
-        let response = handle_mcp_post(State(server), Json(request)).await;
+        let response = handle_mcp_post(State(state), Json(request)).await;
         assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn test_mcp_post_notification() {
         let engine = create_test_engine();
-        let server = Arc::new(Mutex::new(McpServer::new(engine)));
+        let state = make_app_state(engine);
 
         // First initialize (required before other methods).
         let init_req = JsonRpcRawRequest {
@@ -331,7 +386,7 @@ mod tests {
             method: Some("initialize".to_string()),
             params: None,
         };
-        let _ = handle_mcp_post(State(server.clone()), Json(init_req)).await;
+        let _ = handle_mcp_post(State(state.clone()), Json(init_req)).await;
 
         // Then send a notification (no id → notification).
         let notif_req = JsonRpcRawRequest {
@@ -340,14 +395,14 @@ mod tests {
             method: Some("notifications/initialized".to_string()),
             params: None,
         };
-        let response = handle_mcp_post(State(server), Json(notif_req)).await;
+        let response = handle_mcp_post(State(state), Json(notif_req)).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
 
     #[test]
     fn test_server_state_creation() {
         let engine = create_test_engine();
-        let server = McpServer::new(engine.clone());
+        let server = McpServer::new(engine.clone(), crate::task_manager::TaskManager::new());
         // Verify it compiles and doesn't panic
         assert!(!server.initialized);
     }

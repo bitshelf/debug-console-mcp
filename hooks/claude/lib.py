@@ -35,6 +35,29 @@ def _read_lock(lock_path: str) -> Optional[str]:
     return None
 
 
+def _get_excluded_paths() -> set[Path]:
+    """Read TARGET_EXCLUDE env var (colon-separated absolute paths)."""
+    raw = os.environ.get("TARGET_EXCLUDE", "")
+    if not raw:
+        return set()
+    excluded = set()
+    for part in raw.split(":"):
+        part = part.strip()
+        if part:
+            p = Path(part).expanduser().resolve()
+            excluded.add(p)
+    return excluded
+
+
+def _is_excluded(d: Path) -> bool:
+    """Check if a directory is in the exclusion list."""
+    resolved = d.resolve()
+    for ex in _get_excluded_paths():
+        if resolved == ex or str(resolved).startswith(str(ex) + os.sep):
+            return True
+    return False
+
+
 def _is_valid_project_dir(d: Path) -> bool:
     """Reject only the forbidden roots themselves (e.g. /tmp/.target.conf),
     not subdirectories (e.g. /tmp/project/.target.conf with markers is fine)."""
@@ -59,13 +82,13 @@ def find_project_dir() -> Optional[str]:
         p = Path(env)
         if p.exists():
             d = p.resolve().parent
-            if _is_valid_project_dir(d):
+            if _is_valid_project_dir(d) and not _is_excluded(d):
                 return str(d)
     # Walk up from CWD first — the user's current intent
     d = Path.cwd()
     while True:
-        for name in (".target.toml", ".target.conf"):
-            if (d / name).exists() and _is_valid_project_dir(d):
+        for name in (".target.toml",):
+            if (d / name).exists() and _is_valid_project_dir(d) and not _is_excluded(d):
                 return str(d)
         parent = d.parent
         if parent == d:
@@ -75,7 +98,7 @@ def find_project_dir() -> Optional[str]:
     import glob
     for lock_path in sorted(glob.glob("/dev/shm/claude-serial-*.lock")):
         cached = _read_lock(lock_path)
-        if cached and _is_valid_project_dir(Path(cached)):
+        if cached and _is_valid_project_dir(Path(cached)) and not _is_excluded(Path(cached)):
             return cached
     return None
 
@@ -87,10 +110,6 @@ def read_dut_configs(project_dir: str) -> dict:
     duts = {}
     toml_path = Path(project_dir) / ".target.toml"
     if not toml_path.exists():
-        # Fallback: single DUT from shell-format .target.conf
-        conf = _read_shell_config(project_dir)
-        if conf.get("host"):
-            duts["default"] = {"serial_port": conf.get("port", "?"), "login_user": ""}
         return duts
     try:
         with open(toml_path) as f:
@@ -109,24 +128,6 @@ def read_dut_configs(project_dir: str) -> dict:
     except Exception:
         pass
     return duts
-
-
-def _read_shell_config(project_dir: str) -> dict:
-    """Read legacy .target.conf shell format. Returns {host, port} dict."""
-    conf = Path(project_dir) / ".target.conf"
-    result = {}
-    if not conf.exists():
-        return result
-    try:
-        for line in conf.read_text().splitlines():
-            line = line.strip()
-            if line.startswith("DEV_HOST_IP="):
-                result["host"] = line.split("=", 1)[1].strip().strip('"').strip("'")
-            elif line.startswith("SERIAL_PORT="):
-                result["port"] = line.split("=", 1)[1].strip().strip('"').strip("'")
-    except OSError:
-        pass
-    return result
 
 
 def format_serial_state(state: str, label: str = "serial") -> Optional[tuple[str, str]]:

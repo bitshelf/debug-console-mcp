@@ -17,7 +17,7 @@ _HOOK_DIR = Path(__file__).resolve().parent
 if str(_HOOK_DIR) not in sys.path:
     sys.path.insert(0, str(_HOOK_DIR))
 
-from lib import find_project_dir, format_serial_state
+from lib import find_project_dir, format_serial_state, _is_excluded
 
 # ── Config ──────────────────────────────────────────────────────────────────
 TMP_ROOT = os.environ.get("TMPDIR", os.environ.get("TMP", "/tmp"))
@@ -160,54 +160,90 @@ def _get_git_branch() -> str:
 
 # ── Serial state (read from MCP-written cache) ──────────────────────────────
 
-def _dut_serial_dir(project_dir: Path) -> Path:
-    """Find per-DUT directory, falling back to .dut-serial/.
+def _dut_serial_dirs(project_dir: Path) -> list[Path]:
+    """Return all per-DUT directories that have statusline-cache or target-state.
 
-    Checks subdirectories for either statusline-cache or target-state.
-    The MCP server writes to per-DUT directories when DUT_ALIAS is configured,
-    and the root .dut-serial/ when single-DUT.
+    The MCP server writes to per-DUT subdirectories (e.g. .dut-serial/rk3576/)
+    when DUT_ALIAS is configured. For multi-DUT projects, all active DUT dirs
+    are returned so the statusline shows every DUT's state.
+
+    Falls back to root .dut-serial/ only when no per-DUT dirs are found
+    (legacy single-DUT without alias).
     """
     base = project_dir / ".dut-serial"
+    dirs: list[Path] = []
     if base.is_dir():
         for child in sorted(base.iterdir()):
             if child.is_dir() and (
                 (child / "statusline-cache").exists()
                 or (child / "target-state").exists()
             ):
-                return child
-    return base
+                dirs.append(child)
+        # Root cache can be newer than per-DUT caches when MCP server lacks DUT_ALIAS.
+        # Replace stale per-DUT entries with root cache when root is fresher.
+        root_cache = base / "statusline-cache"
+        if root_cache.exists():
+            root_mtime = root_cache.stat().st_mtime
+            dirs = [d for d in dirs if not (
+                (d / "statusline-cache").exists()
+                and (d / "statusline-cache").stat().st_mtime < root_mtime
+            )]
+            if not dirs:
+                dirs.append(base)
+    return dirs
 
 
 def _read_serial_text(project_dir: str) -> str:
-    """Read ANSI-formatted serial state from MCP's cache file."""
+    """Read ANSI-formatted serial state from all per-DUT MCP cache files.
+
+    For multi-DUT projects, concatenates all DUT states separated by spaces.
+    The MCP server writes pre-formatted ANSI text to per-DUT statusline-cache
+    files; we read those directly. Falls back to formatting from target-state
+    for legacy single-DUT without pre-formatted cache.
+    """
     base = Path(project_dir) / ".dut-serial"
-    dut = _dut_serial_dir(Path(project_dir))
-    cache = dut / "statusline-cache"
-    if cache.exists():
-        try:
-            text = cache.read_text().strip()
-            if text:
-                return text
-        except OSError:
-            pass
-    state_file = dut / "target-state"
-    if state_file.exists():
-        try:
-            state = state_file.read_text().strip()
-            if state:
-                # Use DUT alias from directory name, falling back to "serial"
-                label = dut.name if dut != base else "serial"
-                formatted = format_serial_state(state, label)
-                if formatted:
-                    display_text, color = formatted
-                    ansi = {"green": "\033[32m", "red": "\033[31m",
-                            "cyan": "\033[36m", "yellow": "\033[33m"}
-                    code = ansi.get(color, "")
-                    reset = "\033[0m" if code else ""
-                    return f"{code}{display_text}{reset}"
-        except OSError:
-            pass
-    return ""
+    dut_dirs = _dut_serial_dirs(Path(project_dir))
+    texts: list[str] = []
+    for dut in dut_dirs:
+        cache = dut / "statusline-cache"
+        if cache.exists():
+            try:
+                text = cache.read_text().strip()
+                if text:
+                    texts.append(text)
+                    continue
+            except OSError:
+                pass
+        state_file = dut / "target-state"
+        if state_file.exists():
+            try:
+                state = state_file.read_text().strip()
+                if state:
+                    # Use DUT alias from directory name, falling back to "serial"
+                    label = dut.name if dut != base else "serial"
+                    formatted = format_serial_state(state, label)
+                    if formatted:
+                        display_text, color = formatted
+                        ansi = {"green": "\033[32m", "red": "\033[31m",
+                                "cyan": "\033[36m", "yellow": "\033[33m"}
+                        code = ansi.get(color, "")
+                        reset = "\033[0m" if code else ""
+                        texts.append(f"{code}{display_text}{reset}")
+            except OSError:
+                pass
+    return " ".join(texts)
+
+
+def _cwd_has_target_toml() -> bool:
+    """Only show serial state when CWD is within a debug-console project tree."""
+    d = Path.cwd().resolve()
+    for _ in range(10):
+        if (d / ".target.toml").exists():
+            return True
+        if d.parent == d:
+            break
+        d = d.parent
+    return False
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
@@ -230,9 +266,13 @@ def main():
     left_parts.append(_get_git_branch())
     left = " ".join(left_parts)
 
-    # Right side: serial state (from MCP cache)
-    project_dir = find_project_dir()
-    serial_text = _read_serial_text(project_dir) if project_dir else ""
+    # Right side: serial state — from MCP server's project, verified via .target.toml
+    # Skip entirely when CWD is under an excluded path (e.g. allwinner project)
+    serial_text = ""
+    if not _is_excluded(Path.cwd()):
+        project_dir = find_project_dir()
+        if project_dir and (Path(project_dir) / ".target.toml").exists():
+            serial_text = _read_serial_text(project_dir)
 
     if serial_text:
         print(f"{left}  {serial_text}")

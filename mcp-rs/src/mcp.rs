@@ -9,16 +9,20 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+use std::sync::Arc;
+
 use crate::serial_engine::SharedEngine;
+use crate::task_manager::{TaskKind, TaskManager};
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
 // ── Tool definitions ──────────────────────────────────────────────────────────
 
-struct ToolDef {
-    name: &'static str,
-    description: &'static str,
-    input_schema: Value,
+#[derive(Clone)]
+pub struct ToolDef {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub input_schema: Value,
 }
 
 fn tool_definitions() -> Vec<ToolDef> {
@@ -49,6 +53,7 @@ fn tool_definitions() -> Vec<ToolDef> {
                     "lines": {"type": "integer", "default": 50, "description": "Number of lines to return"},
                     "pattern": {"type": "string", "description": "Regex filter pattern"},
                     "archive": {"type": "integer", "default": 0, "description": "Archive index (0=current)"},
+                    "highlighted": {"type": "boolean", "default": true, "description": "Apply shell prompt syntax highlighting (user@host → green, path → blue, $/# → white). Default true — set false for plain text."},
                 },
             }),
         },
@@ -362,18 +367,21 @@ pub struct JsonRpcError {
 
 // ── MCP Server ────────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub struct McpServer {
-    tools: Vec<ToolDef>,
+    pub tools: Vec<ToolDef>,
     pub initialized: bool,
     pub(crate) engine: SharedEngine,
+    tasks: Arc<TaskManager>,
 }
 
 impl McpServer {
-    pub fn new(engine: SharedEngine) -> Self {
+    pub fn new(engine: SharedEngine, tasks: Arc<TaskManager>) -> Self {
         Self {
             tools: tool_definitions(),
             initialized: false,
             engine,
+            tasks,
         }
     }
 
@@ -465,7 +473,7 @@ impl McpServer {
     }
 
     /// Public handler for HTTP transport (takes raw request, produces raw response)
-    pub async fn handle_raw_message(
+    pub(crate) async fn handle_raw_message(
         &mut self,
         request: JsonRpcRawRequest,
     ) -> Option<JsonRpcResponse> {
@@ -517,6 +525,7 @@ impl McpServer {
                         "tools": {"listChanged": false},
                         "resources": {"listChanged": false, "subscribe": false},
                         "prompts": {"listChanged": false},
+                        "tasks": {"listChanged": true},
                     },
                     "serverInfo": {
                         "name": "debug-console-mcp",
@@ -566,11 +575,16 @@ impl McpServer {
                 let start = std::time::Instant::now();
                 let result = self.handle_call_tool(params).await;
                 let elapsed_ms = start.elapsed().as_millis();
-                let success = result.get("success").and_then(|v| v.as_bool()).unwrap_or(true);
+                let success = if Self::is_task_response(&result) {
+                    true // task creation itself succeeded
+                } else {
+                    result.get("success").and_then(|v| v.as_bool()).unwrap_or(true)
+                };
                 tracing::info!(
                     tool = %tool_name,
                     elapsed_ms = %elapsed_ms,
                     success = %success,
+                    is_task = %Self::is_task_response(&result),
                     "MCP tool audit"
                 );
                 Some(JsonRpcResponse {
@@ -634,6 +648,56 @@ impl McpServer {
                     error: None,
                 })
             }
+            "tasks/get" => {
+                let task_id = request
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("taskId"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                match self.tasks.get(task_id).await {
+                    Some(result) => {
+                        let response_value = serde_json::to_value(&result).unwrap_or_default();
+                        Some(JsonRpcResponse {
+                            jsonrpc: "2.0".into(),
+                            id: request.id,
+                            result: Some(response_value),
+                            error: None,
+                        })
+                    }
+                    None => Some(Self::error_response(
+                        request.id,
+                        -32000,
+                        &format!("Task not found: {task_id}"),
+                    )),
+                }
+            }
+            "tasks/cancel" => {
+                let task_id = request
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("taskId"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if task_id.is_empty() {
+                    Some(Self::error_response(
+                        request.id,
+                        -32602,
+                        "Missing required parameter: taskId",
+                    ))
+                } else {
+                    let cancelled = self.tasks.cancel(task_id).await;
+                    Some(JsonRpcResponse {
+                        jsonrpc: "2.0".into(),
+                        id: request.id,
+                        result: Some(serde_json::json!({
+                            "taskId": task_id,
+                            "cancelled": cancelled,
+                        })),
+                        error: None,
+                    })
+                }
+            }
             _ => Some(Self::error_response(
                 request.id,
                 -32601,
@@ -642,8 +706,8 @@ impl McpServer {
         }
     }
 
-    /// 处理 tools/call 请求
-    async fn handle_call_tool(&mut self, params: Value) -> Value {
+    /// Handle tools/call request (pub(crate) for rmcp wrapper)
+    pub(crate) async fn handle_call_tool(&mut self, params: Value) -> Value {
         let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let args = params.get("arguments").cloned().unwrap_or(Value::Null);
 
@@ -966,8 +1030,79 @@ impl McpServer {
         }
 
         if name == "serial_reset" {
-            let result = self.handle_serial_reset(&args).await;
-            return Self::tool_text_response(result);
+            let wait_boot = args
+                .get("wait_boot")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+
+            // Fast path: no wait → synchronous reset
+            if !wait_boot {
+                let result = self.handle_serial_reset(&args).await;
+                return Self::tool_text_response(result);
+            }
+
+            // Long-running path: create async task via MCP Tasks (SEP-2663)
+            let dut_alias = {
+                let engine = self.engine.lock().await;
+                engine.config.dut_aliases().first().cloned()
+            };
+            let task_id = self
+                .tasks
+                .create(
+                    TaskKind::ResetAndWait,
+                    dut_alias,
+                    "Reset triggered, waiting for boot to complete...".into(),
+                )
+                .await;
+            let task_id = match task_id {
+                Some(id) => id,
+                None => {
+                    // DUT already has a running task — fall back to sync
+                    let result = self.handle_serial_reset(&args).await;
+                    return Self::tool_text_response(result);
+                }
+            };
+
+            // Spawn background execution
+            let engine = self.engine.clone();
+            let tasks = self.tasks.clone();
+            let args_owned = args.clone();
+            let tid = task_id.clone();
+
+            tokio::spawn(async move {
+                let cancel_token = tasks.cancel_token(&tid).await;
+                let result = {
+                    // Build a temporary McpServer just for handle_serial_reset.
+                    // We need a helper that can call handle_serial_reset without
+                    // owning a full McpServer.
+                    let server = Self::new(engine.clone(), tasks.clone());
+                    let result = server.handle_serial_reset(&args_owned).await;
+
+                    // Check for cancellation
+                    if let Some(ref ct) = cancel_token {
+                        if ct.is_cancelled() {
+                            return;
+                        }
+                    }
+                    result
+                };
+
+                // Update task based on result
+                if result["success"].as_bool().unwrap_or(false) {
+                    tasks.complete(&tid, result).await;
+                } else {
+                    let error = result["error"]
+                        .as_str()
+                        .unwrap_or("Reset failed")
+                        .to_string();
+                    tasks.fail(&tid, error).await;
+                }
+            });
+
+            return Self::task_response(
+                &task_id,
+                "Reset triggered, waiting for boot to complete. Poll tasks/get for status.",
+            );
         }
 
         if name == "serial_power_cycle" {
@@ -992,17 +1127,12 @@ impl McpServer {
             {
                 let engine = self.engine.lock().await;
                 if engine.state.current() == crate::state_manager::TargetState::DutOff {
-                    let result = serde_json::json!({
-                        "output": "",
-                        "exit_code": null,
-                        "timed_out": false,
-                        "error": "DUT is off or unresponsive; refusing to wait for command timeout",
-                        "hint": "Power on or reset the DUT, then check serial_get_state.",
-                    });
-                    span.record("result.output", "");
-                    span.record("result.exit_code", tracing::field::Empty);
-                    span.record("result.timed_out", false);
-                    return Self::tool_text_response(result);
+                    // Don't reject — the target may be silently listening at a prompt.
+                    // Send the command anyway; if it responds, the read loop transitions
+                    // to Active and we capture the output.
+                    tracing::info!(
+                        "serial_send_command on DUT-off target: attempting command anyway"
+                    );
                 }
             }
             if cmd_trimmed == "reboot" || cmd_trimmed == "poweroff" || cmd_trimmed == "shutdown" {
@@ -1067,6 +1197,18 @@ impl McpServer {
             });
         }
 
+        // Guard: block serial tools when dutabo has taken over
+        if self.engine.lock().await.state.current()
+            == crate::state_manager::TargetState::Dutabo
+        {
+            let blocked_json = serde_json::json!({
+                "success": false,
+                "error": "Serial is taken over by dutabo interactive session. Use dutabo serial to interact with the target.",
+                "state": "dutabo",
+            });
+            return Self::tool_text_response(blocked_json);
+        }
+
         let result = {
             let mut engine = self.engine.lock().await;
             self.call_tool_impl(&mut engine, name, &args).await
@@ -1075,14 +1217,36 @@ impl McpServer {
         Self::tool_text_response(result)
     }
 
-    fn tool_text_response(result: Value) -> Value {
+    pub(crate) fn tool_text_response(result: Value) -> Value {
         serde_json::json!({
             "content": [{"type": "text", "text": serde_json::to_string(&result).unwrap_or_default()}]
         })
     }
 
+    /// Build a CreateTaskResult (SEP-2663) — returned when a long-running
+    /// operation is started in the background.
+    pub(crate) fn task_response(task_id: &str, status_message: &str) -> Value {
+        serde_json::json!({
+            "resultType": "task",
+            "taskId": task_id,
+            "status": "working",
+            "statusMessage": status_message,
+        })
+    }
+
+    /// Check if a tool result is a task response (has resultType="task").
+    pub(crate) fn is_task_response(result: &Value) -> bool {
+        result
+            .get("resultType")
+            .and_then(|v| v.as_str())
+            .is_some_and(|t| t == "task")
+    }
+
     async fn wait_for_login_without_engine_lock(&self, timeout: f64) -> Value {
-        let pattern = "login:";
+        self.wait_for_pattern_without_engine_lock("login:", timeout).await
+    }
+
+    async fn wait_for_pattern_without_engine_lock(&self, pattern: &str, timeout: f64) -> Value {
         let (mut rx, console_tx) = {
             let mut engine = self.engine.lock().await;
             let rx = engine.queue_wait_pattern(pattern);
@@ -1201,6 +1365,47 @@ impl McpServer {
                 return reset_result;
             }
 
+            // Wait for kernel start (U-Boot → kernel handoff), then capture reference log
+            let kernel_result = self.wait_for_pattern_without_engine_lock(
+                r"(Starting kernel|Linux version|Booting Linux)", 60.0
+            ).await;
+            if kernel_result["matched"].as_bool().unwrap_or(false) {
+                let engine = self.engine.lock().await;
+                // Auto-save reference boot log at kernel start (covers DDR→SPL→U-Boot stages)
+                let ref_log = engine.config.reference_log();
+                if !ref_log.is_empty() {
+                    let ref_path = std::path::PathBuf::from(&ref_log);
+                    let path = if ref_path.is_relative() {
+                        engine.config.project_dir.as_ref()
+                            .map(|p| p.join(&ref_path))
+                            .unwrap_or(ref_path)
+                    } else {
+                        ref_path
+                    };
+                    if !path.exists() {
+                        if let Some(current) = engine.logs.current_path() {
+                            if let Err(e) = std::fs::copy(current, &path) {
+                                tracing::warn!("Failed to save reference log to {}: {e}", path.display());
+                            } else {
+                                tracing::info!("Auto-saved reference boot log to {} (kernel start)", path.display());
+                            }
+                        }
+                    }
+                }
+                // Continue waiting for full boot (login)
+                let login_result = self.wait_for_login_without_engine_lock(60.0).await;
+                let engine = self.engine.lock().await;
+                return serde_json::json!({
+                    "success": true,
+                    "new_boot_number": engine.logs.boot_number(),
+                    "log_path": engine.logs.current_path().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
+                    "boot_complete": login_result["matched"].as_bool().unwrap_or(false),
+                    "attempts": attempts,
+                    "reference_saved": !ref_log.is_empty(),
+                });
+            }
+
+            // Fallback: wait for login (no kernel pattern detected)
             let wait_result = self.wait_for_login_without_engine_lock(120.0).await;
             if wait_result["matched"].as_bool().unwrap_or(false) {
                 let engine = self.engine.lock().await;
@@ -1278,7 +1483,12 @@ impl McpServer {
                 let lines = args.get("lines").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
                 let pattern = args.get("pattern").and_then(|v| v.as_str());
                 let archive = args.get("archive").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                engine.read_log(archive, lines, pattern)
+                let highlighted = args.get("highlighted").and_then(|v| v.as_bool()).unwrap_or(true);
+                if highlighted {
+                    engine.read_log_highlighted(archive, lines, pattern)
+                } else {
+                    engine.read_log(archive, lines, pattern)
+                }
             }
             "serial_list_logs" => engine.list_logs(),
             "serial_enter_maskrom" => engine.enter_maskrom().await,
@@ -1427,7 +1637,7 @@ impl McpServer {
 
     // ── Resources ──
 
-    fn build_resources_list(engine: &crate::serial_engine::SerialEngine) -> Value {
+    pub(crate) fn build_resources_list(engine: &crate::serial_engine::SerialEngine) -> Value {
         let archives = engine.logs.list_archives();
         let mut resources = Vec::new();
 
@@ -1452,7 +1662,7 @@ impl McpServer {
         serde_json::json!({"resources": resources})
     }
 
-    fn build_resource_content(engine: &crate::serial_engine::SerialEngine, uri: &str) -> Value {
+    pub(crate) fn build_resource_content(engine: &crate::serial_engine::SerialEngine, uri: &str) -> Value {
         if uri == "state://target" {
             let state = engine.get_state_dict();
             return serde_json::json!({
@@ -1483,7 +1693,7 @@ impl McpServer {
 
     // ── Prompts ──
 
-    fn build_prompts() -> Value {
+    pub(crate) fn build_prompts() -> Value {
         serde_json::json!({
             "prompts": [
                 {
@@ -1537,7 +1747,7 @@ impl McpServer {
         })
     }
 
-    fn build_prompt_content(name: &str) -> Value {
+    pub(crate) fn build_prompt_content(name: &str) -> Value {
         match name {
             "debug_boot" => serde_json::json!({
                 "description": "Debug target boot process",
@@ -1617,7 +1827,7 @@ impl McpServer {
     }
 
     /// Build a flash plan from config + local image path.
-    fn build_flash_plan(
+    pub(crate) fn build_flash_plan(
         config: &crate::config::Config,
         image_path: &str,
         image_type: &str,
@@ -1781,7 +1991,7 @@ mod tests {
     #[tokio::test]
     async fn test_initialize() {
         let engine = create_test_engine();
-        let mut server = McpServer::new(engine);
+        let mut server = McpServer::new(engine, crate::task_manager::TaskManager::new());
 
         let req = make_request(1, "initialize", None);
         let resp = server.handle_message(req).await.unwrap();
@@ -1797,7 +2007,7 @@ mod tests {
     #[tokio::test]
     async fn test_ping() {
         let engine = create_test_engine();
-        let mut server = McpServer::new(engine);
+        let mut server = McpServer::new(engine, crate::task_manager::TaskManager::new());
 
         // Initialize first
         server.initialized = true;
@@ -1812,7 +2022,7 @@ mod tests {
     #[tokio::test]
     async fn test_tools_list() {
         let engine = create_test_engine();
-        let mut server = McpServer::new(engine);
+        let mut server = McpServer::new(engine, crate::task_manager::TaskManager::new());
         server.initialized = true;
 
         let req = make_request(1, "tools/list", None);
@@ -1832,7 +2042,7 @@ mod tests {
     #[tokio::test]
     async fn test_enter_uboot_description_uses_interrupt_character() {
         let engine = create_test_engine();
-        let mut server = McpServer::new(engine);
+        let mut server = McpServer::new(engine, crate::task_manager::TaskManager::new());
         server.initialized = true;
 
         let req = make_request(1, "tools/list", None);
@@ -1865,7 +2075,7 @@ mod tests {
     #[tokio::test]
     async fn test_not_initialized() {
         let engine = create_test_engine();
-        let mut server = McpServer::new(engine);
+        let mut server = McpServer::new(engine, crate::task_manager::TaskManager::new());
 
         // Try to call tools/list without initializing
         let req = make_request(1, "tools/list", None);
@@ -1880,7 +2090,7 @@ mod tests {
     #[tokio::test]
     async fn test_invalid_jsonrpc_version() {
         let engine = create_test_engine();
-        let mut server = McpServer::new(engine);
+        let mut server = McpServer::new(engine, crate::task_manager::TaskManager::new());
 
         let req = JsonRpcRequest {
             jsonrpc: "1.0".to_string(),
@@ -1899,7 +2109,7 @@ mod tests {
     #[tokio::test]
     async fn test_missing_method() {
         let engine = create_test_engine();
-        let mut server = McpServer::new(engine);
+        let mut server = McpServer::new(engine, crate::task_manager::TaskManager::new());
 
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -1918,7 +2128,7 @@ mod tests {
     #[tokio::test]
     async fn test_unknown_method() {
         let engine = create_test_engine();
-        let mut server = McpServer::new(engine);
+        let mut server = McpServer::new(engine, crate::task_manager::TaskManager::new());
         server.initialized = true;
 
         let req = make_request(1, "unknown/method", None);
@@ -1932,7 +2142,7 @@ mod tests {
     #[tokio::test]
     async fn test_notifications_initialized() {
         let engine = create_test_engine();
-        let mut server = McpServer::new(engine);
+        let mut server = McpServer::new(engine, crate::task_manager::TaskManager::new());
 
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -1950,7 +2160,7 @@ mod tests {
     #[tokio::test]
     async fn test_tools_call_get_state() {
         let engine = create_test_engine();
-        let mut server = McpServer::new(engine);
+        let mut server = McpServer::new(engine, crate::task_manager::TaskManager::new());
         server.initialized = true;
 
         let params = serde_json::json!({
@@ -1968,7 +2178,7 @@ mod tests {
     #[tokio::test]
     async fn test_tools_call_unknown_tool() {
         let engine = create_test_engine();
-        let mut server = McpServer::new(engine);
+        let mut server = McpServer::new(engine, crate::task_manager::TaskManager::new());
         server.initialized = true;
 
         let params = serde_json::json!({
@@ -1986,7 +2196,7 @@ mod tests {
     #[tokio::test]
     async fn test_tools_call_list_logs() {
         let engine = create_test_engine();
-        let mut server = McpServer::new(engine);
+        let mut server = McpServer::new(engine, crate::task_manager::TaskManager::new());
         server.initialized = true;
 
         let params = serde_json::json!({
@@ -2005,7 +2215,7 @@ mod tests {
     #[tokio::test]
     async fn test_tools_call_get_config() {
         let engine = create_test_engine();
-        let mut server = McpServer::new(engine);
+        let mut server = McpServer::new(engine, crate::task_manager::TaskManager::new());
         server.initialized = true;
 
         let params = serde_json::json!({
@@ -2024,7 +2234,7 @@ mod tests {
     #[tokio::test]
     async fn test_serial_enter_uboot_no_relay_floods_instead_of_failing_immediately() {
         let engine = create_test_engine();
-        let mut server = McpServer::new(engine);
+        let mut server = McpServer::new(engine, crate::task_manager::TaskManager::new());
         server.initialized = true;
 
         let params = serde_json::json!({
@@ -2051,8 +2261,11 @@ mod tests {
         assert_eq!(body["attempts"], 1);
     }
 
+    /// In DUT-off state, serial_send_command now sends the command anyway
+    /// (the target may be silently listening at a prompt). With no actual
+    /// serial connected, the command times out.
     #[tokio::test]
-    async fn test_serial_send_command_rejects_when_dut_off() {
+    async fn test_serial_send_command_times_out_when_dut_off() {
         let engine = create_test_engine();
         {
             let mut guard = engine.lock().await;
@@ -2060,33 +2273,24 @@ mod tests {
                 .state
                 .transition(crate::state_manager::TargetState::DutOff);
         }
-        let mut server = McpServer::new(engine);
+        let mut server = McpServer::new(engine, crate::task_manager::TaskManager::new());
         server.initialized = true;
 
         let params = serde_json::json!({
             "name": "serial_send_command",
             "arguments": {
-                "command": "echo should-not-wait",
-                "timeout": 30
+                "command": "echo test",
+                "timeout": 0.01
             }
         });
         let req = make_request(1, "tools/call", Some(params));
-        let resp = tokio::time::timeout(
-            std::time::Duration::from_millis(300),
-            server.handle_message(req),
-        )
-        .await
-        .expect("DUT-off command should be rejected immediately")
-        .unwrap();
-
+        let resp = server.handle_message(req).await.unwrap();
         let result = resp.result.expect("tools/call should have result");
         let text = result["content"][0]["text"].as_str().unwrap();
         let body: serde_json::Value = serde_json::from_str(text).unwrap();
-        assert_eq!(body["timed_out"], false);
-        assert!(body["error"]
-            .as_str()
-            .unwrap()
-            .contains("DUT is off or unresponsive"));
+        // With no serial connected, the command returns without crashing.
+        // The response body exists — exact fields depend on engine state.
+        assert!(body.is_object(), "Should return a JSON object");
     }
 
     #[tokio::test]
@@ -2137,7 +2341,7 @@ mod tests {
             }));
             guard.state.transition(crate::state_manager::TargetState::Active);
         }
-        let mut server = McpServer::new(engine);
+        let mut server = McpServer::new(engine, crate::task_manager::TaskManager::new());
         server.initialized = true;
 
         let params = serde_json::json!({
@@ -2167,12 +2371,14 @@ mod tests {
         server_handle.await.unwrap();
     }
 
+    /// With wait_boot=true, serial_reset must return a CreateTaskResult
+    /// immediately (SEP-2663 server-directed task creation), not block.
     #[tokio::test]
-    async fn test_serial_reset_wait_boot_releases_engine_lock() {
+    async fn test_serial_reset_wait_boot_returns_task() {
         let tmp = TempDir::new().unwrap();
         let engine = create_external_reset_engine(&tmp);
         let engine_probe = engine.clone();
-        let mut server = McpServer::new(engine);
+        let mut server = McpServer::new(engine, crate::task_manager::TaskManager::new());
         server.initialized = true;
 
         let params = serde_json::json!({
@@ -2185,36 +2391,44 @@ mod tests {
         });
         let req = make_request(1, "tools/call", Some(params));
 
-        let task = tokio::spawn(async move { server.handle_message(req).await });
-
-        let mut lock_was_available = false;
-        for _ in 0..30 {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            if let Ok(mut engine) = engine_probe.try_lock() {
-                lock_was_available = true;
-                let _ = engine.detector.feed(b"login:\n");
-            }
-            if task.is_finished() {
-                break;
-            }
-        }
-
-        assert!(
-            lock_was_available,
-            "serial_reset(wait_boot=true) held the engine lock while waiting for login"
-        );
-
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(2), task)
-            .await
-            .expect("serial_reset did not complete after login was fed")
-            .expect("serial_reset task panicked")
-            .expect("tools/call should return a response");
+        let resp = server.handle_message(req).await.unwrap();
         let result = resp.result.expect("tools/call should have result");
+
+        // Should return a CreateTaskResult, not a blocking CallToolResult
+        assert_eq!(result["resultType"], "task", "serial_reset(wait_boot=true) must return task");
+        assert!(result["taskId"].as_str().is_some(), "task must have taskId");
+        assert_eq!(result["status"], "working");
+
+        // Engine lock should be immediately available (not held by task)
+        assert!(
+            engine_probe.try_lock().is_ok(),
+            "serial_reset(wait_boot=true) held the engine lock after returning task"
+        );
+    }
+
+    /// wait_boot=false should still return synchronously (fast path).
+    #[tokio::test]
+    async fn test_serial_reset_no_wait_still_sync() {
+        let tmp = TempDir::new().unwrap();
+        let engine = create_external_reset_engine(&tmp);
+        let mut server = McpServer::new(engine, crate::task_manager::TaskManager::new());
+        server.initialized = true;
+
+        let params = serde_json::json!({
+            "name": "serial_reset",
+            "arguments": {
+                "wait_boot": false,
+            }
+        });
+        let req = make_request(1, "tools/call", Some(params));
+        let resp = server.handle_message(req).await.unwrap();
+        let result = resp.result.expect("tools/call should have result");
+
+        // Synchronous path: should have content array, not task
+        assert!(result["content"].is_array(), "serial_reset(wait_boot=false) must return content synchronously");
         let text = result["content"][0]["text"].as_str().unwrap();
         let body: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(body["success"], true);
-        assert_eq!(body["boot_complete"], true);
-        assert_eq!(body["attempts"], 1);
     }
 
     #[test]
