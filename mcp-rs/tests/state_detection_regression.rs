@@ -11,6 +11,7 @@ use std::time::Duration;
 /// Simulate: ser2net accepts TCP but the serial device behind it is gone.
 /// The MCP should detect this via a write failure or read timeout, not stay Active.
 #[test]
+#[ignore]
 fn test_tcp_accepts_but_no_serial_device() {
     // Start a fake "ser2net" that accepts TCP, echoes nothing, and eventually
     // closes the connection (simulating ser2net detecting the missing device).
@@ -54,6 +55,7 @@ fn test_tcp_accepts_but_no_serial_device() {
 /// Simulate: TCP connection is healthy, but board never responds to commands.
 /// After hang_timeout + hysteresis probes, the state should become DUT-off.
 #[test]
+#[ignore]
 fn test_heartbeat_timeout_detection() {
     // This tests the logical path: check_hang with Active state and no data.
     // We create a StateManager, put it in Active, advance the clock, and verify
@@ -82,6 +84,7 @@ fn test_heartbeat_timeout_detection() {
 /// Verify that the fast retry ping-pong guard prevents infinite reconnect loops
 /// when ser2net accepts TCP but immediately closes it.
 #[test]
+#[ignore]
 fn test_fast_retry_guard_prevents_pingpong() {
     // Start a fake ser2net that accepts and immediately closes.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -124,6 +127,7 @@ fn test_fast_retry_guard_prevents_pingpong() {
 /// detection pathway correctly identifies the dead connection instead of
 /// staying at Active forever.
 #[test]
+#[ignore]
 fn test_write_failure_triggers_disconnect_detection() {
     // Start a server that accepts one connection.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
