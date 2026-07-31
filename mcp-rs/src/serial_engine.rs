@@ -1861,16 +1861,15 @@ impl SerialEngine {
     /// Transitions state to Dutabo so the statusline reflects "in use".
     pub fn set_ws_tx(&mut self, tx: tokio::sync::broadcast::Sender<Vec<u8>>) {
         self.ws_tx = Some(tx);
-        // WS-based dutabo — show "in use" on statusline without closing serial.
-        // The read_loop_iter skips sentinel/reconnect logic when ws_tx is set.
         self.state
             .transition(crate::state_manager::TargetState::Dutabo);
+        // Force-write per-DUT statusline so other MCP servers don't overwrite
+        self.state.write_dutabo_forced();
     }
 
     /// Clear WebSocket broadcast channel and restore to Active.
     pub fn clear_ws_tx(&mut self) {
         self.ws_tx = None;
-        // WS session ended — probe and restore active state.
         self.state
             .transition(crate::state_manager::TargetState::Active);
     }

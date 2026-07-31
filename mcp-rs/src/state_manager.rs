@@ -444,6 +444,24 @@ impl StateManager {
         }
     }
 
+    /// Force-write dutabo state to per-DUT directories that have a target-state file.
+    /// Called from set_ws_tx() so the statusline reflects "dutabo" even when
+    /// multiple MCP servers share the same serial port.
+    pub(crate) fn write_dutabo_forced(&self) {
+        let text = self.format_statusline(TargetState::Dutabo);
+        self.atomic_write(&self.cache_file, &text);
+        self.atomic_write(&self.shm_cache_file, &text);
+        // Only write to the alias-specific dir if we know which DUT
+        if !self.dut_alias.is_empty() && self.dut_alias != "default" {
+            let alias_cache = self.project_dir.join(".dut-serial")
+                .join(&self.dut_alias).join("statusline-cache");
+            self.atomic_write(&alias_cache, &text);
+            let alias_state = self.project_dir.join(".dut-serial")
+                .join(&self.dut_alias).join("target-state");
+            self.atomic_write(&alias_state, "dutabo");
+        }
+    }
+
     /// Called on every serial data arrival — resets hang and heartbeat counters.
     /// Also resets `last_probe_time` so the next heartbeat cycle starts fresh.
     pub fn on_activity(&mut self) {
