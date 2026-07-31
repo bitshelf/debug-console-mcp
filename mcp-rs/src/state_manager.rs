@@ -381,7 +381,7 @@ impl StateManager {
                 let text = self.format_statusline(new);
                 self.atomic_write(&self.cache_file, &text);
                 self.atomic_write(&self.shm_cache_file, &text);
-                // Also write per-DUT cache when alias is configured
+                // Sync to per-DUT alias directory (preferred by statusline)
                 if !self.dut_alias.is_empty() && self.dut_alias != "default" {
                     let alias_cache = self
                         .project_dir
@@ -389,6 +389,21 @@ impl StateManager {
                         .join(&self.dut_alias)
                         .join("statusline-cache");
                     self.atomic_write(&alias_cache, &text);
+                }
+                // When no DUT_ALIAS, sync to ALL existing per-DUT dirs so the
+                // statusline (which reads per-DUT first) sees fresh data.
+                if self.dut_alias.is_empty() {
+                    if let Ok(entries) = std::fs::read_dir(
+                        self.project_dir.join(".dut-serial")
+                    ) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.is_dir() {
+                                let cache = path.join("statusline-cache");
+                                self.atomic_write(&cache, &text);
+                            }
+                        }
+                    }
                 }
                 // Write Agent notification for critical states
                 if matches!(

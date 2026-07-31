@@ -179,17 +179,12 @@ def _dut_serial_dirs(project_dir: Path) -> list[Path]:
                 or (child / "target-state").exists()
             ):
                 dirs.append(child)
-        # Root cache can be newer than per-DUT caches when MCP server lacks DUT_ALIAS.
-        # Replace stale per-DUT entries with root cache when root is fresher.
-        root_cache = base / "statusline-cache"
-        if root_cache.exists():
-            root_mtime = root_cache.stat().st_mtime
-            dirs = [d for d in dirs if not (
-                (d / "statusline-cache").exists()
-                and (d / "statusline-cache").stat().st_mtime < root_mtime
-            )]
-            if not dirs:
-                dirs.append(base)
+        # Fallback: root-level .dut-serial/ when no per-DUT dirs found
+        if not dirs and (
+            (base / "statusline-cache").exists()
+            or (base / "target-state").exists()
+        ):
+            dirs.append(base)
     return dirs
 
 
@@ -208,13 +203,6 @@ def _read_serial_text(project_dir: str) -> str:
         cache = dut / "statusline-cache"
         if cache.exists():
             try:
-                mtime = cache.stat().st_mtime
-                age = time.time() - mtime
-                # Stale cache (>60s old): no MCP server updating this DUT
-                if age > 60:
-                    label = dut.name if dut != base else "serial"
-                    texts.append(f"\033[31m✗ {label}:no-monitor\033[0m")
-                    continue
                 text = cache.read_text().strip()
                 if text:
                     texts.append(text)
