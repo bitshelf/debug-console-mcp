@@ -329,6 +329,15 @@ impl LogManager {
             file.write_all(&boot_data).ok();
             tracing::info!("Boot log saved: {} ({} bytes)", fname, boot_data.len());
         }
+        // Write highlighted version in separate directory (not counted by list_archives)
+        let hl_dir = self.log_dir.join("highlighted");
+        fs::create_dir_all(&hl_dir).ok();
+        let hl_path = hl_dir.join(&fname);
+        if let Ok(mut hl_file) = fs::OpenOptions::new().append(true).create(true).open(&hl_path) {
+            let mut highlighted = Vec::with_capacity(boot_data.len() + boot_data.len() / 4);
+            crate::highlight::highlight_serial_prompt(&boot_data, &mut highlighted);
+            hl_file.write_all(&highlighted).ok();
+        }
         // Clean up old logs
         self.cleanup_old_logs();
         // Reset the start position
