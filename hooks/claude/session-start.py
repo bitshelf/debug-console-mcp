@@ -161,6 +161,37 @@ def _project_http_port(project_dir: str) -> int:
     return 3001 + (int(h[:8], 16) % 99)
 
 
+def _project_dut_http_port(project_dir: str, dut_alias: str) -> int:
+    """Deterministic port for a specific DUT (3001-3099)."""
+    import hashlib
+    h = hashlib.md5(
+        (str(Path(project_dir).resolve()) + ":" + dut_alias).encode()
+    ).hexdigest()
+    return 3001 + (int(h[:8], 16) % 99)
+
+
+def _ensure_http_mcp_for_dut(project_dir: str, dut_alias: str, port: int) -> None:
+    """Ensure an HTTP MCP server is running for a specific DUT."""
+    if mcp_running(project_dir):
+        return
+
+    binary = os.path.expanduser("~/.local/bin/debug-console-mcp")
+    if not os.path.isfile(binary):
+        return
+
+    Popen(
+        [binary, "--http", f"127.0.0.1:{port}"],
+        cwd=project_dir,
+        env={
+            **os.environ,
+            "TARGET_CONF": os.path.join(project_dir, ".target.toml"),
+            "TARGET_DUT_ALIAS": dut_alias,
+        },
+        stdout=DEVNULL, stderr=DEVNULL,
+        start_new_session=True,
+    )
+
+
 def _ensure_http_mcp(project_dir: str, port: int) -> None:
     """Ensure an HTTP MCP server is running for this project.
 
@@ -214,10 +245,18 @@ def main():
         with open(pid_file, "w") as f:
             f.write(f"{os.getpid()}\n{lock_file}")
 
-        # ── HTTP MCP: auto-start on per-project hash port ──
-        # Same algorithm as dutabo's project_mcp_port() (MD5, deterministic).
-        port = _project_http_port(proj)
-        _ensure_http_mcp(proj, port)
+        # ── HTTP MCP: start one server per DUT ──
+        # Each DUT needs its own MCP server with TARGET_DUT_ALIAS set.
+        # Uses MD5(project_dir + ":" + alias) for deterministic port.
+        dut_configs = read_dut_configs(proj)
+        if dut_configs:
+            for alias in dut_configs:
+                dut_port = _project_dut_http_port(proj, alias)
+                _ensure_http_mcp_for_dut(proj, alias, dut_port)
+        else:
+            # Fallback: single MCP without DUT_ALIAS (backward compat)
+            port = _project_http_port(proj)
+            _ensure_http_mcp(proj, port)
 
         # ── Auto-generate .mcp.json if missing or port changed ──
         mcp_json_path = os.path.join(proj, ".mcp.json")

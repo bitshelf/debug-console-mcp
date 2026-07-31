@@ -208,6 +208,13 @@ def _read_serial_text(project_dir: str) -> str:
         cache = dut / "statusline-cache"
         if cache.exists():
             try:
+                mtime = cache.stat().st_mtime
+                age = time.time() - mtime
+                # Stale cache (>60s old): no MCP server updating this DUT
+                if age > 60:
+                    label = dut.name if dut != base else "serial"
+                    texts.append(f"\033[31m✗ {label}:no-monitor\033[0m")
+                    continue
                 text = cache.read_text().strip()
                 if text:
                     texts.append(text)
