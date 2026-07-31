@@ -390,21 +390,8 @@ impl StateManager {
                         .join("statusline-cache");
                     self.atomic_write(&alias_cache, &text);
                 }
-                // When no DUT_ALIAS, sync to ALL existing per-DUT dirs so the
-                // statusline (which reads per-DUT first) sees fresh data.
-                if self.dut_alias.is_empty() {
-                    if let Ok(entries) = std::fs::read_dir(
-                        self.project_dir.join(".dut-serial")
-                    ) {
-                        for entry in entries.flatten() {
-                            let path = entry.path();
-                            if path.is_dir() {
-                                let cache = path.join("statusline-cache");
-                                self.atomic_write(&cache, &text);
-                            }
-                        }
-                    }
-                }
+                // Don't blindly sync to all per-DUT dirs — that would overwrite
+                // states written by other MCP servers (e.g. dutabo, disconnected).
                 // Write Agent notification for critical states
                 if matches!(
                     new,
