@@ -56,9 +56,6 @@ cargo tarpaulin --out Html --timeout 300
 cargo audit
 
 # Dependency security audit (requires cargo-audit)
-# NOTE: System GCC 9.4.0 has a memcmp bug rejected by aws-lc-sys, which is
-# now a regular build dependency too (reqwest 0.13 default TLS backend).
-# On this host build/install with clang: CC=clang cargo <cmd>
 cargo audit
 
 # dutabo CLI

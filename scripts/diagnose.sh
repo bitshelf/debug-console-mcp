@@ -103,11 +103,16 @@ fi
 # 4. USB devices
 echo "[4] USB serial devices"
 if [ -n "$DEHOST" ]; then
-    ssh "$DEHOST" "ls /dev/serial/by-alias/ 2>/dev/null" | while read alias; do
-        ok "$alias → $(ssh "$DEHOST" "readlink /dev/serial/by-alias/$alias" 2>/dev/null)"
+    # ls -l puts the device path LAST; match on the extracted field (the
+    # old case matched the whole line against /dev/tty* and never fired).
+    ssh "$DEHOST" "ls -la /dev/ttyACM* /dev/ttyUSB* 2>/dev/null" | awk '{print $NF}' | while read -r line; do
+        case "$line" in
+            /dev/tty*) ok "$line" ;;
+            *) ok "  $line" ;;
+        esac
     done
-    if ! ssh "$DEHOST" "ls /dev/serial/by-alias/ 2>/dev/null | grep -q ."; then
-        warn "no devices in /dev/serial/by-alias/ — check USB cables"
+    if ! ssh "$DEHOST" "ls /dev/ttyACM* /dev/ttyUSB* 2>/dev/null | grep -q ."; then
+        warn "no serial ttys on dev host — check USB cables"
     fi
 fi
 
