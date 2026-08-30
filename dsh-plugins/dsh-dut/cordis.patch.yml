@@ -6,6 +6,8 @@
 # boot, app-boot applies every bundle's patch list in bundle order over the
 # empty root, so these inserts land AFTER the dsh-tui bundle that provides
 # the `tuiStatus` service and the base bundle that provides `tools`.
+# Stock dsh-tui from npm suffices — no patched dsh-tui build is required
+# (the statusline renders via the official `tuiStatus` seam, prompt-above).
 #
 # 架构（用户约定，勿改）：
 #   - `dut-mcp`（role: mcp）= 当前 MCP 的 SERVER plugin 行：负责

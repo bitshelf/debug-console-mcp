@@ -119,7 +119,7 @@ def _known_host_reason(command: str, ip: str, label: str) -> str:
         "The Dev Host is a PRODUCTION machine — NEVER modify it. "
         "To flash a target board: the image must be UPLOADED to the Dev Host, "
         "then upgrade_tool flashes the TARGET via USB OTG. "
-        "Use serial_flash_plan + serial_flash MCP tools, or rk-build skill scripts."
+        "Use dutabo uf/dutabo flash-kernel, or rk-build skill scripts."
     )
 
 
@@ -138,7 +138,7 @@ def _unavailable_reason(command: str, ip: str, label: str) -> str:
         "The Dev Host is a PRODUCTION machine — NEVER modify it. "
         "To flash a target board: the image must be UPLOADED to the Dev Host, "
         "then upgrade_tool flashes the TARGET via USB OTG. "
-        "Use serial_flash_plan + serial_flash MCP tools, or rk-build skill scripts."
+        "Use dutabo uf/dutabo flash-kernel, or rk-build skill scripts."
     )
 
 

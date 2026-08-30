@@ -777,8 +777,11 @@ export function applyStatusline(ctx, config = {}) {
     lastText = plain
     lastSegments = segKey
     try {
-      // Styled segments when the TUI ships setStyled (dsh-tui ≥ 0.9.4),
-      // plain text otherwise — one capability probe, never a version check.
+      // Styled segments when the TUI ships setStyled — one capability probe,
+      // never a version check. Stock dsh-tui does NOT ship it (contributions
+      // render as plain text above the prompt per the official tuiStatus
+      // contract), so the plain path is the norm; the probe auto-enables
+      // colored runs the day upstream lands the capability.
       latestDispose =
         segments !== undefined && typeof status.setStyled === 'function'
           ? status.setStyled(KEY, segments, ctx)

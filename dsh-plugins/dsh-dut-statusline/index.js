@@ -191,7 +191,7 @@ export function pidIsMcpServer(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false
   try {
     const comm = readFileSync(`/proc/${pid}/comm`, 'utf8').trim()
-    if (comm.includes('debug-console')) return true
+    if (comm.includes('sermcp')) return true
     const argv0 = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0')[0]
     if (argv0 !== '' && basename(argv0).startsWith('sermcp')) return true
     return false
