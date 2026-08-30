@@ -1,0 +1,37 @@
+{
+  "name": "debug-console-mcp",
+  "version": "0.4.1",
+  "description": "Project-scoped embedded Linux DUT serial debugging through debug-console-mcp.",
+  "author": {
+    "name": "debug-console-mcp contributors",
+    "url": "https://github.com/bitshelf/debug-console-mcp"
+  },
+  "homepage": "https://github.com/bitshelf/debug-console-mcp",
+  "repository": "https://github.com/bitshelf/debug-console-mcp",
+  "license": "MIT",
+  "keywords": [
+    "embedded-linux",
+    "serial-console",
+    "dut",
+    "mcp",
+    "debugging"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Debug Console MCP",
+    "shortDescription": "Serial debugging for projects with .target.jsonc",
+    "longDescription": "Activates only in a project containing .target.jsonc. Inspect DUT state and logs, run marker-delimited serial commands, control reset and boot modes, and diagnose embedded Linux startup failures.",
+    "developerName": "debug-console-mcp contributors",
+    "category": "Development Tools",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Check the configured DUT state and summarize its latest boot log",
+      "Diagnose the latest serial boot failure",
+      "Reset the configured DUT and monitor it until boot completes"
+    ]
+  }
+}
